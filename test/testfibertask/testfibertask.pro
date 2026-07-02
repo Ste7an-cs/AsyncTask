@@ -9,7 +9,6 @@ QMAKE_CXXFLAGS += -std=c++17 #开启c++17
 QMAKE_CXXFLAGS += -fsanitize=address -fsanitize-recover=address -fno-omit-frame-pointer#开启anitize
 QMAKE_CFLAGS += -fsanitize=address -fsanitize-recover=address -fno-omit-frame-pointer
 QMAKE_LFLAGS += -fsanitize=address -static-libasan
-LIBS += -lasan
 include($$PWD/../../AsyncTask.pri)
 
 SOURCES +=  tst_test_fiber_task.cpp
