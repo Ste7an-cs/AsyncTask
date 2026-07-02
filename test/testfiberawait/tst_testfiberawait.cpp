@@ -305,8 +305,7 @@ void TestFiberAwait::test_case_socket_await()
                     p_socket->write(msg);
                     boost::this_fiber::yield();
                 }
-                p_socket->deleteLater();
-                qDebug() << "p_socket delete " << client_cnt;
+                qDebug() << "p_socket done " << client_cnt;
             });
             boost::this_fiber::yield();
         }
