@@ -104,10 +104,11 @@ struct MetaContext : boost::fibers::fiber_properties {
             this->ctx_ = meta.ctx_;
             this->priority_ = meta.priority_;
             this->affinity_ = meta.affinity_;
+            this->name_ = meta.name_;
         }
         return *this;
     }
-    MetaContext(const MetaContext& other): boost::fibers::fiber_properties(other.ctx_), priority_(other.priority_), affinity_(other.affinity_){
+    MetaContext(const MetaContext& other): boost::fibers::fiber_properties(other.ctx_), priority_(other.priority_), affinity_(other.affinity_), name_(other.name_){
     }
 
     ///
