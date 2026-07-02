@@ -1,0 +1,33 @@
+# 构建产物 / build artifacts
+build*/
+*.o
+*.obj
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+Makefile
+Makefile.*
+*.so
+*.so.*
+*.a
+*.la
+*.lo
+
+# Qt Creator 用户配置
+*.pro.user
+*.pro.user.*
+*.autosave
+
+# 注意：不要用 test/**/<target> 这类模式忽略"可执行测试产物"，
+# 它会连同同名的源码目录（如 test/testfiberawait/）一起被忽略。
+# in-source 构建产物请统一放到 build*/ 目录，或手动清理。
+
+# 第三方库源码/解压产物（体积大，不入库）
+3dParty/boost/boost_*/
+3dParty/boost/*.7z
+3dParty/boost/*.tar.gz
+
+# 编辑器/系统
+.DS_Store
+*.swp
