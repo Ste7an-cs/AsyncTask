@@ -8,9 +8,7 @@
 #include "await/awaitable.hpp"
 #include "await/generator.hpp"
 #include "detail/result.hpp"
-#include "await/signalawait.hpp"
-#include "await/iodeviceawait.hpp"
-#include "await/socketawait.hpp"
+#include "await/coro.hpp"
 #include <QBuffer>
 #include <QAbstractSocket>
 #include <QTcpSocket>
@@ -132,7 +130,7 @@ void TestFiberAwait::test_case_signalawait()
 {
     SigObject* obj = new SigObject();
     auto task1 = Coro::makeTask([obj](){
-        Coro::Result<std::tuple<int, QString>> res1 = Coro::await(obj, &SigObject::sig2);
+        Coro::Result<std::tuple<int, QString>> res1 = Coro::await(Coro::coro(obj, &SigObject::sig2));
 
         if(res1.has_value()){
             return std::get<0>(res1.value());
@@ -141,7 +139,7 @@ void TestFiberAwait::test_case_signalawait()
         }
     }, Coro::Priority::Normal, Coro::Affinity::sticky());
     auto task2 = Coro::makeTask([obj](){
-        Coro::Result<int> res2 = Coro::await<int>(obj, &SigObject::sig2);
+        Coro::Result<int> res2 = Coro::await(Coro::coro<int>(obj, &SigObject::sig2));
         if(res2.has_value()){
             return res2.value();
         }else{
@@ -149,7 +147,7 @@ void TestFiberAwait::test_case_signalawait()
         }
     }, Coro::Priority::Normal, Coro::Affinity::sticky());
     auto task3 = Coro::makeTask([obj](){
-        Coro::Result<void> res3 = Coro::await(obj, &SigObject::sig1);
+        Coro::Result<void> res3 = Coro::await(Coro::coro(obj, &SigObject::sig1));
         if(res3.has_value()){
             return 10;
         }else{
@@ -157,7 +155,7 @@ void TestFiberAwait::test_case_signalawait()
         }
     }, Coro::Priority::Normal, Coro::Affinity::sticky());
     auto task4 = Coro::makeTask([obj](){
-        Coro::Result<void> res4 = Coro::await<void>(obj, &SigObject::sig2);
+        Coro::Result<void> res4 = Coro::await(Coro::coro<void>(obj, &SigObject::sig2));
         if(res4.has_value()){
             return 10;
         }else{
@@ -189,9 +187,9 @@ void TestFiberAwait::test_case_signalawait()
 void TestFiberAwait::test_case_signal_generate()
 {
     SigObject* obj = new SigObject();
-    auto gen1 = Coro::generate(obj, &SigObject::sig2);
-    auto gen2 = Coro::generate<int>(obj, &SigObject::sig2);
-    auto gen3 = Coro::generate<void>(obj, &SigObject::sig2);
+    auto gen1 = Coro::generate(Coro::coro(obj, &SigObject::sig2));
+    auto gen2 = Coro::generate(Coro::coro<int>(obj, &SigObject::sig2));
+    auto gen3 = Coro::generate(Coro::coro<void>(obj, &SigObject::sig2));
     auto task1 = Coro::makeTask([&gen1]() mutable {
         int k=0;
         for(const auto [v_i, v_s] : gen1){
@@ -242,7 +240,7 @@ void TestFiberAwait::test_case_iodevice_await()
     connect(dev, &QBuffer::readyRead, dev, [](){
         qDebug() << "ready read";
     });
-    auto res = Coro::awaitReadAll(dev);
+    auto res = Coro::await(Coro::coro(dev).readAll());
     TQVERIFY(res.has_value() == true);
     TQVERIFY(res.value() == "aaaaaaaa");
     dev->close();
@@ -252,7 +250,7 @@ void TestFiberAwait::test_case_iodevice_await()
 void TestFiberAwait::test_case_iodevice_generate()
 {
     QBuffer * dev = new QBuffer();
-    auto gen = Coro::generateReadAll(dev);
+    auto gen = Coro::generate(Coro::coro(dev).readAll());
     dev->open(QBuffer::ReadWrite);
     auto task1 = Coro::makeTask([dev]() mutable {
         for(int i=0; i<100; i++){
@@ -287,7 +285,7 @@ void TestFiberAwait::test_case_socket_await()
     });
     auto task_server = Coro::makeTask([server](){
         server->listen(QHostAddress::LocalHost, 40080);
-        Coro::Generator<QTcpSocket*> gen = Coro::generateNewConnection(server);
+        Coro::Generator<QTcpSocket*> gen = Coro::generate(Coro::coro(server).nextConnection());
         int client_cnt{0};
         for(QTcpSocket* p_socket : gen){
             client_cnt++;
@@ -300,7 +298,7 @@ void TestFiberAwait::test_case_socket_await()
             });
             Coro::makeTask([p_socket, client_cnt](){
                 int k = 0;
-                auto gen_msg = Coro::generateReadAll(p_socket);
+                auto gen_msg = Coro::generate(Coro::coro(p_socket).readAll());
                 for(const auto & msg : gen_msg){///ping pong服务端
                     p_socket->write(msg);
                     boost::this_fiber::yield();
@@ -315,7 +313,7 @@ void TestFiberAwait::test_case_socket_await()
             Coro::makeTask([i](){
                 QTcpSocket *client = new QTcpSocket();
                 client->connectToHost(QHostAddress::LocalHost, 40080);
-                Coro::awaitForConnected(client);
+                Coro::await(Coro::coro(client).waitForConnected());
                 connect(client, &QTcpSocket::aboutToClose, [i](){
                     qDebug() << "client about to close" << i;
                 });
@@ -324,7 +322,7 @@ void TestFiberAwait::test_case_socket_await()
                         break ;
                     }
                     int size = client->write("aaaaaa");
-                    Coro::Result<QByteArray> r = Coro::awaitReadAll(client);
+                    Coro::Result<QByteArray> r = Coro::await(Coro::coro(client).readAll());
                     if(r){
                         TQVERIFY(r.value() == "aaaaaa");
                         qDebug() << "awaitReadAll true" << i << " " << k;
@@ -342,7 +340,10 @@ void TestFiberAwait::test_case_socket_await()
     task_client.get();
     Coro::sleep(4);
     server->close();
-    server->deleteLater();
+    // 立即销毁 server：触发 coro(server).nextConnection() 的 destroyed 收尾，使
+    // 服务端生成器结束、task_server.get() 返回。此时全部 ping-pong 已完成、
+    // 各连接处理协程均已结束，销毁其子 socket 是安全的。
+    delete server;
     task_server.get();
 }
 

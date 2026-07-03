@@ -188,9 +188,12 @@ private:
 ///
 template<typename T>
 Generator<T> generate(Awaitable<T> a){
-    return Generator<T>([a = std::move(a)](auto yield) mutable {
+    // Awaitable move-only，而 launch_properties 会拷贝 fiber 函数，
+    // 故用 shared_ptr 持有以保证生产者 lambda 可拷贝（单一所有权仍在此 shared_ptr）。
+    auto sa = std::make_shared<Awaitable<T>>(std::move(a));
+    return Generator<T>([sa](auto yield){
         for(;;){
-            Result<T> r = a.await();
+            Result<T> r = sa->await();
             if(!r.has_value()){
                 return;
             }

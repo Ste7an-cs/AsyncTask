@@ -8,8 +8,6 @@
 #include "await/awaitable.hpp"
 #include "await/generator.hpp"
 #include "detail/result.hpp"
-#include "await/signalawait.hpp"
-#include "await/iodeviceawait.hpp"
 
 class TestProfile : public QObject
 {

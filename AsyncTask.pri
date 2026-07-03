@@ -21,22 +21,16 @@ HEADERS += \
     $$PWD/coro/executor/qtfiberthread.h \
     $$PWD/coro/executor/scheduler/qtlocalfiberscheduler.h \
     $$PWD/coro/task/fiberapplication.h \
-    $$PWD/coro/await/futureawait.hpp \
-    $$PWD/coro/await/iodeviceawait.hpp \
-    $$PWD/coro/await/signalawait.hpp
+    $$PWD/coro/await/coro.hpp \
+    $$PWD/coro/await/detail/signalpack.hpp
 SOURCES += \
     $$PWD/coro/executor/scheduler/qtfiberscheduler.cpp \
     $$PWD/coro/executor/qtfiberthread.cpp \
     $$PWD/coro/executor/scheduler/qtlocalfiberscheduler.cpp \
-    $$PWD/coro/task/fiberapplication.cpp \
-    $$PWD/coro/await/iodeviceawait.cpp
+    $$PWD/coro/task/fiberapplication.cpp
 }
 contains(QT, network){
 QT += network
-HEADERS += \
-    $$PWD/coro/await/socketawait.hpp
-SOURCES += \
-    $$PWD/coro/await/socketawait.cpp
 }
 contains(QT, widgets){
 
