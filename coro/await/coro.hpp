@@ -16,6 +16,8 @@
 ///     全部 Qt 依赖集中在这些 coro* 头文件中；Awaitable 本体与 Qt 解耦。
 ///
 
+#include "awaitable.hpp"   // 消费: await(a) / await(a, timeout)
+#include "generator.hpp"   // 消费: generate(a)
 #include "corosignal.hpp"
 #include "corofuture.hpp"
 #include "coroiodevice.hpp"
