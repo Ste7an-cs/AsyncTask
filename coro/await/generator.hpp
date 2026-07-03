@@ -180,6 +180,28 @@ private:
     Awaitable<void> awaiter_;
     boost::fibers::fiber fb_;
 };
+
+///
+/// \brief generate 把一个 Awaitable 适配为 Generator（流式消费）。
+///     按值接管 Awaitable；生成器 fiber 内循环 await：有值则 yield，关闭/出错则结束。
+///     用法：for(auto v : Coro::generate(coro(obj, &T::sig))){ ... }
+///
+template<typename T>
+Generator<T> generate(Awaitable<T> a){
+    return Generator<T>([a = std::move(a)](auto yield) mutable {
+        for(;;){
+            Result<T> r = a.await();
+            if(!r.has_value()){
+                return;
+            }
+            if constexpr (std::is_void_v<T>){
+                yield();
+            }else{
+                yield(r.value());
+            }
+        }
+    });
+}
 }
 
 #endif // GENERATOR_H
