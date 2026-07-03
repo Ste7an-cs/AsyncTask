@@ -22,7 +22,14 @@ HEADERS += \
     $$PWD/coro/executor/scheduler/qtlocalfiberscheduler.h \
     $$PWD/coro/task/fiberapplication.h \
     $$PWD/coro/await/coro.hpp \
-    $$PWD/coro/await/detail/signalpack.hpp
+    $$PWD/coro/await/corosignal.hpp \
+    $$PWD/coro/await/corofuture.hpp \
+    $$PWD/coro/await/coroiodevice.hpp \
+    $$PWD/coro/await/corosocket.hpp \
+    $$PWD/coro/await/corotcpserver.hpp \
+    $$PWD/coro/await/corolocalsocket.hpp \
+    $$PWD/coro/await/detail/signalpack.hpp \
+    $$PWD/coro/await/detail/lifecycle.hpp
 SOURCES += \
     $$PWD/coro/executor/scheduler/qtfiberscheduler.cpp \
     $$PWD/coro/executor/qtfiberthread.cpp \
