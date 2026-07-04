@@ -1,153 +1,153 @@
 ---
 name: using-asynctask
-description: Use when writing, generating, or modifying C++ code that uses the AsyncTask coroutine framework (namespace `Coro`, boost.fiber based) — makeTask/then/get task chains, awaiting Qt signals/sockets/QIODevice/futures with coro()/await()/generate(), Awaitable/Generator/Result, or the installFiberApplication/exec/quit lifecycle. Also when hitting AsyncTask pitfalls (main-thread coroutines not running, process won't exit, deleteLater deferred, runtime affinity change ignored).
+description: 当编写、生成或修改使用 AsyncTask 协程框架（命名空间 `Coro`，基于 boost.fiber）的 C++ 代码时使用 —— 涉及 makeTask/then/get 任务链、用 coro()/await()/generate() 等待 Qt 信号/socket/QIODevice/future、Awaitable/Generator/Result，或 installFiberApplication/exec/quit 生命周期。遇到 AsyncTask 常见问题（主线程协程不执行、进程无法退出、deleteLater 延迟、运行时改线程亲和无效）时也适用。
 ---
 
-# Using AsyncTask (Coro)
+# AsyncTask（Coro）使用指南
 
-## Overview
+## 概述
 
-AsyncTask is a **stackful coroutine** framework (built on boost.fiber) for Qt/C++17. A coroutine that waits **yields its thread instead of blocking it**, so you write async logic as straight-line synchronous-style code while many coroutines run concurrently on a few threads.
+AsyncTask 是基于 boost.fiber 的**有栈协程**框架，面向 Qt/C++17。等待中的协程会**让出线程而非阻塞线程**，因此可以用同步风格的顺序代码书写异步逻辑，同时让大量协程在少量线程上并发运行。
 
-Core rules (violating any of these is the usual cause of bugs):
+三条核心规则（违反其一是绝大多数 bug 的根源）：
 
-1. **Drive the app with `Coro::exec()`, NOT `QCoreApplication::exec()`.** The fiber scheduler is the main loop; it pumps Qt events itself. The two are mutually exclusive on the same thread.
-2. **Shut down with `Coro::quit()`** — it wakes suspended coroutines, drains in-flight work, then exits. Skipping it causes hang-on-exit or exit crashes.
-3. **Everything lives in namespace `Coro`.** Do `using namespace Coro;`.
+1. **用 `Coro::exec()` 驱动主循环，不要用 `QCoreApplication::exec()`。** 协程调度器就是主循环，它自己会泵送 Qt 事件；二者在同一线程互斥。
+2. **用 `Coro::quit()` 退出** —— 它会唤醒挂起协程、排空在途任务再退出。不调用会导致退出时卡死或崩溃。
+3. **所有 API 都在命名空间 `Coro` 下。** 先 `using namespace Coro;`。
 
-## When to use
+## 何时使用
 
-- Writing any code that calls `makeTask`, `coro`, `await`, `generate`, `Coro::exec/quit`, `Awaitable`, `Generator`, `Result`.
-- Awaiting a Qt signal / socket / `QIODevice` / `QFuture` / `std::future` as if it were synchronous.
-- Setting up an AsyncTask program or a dedicated coroutine thread.
-- Debugging: main-thread coroutines don't run, process won't exit, `deleteLater` never fires, affinity change ignored.
+- 编写任何调用 `makeTask`、`coro`、`await`、`generate`、`Coro::exec/quit`、`Awaitable`、`Generator`、`Result` 的代码。
+- 需要把 Qt 信号 / socket / `QIODevice` / `QFuture` / `std::future` 当成同步调用来等待。
+- 搭建 AsyncTask 程序或创建专用协程线程。
+- 排障：主线程协程不执行、进程无法退出、`deleteLater` 不生效、改线程亲和无效。
 
-Not for: non-coroutine Qt code, or picking the framework itself (that decision is already made).
+不适用：非协程的普通 Qt 代码，或“是否选用本框架”的选型决策（该决策已定）。
 
-## Setup
+## 环境配置
 
-**`.pro` file** (Qt project — Qt bits auto-enable when `QT` has `core`/`network`):
+**`.pro` 文件**（Qt 工程；`QT` 含 `core`/`network` 时自动启用对应 Qt 能力）：
 ```pro
-QT += core network            # network needed for socket/tcpserver coro() wrappers
+QT += core network            # socket / tcpserver 的 coro() 包装器需要 network
 CONFIG += console c++17
-include($$PWD/path/to/AsyncTask.pri)   # adjust relative path
+include($$PWD/path/to/AsyncTask.pri)   # 按实际相对路径修改
 SOURCES += main.cpp
 ```
 
-**Includes** (only what you use):
+**头文件**（按需引入）：
 ```cpp
 #include "task/fiberapplication.h"   // installFiberApplication / exec / quit
 #include "task/fibertask.h"          // makeTask / FiberTask / Priority / Affinity
-#include "await/coro.hpp"            // umbrella: coro()/await()/generate() for all sources
-// or a specific source header: await/corosignal.hpp, corosocket.hpp, corotcpserver.hpp,
-//    coroiodevice.hpp, corolocalsocket.hpp, corofuture.hpp, await/generator.hpp
+#include "await/coro.hpp"            // 伞头：一次性引入所有来源的 coro()/await()/generate()
+// 或按来源单独引入：await/corosignal.hpp、corosocket.hpp、corotcpserver.hpp、
+//    coroiodevice.hpp、corolocalsocket.hpp、corofuture.hpp、await/generator.hpp
 #include "detail/asyncdefine.h"      // sleep / msleep / launch_properties
-#include "executor/qtfiberthread.h"  // QtFiberThread (dedicated coroutine thread)
+#include "executor/qtfiberthread.h"  // QtFiberThread（专用协程线程）
 using namespace Coro;
 ```
 
-## Program skeleton (always this shape)
+## 程序骨架（固定为这个形状）
 
 ```cpp
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
-    installFiberApplication();      // install scheduler on main thread + start worker pool
+    installFiberApplication();      // 主线程安装调度器 + 启动工作线程池
 
     makeTask([]{
-        // ... your coroutine logic; await/sleep here yield the thread ...
-        quit();                     // safe shutdown when done
+        // ... 协程逻辑；这里的 await/sleep 会让出线程 ...
+        quit();                     // 完成后安全退出
         return 0;
     });
 
-    return exec();                  // Coro::exec() — NOT app.exec()
+    return exec();                  // Coro::exec() —— 不是 app.exec()
 }
 ```
 
-## Quick reference
+## 速查表
 
-| Need | API |
+| 需求 | 接口 |
 |---|---|
-| Start a coroutine task | `auto t = makeTask(fn, pri=Priority::Normal, affine=Affinity::fixed(current thread));` |
-| Chain after result | `t.then([](Prev v){ return ...; })` |
-| End-of-chain callback | `t.on_finally([]{ ... })` |
-| Cancel a chain | `t.cancel();` (only short-circuits not-yet-started nodes) |
-| Get result (yields) | `Result<T> r = t.get();` |
-| Read a Result | `if (r) use(r.value());` / `r.value_or(def)` / `r.has_value()` / `r.error()` |
-| Priority | `Priority::Low / Normal / High` |
-| Affinity | `Affinity::shared()` / `sticky()` / `fixed(threadId)` |
-| Await a signal | `auto r = await(coro(obj, &Obj::sig));` |
-| Await, force types | `await(coro<int>(obj, &Obj::sig));` |
-| Await w/ timeout | `await(coro(...), std::chrono::milliseconds(500))` |
-| Socket / iodevice | `await(coro(sock).waitForConnected());` `await(coro(dev).readAll())` |
-| Accept connections | `for (QTcpSocket* s : generate(coro(server).nextConnection())) {...}` |
-| Await a future | `await(coro(std::move(fut)));` |
-| Stream any Awaitable | `for (auto v : generate(coro(...))) {...}` |
-| Yield / sleep in coroutine | `boost::this_fiber::yield();` `sleep(1);` `msleep(100);` |
-| Dedicated coroutine thread | `auto* w = new QtFiberThread(); w->start(); ... w->quit();` |
-| Low-level fiber | `auto fb = launch_properties(fn, pri, affine); fb.detach();` |
+| 启动协程任务 | `auto t = makeTask(fn, pri=Priority::Normal, affine=Affinity::fixed(当前线程));` |
+| 链式后继 | `t.then([](Prev v){ return ...; })` |
+| 任务链结束回调 | `t.on_finally([]{ ... })` |
+| 取消任务链 | `t.cancel();`（只令尚未开始的节点短路） |
+| 取结果（让出式） | `Result<T> r = t.get();` |
+| 读取 Result | `if (r) use(r.value());` / `r.value_or(def)` / `r.has_value()` / `r.error()` |
+| 优先级 | `Priority::Low / Normal / High` |
+| 线程亲和 | `Affinity::shared()` / `sticky()` / `fixed(threadId)` |
+| 等待信号 | `auto r = await(coro(obj, &Obj::sig));` |
+| 等待并指定类型 | `await(coro<int>(obj, &Obj::sig));` |
+| 带超时等待 | `await(coro(...), std::chrono::milliseconds(500))` |
+| socket / iodevice | `await(coro(sock).waitForConnected());` `await(coro(dev).readAll())` |
+| 接受连接 | `for (QTcpSocket* s : generate(coro(server).nextConnection())) {...}` |
+| 等待 future | `await(coro(std::move(fut)));` |
+| 把任意 Awaitable 当流 | `for (auto v : generate(coro(...))) {...}` |
+| 协程内让出 / 休眠 | `boost::this_fiber::yield();` `sleep(1);` `msleep(100);` |
+| 专用协程线程 | `auto* w = new QtFiberThread(); w->start(); ... w->quit();` |
+| 底层创建协程 | `auto fb = launch_properties(fn, pri, affine); fb.detach();` |
 
-Signal arity → result type: no args → `Awaitable<void>`; one arg → `Awaitable<Value>`; many → `Awaitable<tuple<...>>`. Awaiting a void signal returns `Result<void>` — usable as a bool (`if (await(coro(obj,&sig)))`), or just ignore it for fire-and-continue.
+信号参数目数 → 结果类型：无参 → `Awaitable<void>`；单参 → `Awaitable<Value>`；多参 → `Awaitable<tuple<...>>`。等待无参(void)信号返回 `Result<void>` —— 可当 bool 用（`if (await(coro(obj,&sig)))`），也可忽略返回值作“触发即继续”。
 
-**Coordinate shutdown across coroutines:** `quit()` should run only after the work is truly done. To wait for other coroutines/tasks first, **capture their `FiberTask` and call `.get()`** (which yields, not blocks) before `quit()`:
+**跨协程协调退出：** `quit()` 应在工作真正完成后才调用。若要先等其它协程/任务结束，**捕获其 `FiberTask` 并调用 `.get()`**（让出而非阻塞）再 `quit()`：
 ```cpp
-auto job = makeTask([]{ /* background work */ return 1; });
-makeTask([job]{ job.get(); /* now safe */ quit(); return 0; });  // join then quit
+auto job = makeTask([]{ /* 后台工作 */ return 1; });
+makeTask([job]{ job.get(); /* 现在安全了 */ quit(); return 0; });  // 先 join 再 quit
 ```
 
-## Recipes
+## 常用范式
 
-**Task chain (structured concurrency)**
+**任务链（结构化并发）**
 ```cpp
 auto task = makeTask([]{ return 10; }, Priority::Normal, Affinity::sticky())
-    .then([](int v){ return v + 1; })       // prev result is the argument
+    .then([](int v){ return v + 1; })       // 前驱结果作为入参
     .on_finally([]{ qDebug() << "chain done"; });
-Result<int> r = task.get();                 // yields until ready, doesn't block thread
+Result<int> r = task.get();                 // 让出直到就绪，不阻塞线程
 ```
 
-**Await a Qt signal (synchronous-style)**
+**等待 Qt 信号（同步风格）**
 ```cpp
 makeTask([]{
     QTimer* timer = new QTimer();
     timer->start(500);
-    await(coro(timer, &QTimer::timeout));   // yields; thread stays free
+    await(coro(timer, &QTimer::timeout));   // 让出协程；线程保持空闲可用
     timer->deleteLater();
     quit();
     return 0;
 });
 ```
 
-**Socket ping / stream read**
+**socket 收发 / 流式读取**
 ```cpp
 QTcpSocket* c = new QTcpSocket();
 c->connectToHost(QHostAddress::LocalHost, 40088);
 await(coro(c).waitForConnected());
 c->write("ping");
 QByteArray data = await(coro(c).readAll()).value_or(QByteArray());
-// stream: for (const QByteArray& msg : generate(coro(c).readAll())) { ... }
+// 流式：for (const QByteArray& msg : generate(coro(c).readAll())) { ... }
 ```
 
-**Generator (producer/consumer stream)**
+**Generator（生产者/消费者数据流）**
 ```cpp
 Generator<int> squares([](auto yield){
-    for (int i = 0; i < 6; i++){ msleep(100); yield(i * i); }  // pause yields thread
+    for (int i = 0; i < 6; i++){ msleep(100); yield(i * i); }  // 暂停期间让出线程
 });
 for (int v : squares) qDebug() << v;
 ```
 
-**Producer/consumer via an Awaitable channel**
+**用 Awaitable 通道做生产者/消费者**
 ```cpp
 Awaitable<int> a;
 auto prod = makeTask([ch = a.channel()]{ for(int i=0;i<10;i++) ch->push(i); ch->close(); });
 auto cons = makeTask([&a]{ while (auto v = a.await()) { /* v.value() */ } });
 ```
 
-**Dedicated coroutine thread + Shared coroutines**
+**专用协程线程 + Shared 协程**
 ```cpp
 installFiberApplication();
 QtFiberThread* worker = new QtFiberThread();
-worker->start();                            // also schedules Shared coroutines
+worker->start();                            // 也会参与 Shared 协程的调度
 makeTask([]{
-    auto fb = launch_properties([]{ msleep(100); /* runs on some worker */ },
+    auto fb = launch_properties([]{ msleep(100); /* 在某工作线程上运行 */ },
                                 Priority::High, Affinity::shared());
     fb.detach();
     quit(); return 0;
@@ -156,26 +156,26 @@ int rc = exec();
 worker->quit(); delete worker;
 ```
 
-## Critical rules & pitfalls
+## 关键规则与常见问题
 
-| Symptom | Cause & fix |
+| 现象 | 原因与排除 |
 |---|---|
-| Main-thread coroutines never run | You drove the loop with `QCoreApplication::exec()`. Use `Coro::exec()` (fiber scheduler is the main loop and pumps Qt events; the two are mutually exclusive per thread). |
-| Process won't exit / crashes on exit | You didn't call `Coro::quit()`. It wakes suspended coroutines, drains in-flight tasks, then exits. Don't let detached coroutines touch Qt objects after `QCoreApplication` is destroyed. |
-| `deleteLater` never fires mid-run | During coroutine scheduling Qt doesn't dispatch `DeferredDelete` until `quit()`. For immediate release use plain `delete`. |
-| Changed `Affinity` at runtime but coroutine didn't migrate | Not supported. Set thread affinity at creation via `Affinity`; do not repeatedly re-affinitize a running coroutine. |
-| `coro(socket)` / `coro(server)` not found | Missing `QT += network`, or include the specific header (`await/corosocket.hpp` etc.) or the umbrella `await/coro.hpp`. |
-| Link error: incompatible ASan runtimes | In test `.pro`, keep `-static-libasan`, remove `LIBS += -lasan`. |
-| qmake can't find boost | Install boost to `/usr/local` (see ReadMe §2.2) and `include(AsyncTask.pri)`. |
+| 主线程协程从不执行 | 用了 `QCoreApplication::exec()` 驱动主循环。改用 `Coro::exec()`（协程调度器即主循环并泵 Qt 事件；二者同线程互斥）。 |
+| 进程无法退出 / 退出崩溃 | 没调用 `Coro::quit()`。它会唤醒挂起协程、排空在途任务再退出。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
+| 运行中 `deleteLater` 迟迟不生效 | 协程调度期间 Qt 不派发 `DeferredDelete`，通常到 `quit()` 才处理。需要即时释放请用普通 `delete`。 |
+| 运行中改 `Affinity` 但协程未迁移线程 | 不受支持。请在创建协程时用 `Affinity` 指定线程归属，勿运行中反复 `setAffinity` 迁移。 |
+| 找不到 `coro(socket)` / `coro(server)` | 缺 `QT += network`，或未引入对应头（`await/corosocket.hpp` 等）或伞头 `await/coro.hpp`。 |
+| 链接报 ASan 运行时不兼容 | 测试 `.pro` 中保留 `-static-libasan`，去掉 `LIBS += -lasan`。 |
+| qmake 找不到 boost | 未按 ReadMe §2.2 将 boost 安装到 `/usr/local`，或未 `include(AsyncTask.pri)`。 |
 
-## Common mistakes
+## 常见错误
 
-- Calling `app.exec()` instead of `exec()` (Coro). Always the latter.
-- Forgetting `quit()` — the program hangs at shutdown.
-- Blocking calls inside a coroutine (`QThread::sleep`, `waitForXxx`, `future.get()`): these block the whole thread. Use `sleep`/`msleep`/`this_fiber::yield` and `await(coro(...))` instead.
-- Capturing the whole `Awaitable` in a producer lambda — capture `a.channel()` (a `shared_ptr`) instead, to avoid a reference cycle.
-- Passing an `Awaitable` by copy — it is move-only; move it, or hand it straight to `await`/`generate`.
+- 用 `app.exec()` 而非 `exec()`（Coro）。始终用后者。
+- 忘记 `quit()` —— 程序退出时卡死。
+- 在协程内做阻塞调用（`QThread::sleep`、`waitForXxx`、`future.get()`）：这些会阻塞整个线程。请改用 `sleep`/`msleep`/`this_fiber::yield` 与 `await(coro(...))`。
+- 在生产者 lambda 中捕获整个 `Awaitable` —— 应捕获 `a.channel()`（一个 `shared_ptr`），以避免引用环。
+- 按值拷贝 `Awaitable` —— 它是 move-only；请移动它，或直接交给 `await`/`generate`。
 
-## Reference
+## 参考
 
-Deeper design/behavior: `ReadMe.md` §3, `doc/需求规格说明.md` (what & why), `doc/软件设计说明.md` (how it works, with diagrams), runnable `example/` (basic, signal_await, socket_pingpong, generator, thread_init).
+更深入的设计/行为：`ReadMe.md` §3、`doc/需求规格说明.md`（做什么与为什么）、`doc/软件设计说明.md`（怎么实现，含图）、可运行的 `example/`（basic、signal_await、socket_pingpong、generator、thread_init）。
