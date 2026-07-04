@@ -1,10 +1,10 @@
 #ifndef COROIODEVICE_HPP
 #define COROIODEVICE_HPP
 
-///
-/// \file coroiodevice.hpp
-/// \brief QIODevice 的协程包装器：coro(QIODevice*).readAll()/waitForReadyRead()/... 返回 Awaitable。
-///
+/**
+ * @file coroiodevice.hpp
+ * @brief QIODevice 的协程包装器：coro(QIODevice*).readAll()/waitForReadyRead()/... 返回 Awaitable。
+ */
 
 #include <memory>
 #include <QObject>
@@ -16,15 +16,22 @@
 
 namespace Coro {
 
-///
-/// \brief The CoroIODevice class QIODevice 的协程包装器（镜像原方法名）。
-///
+/**
+ * @brief QIODevice 的协程包装器（方法名镜像原 Qt API）
+ */
 class CoroIODevice{
-    QPointer<QIODevice> dev_;
+    QPointer<QIODevice> dev_;///< 被包装的设备（弱引用）
 public:
+    /**
+     * @brief 构造
+     * @param dev 被包装的 QIODevice
+     */
     explicit CoroIODevice(QIODevice* dev): dev_(dev){}
 
-    /// 等待可读并返回读取的全部数据；可 generate 流式读取
+    /**
+     * @brief 等待可读并返回读取的全部数据；可 generate 流式读取
+     * @return 产出 QByteArray 的 Awaitable
+     */
     Awaitable<QByteArray> readAll(){
         Awaitable<QByteArray> a;
         auto ch = a.channel();
@@ -39,7 +46,10 @@ public:
         a.setOnClose(detail::bind_close(dev_.data(), ch, {c1}));
         return a;
     }
-    /// 等待可读（不取数据）
+    /**
+     * @brief 等待可读（不取数据）
+     * @return 就绪时触发一次的 Awaitable<void>
+     */
     Awaitable<void> waitForReadyRead(){
         Awaitable<void> a;
         auto ch = a.channel();
@@ -48,7 +58,10 @@ public:
         a.setOnClose(detail::bind_close(dev_.data(), ch, {c}));
         return a;
     }
-    /// 等待数据写出
+    /**
+     * @brief 等待数据写出
+     * @return 写出时触发一次的 Awaitable<void>
+     */
     Awaitable<void> waitForBytesWritten(){
         Awaitable<void> a;
         auto ch = a.channel();
@@ -59,6 +72,11 @@ public:
     }
 };
 
+/**
+ * @brief 构造 QIODevice 的协程包装器
+ * @param dev 被包装的 QIODevice
+ * @return CoroIODevice 包装器
+ */
 inline CoroIODevice coro(QIODevice* dev){ return CoroIODevice(dev); }
 
 }

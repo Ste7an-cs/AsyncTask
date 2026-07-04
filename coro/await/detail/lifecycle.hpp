@@ -10,15 +10,17 @@
 namespace Coro {
 namespace detail {
 
-///
-/// \brief bind_close 为一个 channel 绑定统一的生命周期：
-///     来源对象析构、或应用 aboutToQuit 时，关闭 channel（使等待/生成器收敛）。
-///     并把主连接与这两条清理连接汇总为一个断连回调（供 Awaitable::setOnClose）。
-/// \param sender 来源 QObject（可为空）
-/// \param ch     目标 channel 的 shared_ptr
-/// \param conns  已建立的主连接列表
-/// \return 断开所有连接的清理函数
-///
+/**
+ * @brief 为一个 channel 绑定统一的生命周期收尾。
+ *
+ * 来源对象析构、或应用 aboutToQuit 时关闭 channel（使等待/生成器收敛），并把
+ * 主连接与这两条清理连接汇总为一个断连回调（供 Awaitable::setOnClose）。
+ * @tparam ChPtr channel 的智能指针类型
+ * @param sender 来源 QObject（可为空）
+ * @param ch 目标 channel 的 shared_ptr
+ * @param conns 已建立的主连接列表
+ * @return 断开所有连接的清理函数
+ */
 template<class ChPtr>
 std::function<void()> bind_close(QObject* sender, ChPtr ch,
                                  std::vector<std::shared_ptr<QMetaObject::Connection>> conns){

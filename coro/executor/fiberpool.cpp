@@ -10,17 +10,29 @@
 #else
 #include "scheduler/fiberscheduler.h"
 #endif
+
+/**
+ * @brief 获取全局单例，首次调用按 max(硬件并发, 2) 创建工作线程
+ * @return 单例引用
+ */
 Coro::FibersPool &Coro::FibersPool::instance()
 {
     static FibersPool fibers(std::max(std::thread::hardware_concurrency(), 2U));
     return fibers;
 }
 
+/**
+ * @brief 关闭线程池：唤醒各工作线程使其退出
+ */
 void Coro::FibersPool::close()
 {
     block.close();
 }
 
+/**
+ * @brief 构造：创建 work_num 个工作线程并设置线程名
+ * @param work_num 工作线程数量
+ */
 Coro::FibersPool::FibersPool(const int work_num)
 {
     for(int i=0; i<work_num; i++){
@@ -38,6 +50,9 @@ Coro::FibersPool::FibersPool(const int work_num)
     }
 }
 
+/**
+ * @brief 析构：join 所有工作线程
+ */
 Coro::FibersPool::~FibersPool()
 {
     for(auto& td:tds){
@@ -47,6 +62,9 @@ Coro::FibersPool::~FibersPool()
     }
 }
 
+/**
+ * @brief 工作线程主体：安装调度算法后 block.wait() 挂起（线程不退出、可调度协程）
+ */
 void Coro::FibersPool::worker()
 {
 #ifdef ASYNC_HAS_QTCORE

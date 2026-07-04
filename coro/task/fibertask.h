@@ -6,16 +6,20 @@
 
 namespace Coro {
 
-///
-/// \brief The SharedState struct 每个Task共享的状态，用于记录Finally
-///
+/**
+ * @brief 每个 Task 共享的状态，用于记录在途节点数、取消标志与结束回调。
+ *
+ * 一条任务链上的所有 FiberTask 共享同一个 SharedState。
+ */
 struct SharedState{
-    std::atomic_int pending_cnt{0};
-    std::atomic_bool is_runnable{true};
-    std::vector<std::function<void()>> finally_cbs;
+    std::atomic_int pending_cnt{0};///< 在途节点计数
+    std::atomic_bool is_runnable{true};///< 取消标志，false 表示已取消
+    std::vector<std::function<void()>> finally_cbs;///< 结束回调列表
+    /** @brief 登记一个节点（在途计数加一） */
     void add_nodes(){
         pending_cnt.fetch_add(1);
     }
+    /** @brief 完成一个节点（在途计数减一），归零时触发全部结束回调 */
     void done_nodes() noexcept {
         if(pending_cnt.fetch_sub(1) == 0){
             for(auto& func : finally_cbs){
@@ -25,23 +29,30 @@ struct SharedState{
     }
 };
 
-///
-/// \brief The TaskExit class 用于终止任务的异常
-///
+/**
+ * @brief 用于终止任务的异常
+ */
 class TaskExit : public std::exception{
 public:
+    /**
+     * @brief 构造
+     * @param msg 终止任务时的消息
+     */
     TaskExit(const std::string& msg = "task exit"):msg_(msg){}
+    /**
+     * @brief 异常描述
+     * @return 消息字符串
+     */
     const char * what() const noexcept override{
         return msg_.c_str();
     }
 private:
-    std::string msg_;
+    std::string msg_;///< 终止消息
 };
 
-///
-/// \brief terminal_task 终止任务
-/// \param msg  终止任务时的消息
-///
+/**
+ * @brief 终止当前任务（抛出 TaskExit 异常）
+ */
 inline void terminal_task(){
     throw TaskExit();
 }
@@ -49,45 +60,57 @@ inline void terminal_task(){
 template<typename T>
 class FiberTask;
 
-///
-/// \brief 结构化并发任务
-///
+/**
+ * @brief 结构化并发任务句柄。
+ *
+ * 持有结果 future、共享状态与本任务的优先级/线程模型；then/on_finally/cancel/
+ * get 构成链式编排接口。
+ * @tparam T 任务返回值类型
+ */
 template<typename T>
 class FiberTask
 {
 public:
 
-    ///
-    /// \brief FiberTask 链式调用构造函数，该函数不会被使用
-    /// \param f
-    /// \param s
-    /// \param pri
-    /// \param affine
-    ///
+    /**
+     * @brief 链式调用构造函数（内部使用）
+     * @param f 结果 future
+     * @param s 任务链共享状态
+     * @param pri 优先级
+     * @param affine 线程模型
+     */
     explicit FiberTask(std::shared_ptr<boost::fibers::future<Result<T>>> f, std::shared_ptr<SharedState> s, Priority pri=Priority::Normal, Affinity affine=Affinity::shared())
         : future_ptr_(f), state_ptr_(s), pri_(pri), affine_(affine){}
 
-    ///
-    /// \brief cancel 取消任务
-    ///
+    /**
+     * @brief 取消任务链（尚未开始的后继在启动前短路）
+     */
     void cancel(){
         if(state_ptr_){
             this->state_ptr_->is_runnable.store(false);
         }
     }
 
-    ///
-    /// \brief 定义下一个任务，下一个任务的优先级和线程模型继承自上一个任务
-    ///
+    /**
+     * @brief 定义下一个任务，下一个任务的优先级和线程模型继承自上一个任务
+     * @tparam Func 后继函数类型
+     * @param func 后继函数
+     * @return 后继任务句柄
+     */
     template<typename Func>
     auto then(Func&& func)
 //    ->FiberTask<std::invoke_result_t<Func, T>>
     {
         return then(func, this->pri_, this->affine_);
     }
-    ///
-    /// \brief 定义下一个任务，并指定优先级和线程模型
-    ///
+    /**
+     * @brief 定义下一个任务，并指定优先级和线程模型
+     * @tparam Func 后继函数类型
+     * @param func 后继函数（以前驱结果为入参）
+     * @param pri 后继优先级
+     * @param affine 后继线程模型
+     * @return 后继任务句柄
+     */
     template<typename Func>
     auto then(Func&& func, Priority pri, Affinity affine)
 //    ->FiberTask<std::invoke_result_t<Func, T>>
@@ -127,7 +150,12 @@ public:
         fiber.detach();
         return FiberTask<ReturnType>(next_future_ptr, state_ptr_, pri, affine);
     }
-    /// 注册任务结束后执行的函数
+    /**
+     * @brief 注册任务链全部结束后执行的回调
+     * @tparam Func 回调类型
+     * @param func 结束回调
+     * @return 自身任务句柄（便于链式调用）
+     */
     template<typename Func>
     auto on_finally(Func&& func){
         if(state_ptr_){
@@ -135,7 +163,10 @@ public:
         }
         return FiberTask<T>(future_ptr_, state_ptr_, pri_, affine_);
     }
-    /// 获取结果
+    /**
+     * @brief 获取任务结果（结果未就绪时协程让出等待）
+     * @return 任务结果；异常/取消时返回 interrupted 错误
+     */
     Result<T> get() {
         try {
             return future_ptr_->get();
@@ -146,30 +177,43 @@ public:
 protected:
 
 private:
-    std::shared_ptr<boost::fibers::future<Result<T>>> future_ptr_;
-    std::shared_ptr<SharedState> state_ptr_;
-    Priority pri_{Priority::Normal};
-    Affinity affine_{Affinity::shared()};
+    std::shared_ptr<boost::fibers::future<Result<T>>> future_ptr_;///< 结果 future
+    std::shared_ptr<SharedState> state_ptr_;///< 任务链共享状态
+    Priority pri_{Priority::Normal};///< 本任务优先级
+    Affinity affine_{Affinity::shared()};///< 本任务线程模型
 };
 
-///
-/// \brief FiberTask在返回值为void时的重载
-///
+/**
+ * @brief FiberTask 在返回值为 void 时的特化
+ */
 template<>
 class FiberTask<void>
 {
 public:
+    /**
+     * @brief 链式调用构造函数（内部使用）
+     * @param f 结果 future
+     * @param s 任务链共享状态
+     * @param pri 优先级
+     * @param affine 线程模型
+     */
     explicit FiberTask(std::shared_ptr<boost::fibers::future<Result<void>>> f, std::shared_ptr<SharedState> s, Priority pri=Priority::Normal, Affinity affine=Affinity::shared())
         : future_ptr_(f), state_ptr_(s), pri_(pri), affine_(affine){}
-    ///
-    /// \brief cancel 取消任务
-    ///
+    /**
+     * @brief 取消任务链（尚未开始的后继在启动前短路）
+     */
     void cancel(){
         if(state_ptr_){
             this->state_ptr_->is_runnable.store(false);
         }
     }
 
+    /**
+     * @brief 定义下一个任务，优先级和线程模型继承自上一个任务
+     * @tparam Func 后继函数类型
+     * @param func 后继函数
+     * @return 后继任务句柄
+     */
     template<typename Func>
     auto then(Func&& func)
 //    ->FiberTask<std::invoke_result_t<Func>>
@@ -177,6 +221,14 @@ public:
         return then(func, this->pri_, this->affine_);
     }
 
+    /**
+     * @brief 定义下一个任务，并指定优先级和线程模型
+     * @tparam Func 后继函数类型
+     * @param func 后继函数
+     * @param pri 后继优先级
+     * @param affine 后继线程模型
+     * @return 后继任务句柄
+     */
     template<typename Func>
     auto then(Func&& func, Priority pri, Affinity affine)
 //    ->FiberTask<std::invoke_result_t<Func>>
@@ -209,6 +261,12 @@ public:
         fiber.detach();
         return FiberTask<ReturnType>(next_future_ptr, state_ptr_, pri, affine);
     }
+    /**
+     * @brief 注册任务链全部结束后执行的回调
+     * @tparam Func 回调类型
+     * @param func 结束回调
+     * @return 自身任务句柄（便于链式调用）
+     */
     template<typename Func>
     auto on_finally(Func&& func){
         if(state_ptr_){
@@ -216,6 +274,10 @@ public:
         }
         return FiberTask<void>(future_ptr_, state_ptr_, pri_, affine_);
     }
+    /**
+     * @brief 获取任务结果（结果未就绪时协程让出等待）
+     * @return 任务结果；异常/取消时返回 interrupted 错误
+     */
     Result<void> get() {
         try {
             return future_ptr_->get();
@@ -224,19 +286,22 @@ public:
         }
     }
 private:
-    std::shared_ptr<boost::fibers::future<Result<void>>> future_ptr_;
-    std::shared_ptr<SharedState> state_ptr_;
-    Priority pri_{Priority::Normal};
-    Affinity affine_{Affinity::shared()};
+    std::shared_ptr<boost::fibers::future<Result<void>>> future_ptr_;///< 结果 future
+    std::shared_ptr<SharedState> state_ptr_;///< 任务链共享状态
+    Priority pri_{Priority::Normal};///< 本任务优先级
+    Affinity affine_{Affinity::shared()};///< 本任务线程模型
 };
 
-///
-/// \brief makeTask 创建一个fibertask
-/// \param func 第一个task执行函数
-/// \param pri  优先级
-/// \param affine   线程模型
-/// \return
-///
+/**
+ * @brief 创建一个 FiberTask（启动任务链的首个协程）。
+ *
+ * 若为 sticky 模式，先执行一个空函数获取可用的线程 id 再绑定。
+ * @tparam Func 首个任务函数类型
+ * @param func 第一个 task 执行函数
+ * @param pri 优先级
+ * @param affine 线程模型（默认固定到当前线程）
+ * @return 任务句柄
+ */
 template <typename Func>
 auto makeTask(Func&& func, Priority pri=Priority::Normal, Affinity affine=Affinity::fixed(std::this_thread::get_id()))->FiberTask<std::invoke_result_t<Func>>{
     using ReturnType = std::invoke_result_t<Func>;

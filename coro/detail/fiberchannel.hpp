@@ -9,22 +9,29 @@
 
 namespace Coro {
 
-///
-/// \brief The FiberChannel class 跨线程/跨协程安全的队列，可用于两个线程/协程间数据传递
-///         代替boost::fibers::unbufferd_channel，原生的unbufferd_channel在非协程上pop时会crash
-///
+/**
+ * @brief 跨线程/跨协程安全的队列，可用于两个线程/协程间数据传递。
+ *
+ * 代替 boost::fibers::unbuffered_channel——原生的 unbuffered_channel 在
+ * 非协程线程上 pop 时会 crash。内部用 fiber 版 mutex/condition_variable，
+ * 等待时让出协程而非阻塞线程。
+ * @tparam T 队列元素类型
+ */
 template<class T>
 class FiberChannel{
     using channel_status = boost::fibers::channel_op_status;
 public:
+    /** @brief 默认构造，创建空队列 */
     FiberChannel() = default;
+    /** @brief 禁止拷贝构造 */
     FiberChannel(const FiberChannel& ) = delete ;
+    /** @brief 禁止拷贝赋值 */
     FiberChannel& operator=(const FiberChannel&) = delete ;
-    ///
-    /// \brief push 添加一个元素value至队列
-    /// \param value
-    /// \return 成功返回success，如果channel关闭，返回closed
-    ///
+    /**
+     * @brief 添加一个元素 value 至队列
+     * @param value 待入队的元素
+     * @return 成功返回 success；如果 channel 已关闭返回 closed
+     */
     channel_status push(T value){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         if ( BOOST_UNLIKELY( is_closed() ) ) {
@@ -34,11 +41,11 @@ public:
         cv_consumer_.notify_one();
         return channel_status::success;
     }
-    ///
-    /// \brief pop 获取一个元素至引用参数，如果channel中无可用值，阻塞/协程等待
-    /// \param value 引用参数
-    /// \return 成功返回success，如果channel关闭，返回closed
-    ///
+    /**
+     * @brief 获取一个元素至引用参数，如果 channel 中无可用值则阻塞/协程等待
+     * @param out 输出参数，取到的元素
+     * @return 成功返回 success；如果 channel 已关闭返回 closed
+     */
     channel_status pop(T& out){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         cv_consumer_.wait(lck, [this](){return !queue_.empty() || closed_.load();});
@@ -49,12 +56,14 @@ public:
         queue_.pop_front();
         return channel_status::success;
     }
-    ///
-    /// \brief pop 获取一个元素至引用参数，如果channel中无可用值，阻塞/协程等待，最大等待时长为timeout_duration
-    /// \param value 引用参数
-    /// \param timeout_duration 超时时间
-    /// \return 成功返回success，如果channel关闭，返回closed
-    ///
+    /**
+     * @brief 获取一个元素至引用参数，无可用值则等待，最长等待 timeout_duration
+     * @tparam Rep 时长的计数类型
+     * @tparam Period 时长的周期类型
+     * @param out 输出参数，取到的元素
+     * @param timeout_duration 超时时间
+     * @return 成功返回 success；如果 channel 已关闭或超时返回 closed
+     */
     template< typename Rep, typename Period >
     channel_status pop_wait_for( T & out,
                                  std::chrono::duration< Rep, Period > const& timeout_duration){
@@ -67,10 +76,11 @@ public:
         queue_.pop_front();
         return channel_status::success;
     }
-    ///
-    /// \brief value_pop 阻塞等待可用的值，如果channel关闭，则抛异常
-    /// \return 可用的值
-    ///
+    /**
+     * @brief 阻塞等待可用的值，如果 channel 关闭则抛异常
+     * @return 可用的值
+     * @throws boost::fibers::fiber_error channel 已关闭
+     */
     T value_pop(){
         for(;;){
             std::unique_lock<boost::fibers::mutex> lck{mtx_};
@@ -88,19 +98,26 @@ public:
             return out;
         }
     }
+    /**
+     * @brief 查询 channel 是否已关闭
+     * @return 已关闭返回 true
+     */
     bool is_closed() const noexcept {
         return closed_.load( std::memory_order_acquire);
     }
+    /**
+     * @brief 关闭 channel，唤醒并收敛所有等待者
+     */
     void close() noexcept {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         closed_.store(true);
         cv_consumer_.notify_all();
     }
 private:
-    boost::fibers::mutex mtx_;
-    boost::fibers::condition_variable cv_consumer_;//通知消费者
-    std::deque<T> queue_{};
-    std::atomic_bool closed_{false};
+    boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量
+    boost::fibers::condition_variable cv_consumer_;///< 通知消费者的条件变量
+    std::deque<T> queue_{};///< 底层元素队列
+    std::atomic_bool closed_{false};///< 关闭标志
 
 
 };

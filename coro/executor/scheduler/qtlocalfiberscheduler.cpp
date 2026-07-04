@@ -1,16 +1,26 @@
 #include "qtlocalfiberscheduler.h"
 #include <QDebug>
 
+/**
+ * @brief 构造
+ */
 Coro::QtLocalFiberScheduler::QtLocalFiberScheduler():QtFiberScheduler()
 {
 
 }
 
+/**
+ * @brief 析构
+ */
 Coro::QtLocalFiberScheduler::~QtLocalFiberScheduler()
 {
 
 }
 
+/**
+ * @brief 取下一个可运行协程：只取“本线程 Fixed → Shared”，命中则 attach 到本线程
+ * @return 下一个可运行的 fiber 上下文；无则返回 nullptr
+ */
 boost::fibers::context *Coro::QtLocalFiberScheduler::pick_next() noexcept
 {
     boost::fibers::context *ctx{nullptr};
@@ -43,6 +53,10 @@ boost::fibers::context *Coro::QtLocalFiberScheduler::pick_next() noexcept
     return ctx;
 }
 
+/**
+ * @brief 判断本线程是否有可用协程（Shared、本线程 Fixed，或本线程主队列非空）
+ * @return 有则返回 true
+ */
 bool Coro::QtLocalFiberScheduler::has_ready_fibers() const noexcept
 {
     std::lock_guard<std::mutex> guard(global_mtx);

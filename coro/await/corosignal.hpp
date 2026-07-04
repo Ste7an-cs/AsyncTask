@@ -1,11 +1,12 @@
 #ifndef COROSIGNAL_HPP
 #define COROSIGNAL_HPP
 
-///
-/// \file corosignal.hpp
-/// \brief Qt 信号的协程等待工厂：coro(obj, &T::sig) 返回 Awaitable。
-///     信号无参 -> Awaitable<void>；单参 -> Awaitable<Value>；多参 -> Awaitable<tuple<...>>。
-///
+/**
+ * @file corosignal.hpp
+ * @brief Qt 信号的协程等待工厂：coro(obj, &T::sig) 返回 Awaitable。
+ *
+ * 信号无参 -> Awaitable<void>；单参 -> Awaitable<Value>；多参 -> Awaitable<tuple<...>>。
+ */
 
 #include <memory>
 #include <tuple>
@@ -21,7 +22,16 @@ namespace Coro {
 
 namespace detail {
 
-/// 信号 -> Awaitable：连接信号，把参数打包 push 进 channel；析构/来源销毁/退出时收尾。
+/**
+ * @brief 信号 -> Awaitable：连接信号，把参数打包 push 进 channel；析构/来源销毁/退出时收尾。
+ * @tparam Obj 发送者对象类型
+ * @tparam Sig 信号（成员函数指针）类型
+ * @tparam A 信号参数类型包
+ * @param obj 发送者对象
+ * @param sig 信号
+ * @param 信号参数 tuple 指针（仅用于类型推导）
+ * @return 对应的 Awaitable
+ */
 template<class Obj, class Sig, class... A>
 auto coro_signal_impl(Obj* obj, Sig sig, std::tuple<A...>*){
     using PR = pack_result<A...>;
@@ -41,7 +51,18 @@ auto coro_signal_impl(Obj* obj, Sig sig, std::tuple<A...>*){
     return a;
 }
 
-/// 信号 -> Awaitable（指定所需类型 Want...，取信号前 K 个参数构造 R）
+/**
+ * @brief 信号 -> Awaitable（指定所需类型 Want...，取信号前 K 个参数构造 R）
+ * @tparam Obj 发送者对象类型
+ * @tparam Sig 信号（成员函数指针）类型
+ * @tparam Want 期望取用并构造的类型包
+ * @tparam A 信号参数类型包
+ * @param obj 发送者对象
+ * @param sig 信号
+ * @param 期望类型 tuple 指针（仅用于类型推导）
+ * @param 信号参数 tuple 指针（仅用于类型推导）
+ * @return 对应的 Awaitable
+ */
 template<class Obj, class Sig, class... Want, class... A>
 auto coro_signal_typed_impl(Obj* obj, Sig sig, std::tuple<Want...>*, std::tuple<A...>*){
     constexpr std::size_t K = sizeof...(Want);
@@ -66,19 +87,32 @@ auto coro_signal_typed_impl(Obj* obj, Sig sig, std::tuple<Want...>*, std::tuple<
 
 } // detail
 
-///
-/// \brief coro 等待一个 Qt 信号，返回 Awaitable。
-///     用 await(coro(obj,sig)) 取一次，或 generate(coro(obj,sig)) 流式迭代。
-///
+/**
+ * @brief 等待一个 Qt 信号，返回 Awaitable。
+ *
+ * 用 await(coro(obj,sig)) 取一次，或 generate(coro(obj,sig)) 流式迭代。
+ * @tparam Obj 发送者对象类型
+ * @tparam Sig 信号（成员函数指针）类型
+ * @param obj 发送者对象
+ * @param sig 信号
+ * @return 对应的 Awaitable
+ */
 template<class Obj, class Sig>
 auto coro(Obj* obj, Sig sig){
     return detail::coro_signal_impl(
         obj, sig, static_cast<typename detail::signal_args<Sig>::type*>(nullptr));
 }
 
-///
-/// \brief coro 等待一个 Qt 信号并指定所需类型，如 coro<int>(obj, &Obj::sig2)。
-///
+/**
+ * @brief 等待一个 Qt 信号并指定所需类型，如 coro<int>(obj, &Obj::sig2)。
+ * @tparam W0 期望取用的首个类型
+ * @tparam Wr 期望取用的其余类型
+ * @tparam Obj 发送者对象类型
+ * @tparam Sig 信号（成员函数指针）类型
+ * @param obj 发送者对象
+ * @param sig 信号
+ * @return 对应的 Awaitable
+ */
 template<class W0, class... Wr, class Obj, class Sig>
 auto coro(Obj* obj, Sig sig){
     return detail::coro_signal_typed_impl(

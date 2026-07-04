@@ -6,15 +6,27 @@ using namespace boost::fibers::algo;
 using namespace Coro;
 
 std::mutex FiberScheduler::global_mtx{};
+
+/**
+ * @brief 构造
+ */
 FiberScheduler::FiberScheduler()
 {
 
 }
 
+/**
+ * @brief 析构
+ */
 FiberScheduler::~FiberScheduler()
 {
 }
 
+/**
+ * @brief 协程就绪时的处理：pinned 上下文留在本线程主队列，其余 detach 后入全局队列
+ * @param ctx 被唤醒的 fiber 上下文
+ * @param props fiber 的属性
+ */
 void Coro::FiberScheduler::awakened(boost::fibers::context *ctx, Coro::MetaContext &props) noexcept
 {
     // fiber自身的事件，必须绑定至scheduler所在的线程，这里缓存至main_queue_
@@ -33,6 +45,12 @@ void Coro::FiberScheduler::awakened(boost::fibers::context *ctx, Coro::MetaConte
     }
 }
 
+/**
+ * @brief 取下一个可运行协程：按“本线程 Fixed → 本线程 Sticky → 未分配 Sticky → Shared”取用。
+ *
+ * 命中全局队列则 attach 到本线程；否则从本线程主队列取调度任务。
+ * @return 下一个可运行的 fiber 上下文；无则返回 nullptr
+ */
 boost::fibers::context * Coro::FiberScheduler::pick_next() noexcept{
 
     boost::fibers::context *ctx{nullptr};
@@ -85,6 +103,10 @@ boost::fibers::context * Coro::FiberScheduler::pick_next() noexcept{
     return ctx;
 }
 
+/**
+ * @brief 判断本线程是否有可运行协程（全局队列中可被本线程取用者，或本线程主队列非空）
+ * @return 有则返回 true
+ */
 bool Coro::FiberScheduler::has_ready_fibers() const noexcept
 {
     std::lock_guard<std::mutex> guard(global_mtx);
@@ -101,6 +123,10 @@ bool Coro::FiberScheduler::has_ready_fibers() const noexcept
     }
 }
 
+/**
+ * @brief 无可运行协程时挂起线程至指定时刻或被 notify 唤醒
+ * @param time_point 下一个唤醒的时刻
+ */
 void Coro::FiberScheduler::suspend_until(const std::chrono::steady_clock::time_point &time_point) noexcept
 {
     if ( (std::chrono::steady_clock::time_point::max)() == time_point) {
@@ -119,6 +145,9 @@ void Coro::FiberScheduler::suspend_until(const std::chrono::steady_clock::time_p
     }
 }
 
+/**
+ * @brief 唤醒挂起在 suspend_until 的调度器线程
+ */
 void Coro::FiberScheduler::notify(void) noexcept
 {
     boost::unique_lock< boost::mutex > lk{ mtx_ };
@@ -127,6 +156,11 @@ void Coro::FiberScheduler::notify(void) noexcept
     cnd_.notify_all();
 }
 
+/**
+ * @brief 协程属性变更时：若已就绪则解除就绪态并重新调度
+ * @param ctx fiber 上下文
+ * @param props 变更后的属性
+ */
 void FiberScheduler::property_change(context *ctx, MetaContext &props) noexcept
 {
     ///当fiber已经就绪时（已经由pick_next返回），解除就绪态并重新调度
