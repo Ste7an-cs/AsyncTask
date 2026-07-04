@@ -74,7 +74,6 @@ struct pack_result<>{
 /**
  * @brief 根据传入的 tuple 类型获得对应的 pack_result 结果类型
  * @tparam A tuple 元素类型包
- * @param 空 tuple 指针（仅用于类型推导）
  * @return 结果类型的默认值（仅用于 decltype 推导）
  */
 template <class ...A>
@@ -90,7 +89,6 @@ constexpr auto tuple_pack_type(std::tuple<A...>*){
  * @tparam Tuple 源 tuple 类型
  * @tparam I 取用的下标序列
  * @param t 源 tuple
- * @param 下标序列（仅用于展开）
  * @return 构造出的目标类型对象
  */
 template <class R, class... Want, class Tuple, std::size_t... I>

@@ -24,8 +24,6 @@ FiberScheduler::~FiberScheduler()
 
 /**
  * @brief 协程就绪时的处理：pinned 上下文留在本线程主队列，其余 detach 后入全局队列
- * @param ctx 被唤醒的 fiber 上下文
- * @param props fiber 的属性
  */
 void Coro::FiberScheduler::awakened(boost::fibers::context *ctx, Coro::MetaContext &props) noexcept
 {

@@ -29,7 +29,6 @@ namespace detail {
  * @tparam A 信号参数类型包
  * @param obj 发送者对象
  * @param sig 信号
- * @param 信号参数 tuple 指针（仅用于类型推导）
  * @return 对应的 Awaitable
  */
 template<class Obj, class Sig, class... A>
@@ -59,8 +58,6 @@ auto coro_signal_impl(Obj* obj, Sig sig, std::tuple<A...>*){
  * @tparam A 信号参数类型包
  * @param obj 发送者对象
  * @param sig 信号
- * @param 期望类型 tuple 指针（仅用于类型推导）
- * @param 信号参数 tuple 指针（仅用于类型推导）
  * @return 对应的 Awaitable
  */
 template<class Obj, class Sig, class... Want, class... A>

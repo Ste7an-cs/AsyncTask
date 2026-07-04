@@ -263,9 +263,9 @@ template<typename U, typename E>
 struct is_result_type<Result<U, E>> : std::true_type{};
 
 /**
- * @brief 递归萃取 Result<T> 最内层非 Result 的类型。
+ * @brief 递归萃取 `Result<T>` 最内层非 Result 的类型。
  *
- * 对 Result<Result<T>> 提取类型 T（主模板：非 Result，类型即自身）。
+ * 对 `Result<Result<T>>` 提取类型 T（主模板：非 Result，类型即自身）。
  * @tparam T 待萃取类型
  */
 template <typename T>
@@ -274,7 +274,7 @@ struct result_inner_type{
 };
 
 /**
- * @brief 偏特化：T 为 Result<U>，继续递归萃取内层类型
+ * @brief 偏特化：T 为 `Result<U>`，继续递归萃取内层类型
  * @tparam U 内层类型
  */
 template <typename U>
@@ -282,7 +282,7 @@ struct result_inner_type<Result<U>>{
     using type = typename result_inner_type<U>::type;///< 萃取结果类型
 };
 /**
- * @brief 偏特化：T 为 Result<U, E>，继续递归萃取内层类型
+ * @brief 偏特化：T 为 `Result<U, E>`，继续递归萃取内层类型
  * @tparam U 内层类型
  * @tparam E 错误类型
  */
