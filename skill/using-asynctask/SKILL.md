@@ -86,7 +86,13 @@ int main(int argc, char* argv[]) {
 | Dedicated coroutine thread | `auto* w = new QtFiberThread(); w->start(); ... w->quit();` |
 | Low-level fiber | `auto fb = launch_properties(fn, pri, affine); fb.detach();` |
 
-Signal arity → result type: no args → `Awaitable<void>`; one arg → `Awaitable<Value>`; many → `Awaitable<tuple<...>>`.
+Signal arity → result type: no args → `Awaitable<void>`; one arg → `Awaitable<Value>`; many → `Awaitable<tuple<...>>`. Awaiting a void signal returns `Result<void>` — usable as a bool (`if (await(coro(obj,&sig)))`), or just ignore it for fire-and-continue.
+
+**Coordinate shutdown across coroutines:** `quit()` should run only after the work is truly done. To wait for other coroutines/tasks first, **capture their `FiberTask` and call `.get()`** (which yields, not blocks) before `quit()`:
+```cpp
+auto job = makeTask([]{ /* background work */ return 1; });
+makeTask([job]{ job.get(); /* now safe */ quit(); return 0; });  // join then quit
+```
 
 ## Recipes
 
