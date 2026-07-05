@@ -9,8 +9,9 @@ namespace Coro {
 /**
  * @brief 支持 Qt 事件循环的调度器。
  *
- * 覆写 suspend_until，在无就绪协程时用 QEventLoop::processEvents 泵一轮 Qt
- * 事件，使协程调度与 Qt 事件循环共存于同一线程；用于工作线程池。
+ * suspend_until 委托基类做阻塞（cv 等待，不空转）；每次进入空闲时起一个**一次性协程**
+ * （绑定当前线程、worker 上下文），分发一轮 Qt 事件后自行退出。一次性协程是有限的，
+ * 不残留、不会在线程析构时阻塞 boost.fiber 的 ~scheduler。
  */
 class QtFiberScheduler : public FiberScheduler
 {
@@ -21,19 +22,12 @@ public:
     ~QtFiberScheduler(void) override;
 
     /**
-     * @brief 没有可运行的协程时，休眠线程并驱动一轮 Qt 事件
+     * @brief 无就绪协程时：起一个一次性协程分发一轮 Qt 事件，随后委托基类阻塞
      * @param time_point 下一个唤醒的时刻
      */
     void suspend_until( std::chrono::steady_clock::time_point const& time_point) noexcept override;
-    /**
-     * @brief 唤醒挂起的调度器线程（同时唤醒 Qt 事件循环）
-     */
-    void notify(void) noexcept override;
 protected:
-    QEventLoop loop;///< 备用事件循环
-    std::atomic_bool interrupt_flg{false};///< 中断标志
-    boost::fibers::fiber event_fiber_;///< 事件协程（预留）
-    QEventLoop eventloop;///< 驱动 Qt 事件的事件循环
+    QEventLoop eventloop;   ///< 驱动 Qt 事件的事件循环（构造即创建本线程事件派发器）
 };
 
 }

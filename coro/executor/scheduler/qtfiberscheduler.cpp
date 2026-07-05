@@ -1,10 +1,7 @@
 #include "qtfiberscheduler.h"
-#include <QCoreApplication>
-#include <QAbstractEventDispatcher>
-#include <QThread>
+#include <thread>
 #include "detail/asyncdefine.h"
 #include <boost/fiber/all.hpp>
-#include <QDebug>
 
 /**
  * @brief 构造
@@ -21,29 +18,17 @@ Coro::QtFiberScheduler::~QtFiberScheduler(void)
 }
 
 /**
- * @brief 无可运行协程时休眠线程，同时用 processEvents 驱动一轮 Qt 事件
+ * @brief 无就绪协程时：起一个一次性协程分发一轮 Qt 事件，随后委托基类阻塞
+ *
+ * 一次性协程绑定当前线程、运行在 worker 上下文，`processEvents` 一轮即退出——因此不残留
+ * 无限协程，线程析构时不会卡在 boost.fiber 的 ~scheduler 等待它终止。Qt 回调也在 worker
+ * 上下文里执行（回调里可安全做协程阻塞）。
  * @param time_point 下一个唤醒的时刻
  */
 void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time_point &time_point) noexcept
 {
-    constexpr QEventLoop::ProcessEventsFlags flags = QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents;
-    if ( (std::chrono::steady_clock::time_point::max)() == time_point) {
-        eventloop.processEvents(flags, 200);
-        flag_ = false;
-    } else {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(time_point - std::chrono::steady_clock::now()).count();
-        if(duration > 0){
-            eventloop.processEvents(flags, duration);
-        }
-        flag_ = false;
-    }
-}
-
-/**
- * @brief 唤醒挂起的调度器线程（唤醒 Qt 事件循环）
- */
-void Coro::QtFiberScheduler::notify() noexcept
-{
-    flag_ = true;
-    eventloop.wakeUp();
+    boost::fibers::fiber(launch_properties([this]{
+        eventloop.processEvents(QEventLoop::AllEvents);   // 分发一轮 Qt 事件后退出
+    }, Priority::High, Affinity::fixed(std::this_thread::get_id()))).detach();
+    FiberScheduler::suspend_until(time_point);            // 委托基类阻塞
 }
