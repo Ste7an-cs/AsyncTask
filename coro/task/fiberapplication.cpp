@@ -54,16 +54,9 @@ int Coro::FiberApplication::exec()
  */
 void Coro::FiberApplication::quit()
 {
-    // ① 主动触发真正的 QCoreApplication::aboutToQuit。
-    //    本框架不跑 QCoreApplication::exec()（Coro::exec 实为 block.wait，Qt 事件靠
-    //    QtFiberScheduler::suspend_until 里的 processEvents 驱动），因此 exit()/quit()
-    //    不会发出 aboutToQuit，需在此主动触发。这样每个 awaitable 早已 connect 的
-    //    close 绑定被点亮，唤醒所有仍阻塞在 await() 里的协程。
     QMetaObject::invokeMethod(QCoreApplication::instance(), "aboutToQuit", Qt::DirectConnection);
     QtFiberScheduler::signalExit();
-    // ② 排空：应用仍存活时把被唤醒的协程及其 deleteLater 事件跑完。
     drainUntilIdle();
-    // ③ 停线程池、退出。
     block.close();
     Coro::FibersPool::instance().close();
     QCoreApplication::exit();
