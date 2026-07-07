@@ -1,6 +1,7 @@
 #include "fiberapplication.h"
 #include "executor/fiberpool.h"
 #include "executor/scheduler/qtlocalfiberscheduler.h"
+#include "executor/scheduler/qtfiberscheduler.h"
 #include "executor/scheduler/fibertaskqueue.h"
 #include <QEventLoop>
 #include <QElapsedTimer>
@@ -59,6 +60,9 @@ void Coro::FiberApplication::quit()
     //    不会发出 aboutToQuit，需在此主动触发。这样每个 awaitable 早已 connect 的
     //    close 绑定被点亮，唤醒所有仍阻塞在 await() 里的协程。
     QMetaObject::invokeMethod(QCoreApplication::instance(), "aboutToQuit", Qt::DirectConnection);
+    // 设置全局退出标志，令各线程常驻泵协程醒来后自行退出。须在 drain 和停池前调用，
+    // 这样线程析构时 ~scheduler 不会遇到无限协程而挂死：泵已看到标志退出 → 有界等待。
+    QtFiberScheduler::signalExit();
     // ② 排空：应用仍存活时把被唤醒的协程及其 deleteLater 事件跑完。
     drainUntilIdle();
     // ③ 停线程池、退出。
