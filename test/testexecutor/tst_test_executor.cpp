@@ -90,6 +90,10 @@ void test_executor::test_case_qtfiberthread()
     thread->deleteLater();
     qDebug() << "thread->quit()";
 
+    // 本函数用 QTEST_GUILESS_MAIN(不走 Coro::exec/quit), 主线程和 QtFiberThread 上都有
+    // QtFiberScheduler 常驻泵协程. 在 test 结束前调用 signalExit 设全局退出标志，让泵协程
+    // 醒来后自行退出；否则线程析构时 ~scheduler 会等无限协程终止而挂死。
+    Coro::QtFiberScheduler::signalExit();
 }
 void test_executor::test_case_fiberpool()
 {
@@ -126,6 +130,9 @@ void test_executor::test_case_fiberpool()
     qDebug() << "FibersPool close" << QDateTime::currentDateTime();
     QVERIFY(shared_cnt==100);
     QVERIFY(sticky_cnt==100);
+
+    // 同上：测试用 QTEST_GUILESS_MAIN，须在返回前让主线程的泵协程退出。
+    Coro::QtFiberScheduler::signalExit();
 }
 
 
