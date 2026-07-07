@@ -31,10 +31,10 @@ public:
     /** @brief 设置全局退出标志，令所有泵协程退出（Coro::quit() 中调用） */
     static void signalExit(void);
 protected:
-    QEventLoop eventloop;                  ///< 本线程事件循环（构造即创建事件派发器）
-    static std::atomic_bool s_exit_;       ///< 全局退出标志：quit() 置位，泵协程读到后退出
+    QEventLoop eventloop;                  ///< 本线程 Qt 事件循环
+    static std::atomic_bool s_exit_;       ///< 全局退出标志
     std::once_flag pump_once_;             ///< 每线程一次
-    int pump_interval_ms_{ 1 };            ///< 事件协程分发间隔(ms)
+    int pump_interval_ms_{ 1 };            ///< 事件分发间隔（ms）
 };
 
 }
