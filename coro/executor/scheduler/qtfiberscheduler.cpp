@@ -6,12 +6,15 @@
 std::atomic_bool Coro::QtFiberScheduler::s_exit_{ false };
 
 /**
- * @brief 构造 / 析构
+ * @brief 构造
  */
 Coro::QtFiberScheduler::QtFiberScheduler(void):FiberScheduler()
 {
 }
 
+/**
+ * @brief 析构
+ */
 Coro::QtFiberScheduler::~QtFiberScheduler(void)
 {
 }
@@ -25,8 +28,8 @@ void Coro::QtFiberScheduler::signalExit(void)
 }
 
 /**
- * @brief 无就绪协程时：首次空闲时创建事件协程（call_once），此后委托基类阻塞
- * @param time_point 唤醒时刻
+ * @brief 无就绪协程时：首次创建常驻事件协程（call_once），随后委托基类阻塞
+ * @param time_point 下一个唤醒的时刻
  */
 void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time_point &time_point) noexcept
 {
