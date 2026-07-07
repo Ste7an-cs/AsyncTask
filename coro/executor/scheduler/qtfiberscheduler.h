@@ -19,9 +19,7 @@ namespace Coro {
 class QtFiberScheduler : public FiberScheduler
 {
 public:
-    /** @brief 构造 */
     QtFiberScheduler(void);
-    /** @brief 析构 */
     ~QtFiberScheduler(void) override;
 
     /**
