@@ -185,4 +185,4 @@ worker->quit(); delete worker;
 
 ## 参考
 
-更深入的设计/行为：`ReadMe.md` §3、`doc/需求规格说明v2.md`（做什么与为什么）、`doc/软件设计说明.md`（怎么实现，含图）、可运行的 `example/`（basic、signal_await、socket_pingpong、generator、thread_init）。
+更深入的设计/行为：`ReadMe.md` §3、`doc/需求规格说明.md`（做什么与为什么）、`doc/软件设计说明.md`（怎么实现，含图）、可运行的 `example/`（basic、signal_await、socket_pingpong、generator、thread_init）。
