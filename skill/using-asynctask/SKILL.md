@@ -77,7 +77,7 @@ int main(int argc, char* argv[]) {
 | 线程亲和 | `Affinity::shared()` / `sticky()` / `fixed(threadId)` |
 | 等待信号 | `auto r = await(coro(obj, &Obj::sig));` |
 | 等待并指定类型 | `await(coro<int>(obj, &Obj::sig));` |
-| 带超时等待 | `await(coro(...), std::chrono::milliseconds(500))` |
+| 带超时等待 | `await_for(coro(...), std::chrono::milliseconds(500))` |
 | socket / iodevice | `await(coro(sock).waitForConnected());` `await(coro(dev).readAll())` |
 | 接受连接 | `for (QTcpSocket* s : generate(coro(server).nextConnection())) {...}` |
 | 等待 future | `await(coro(std::move(fut)));` |

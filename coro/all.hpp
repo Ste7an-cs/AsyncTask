@@ -24,7 +24,7 @@
 #include "task/fibertask.h"         // makeTask / FiberTask
 
 // —— 等待层（与 Qt 解耦部分）——
-#include "await/awaitable.hpp"      // Awaitable / await(a) / await(a, timeout)
+#include "await/awaitable.hpp"      // Awaitable / await(a) / await_for(a, timeout)
 #include "await/generator.hpp"      // Generator / generate(a)
 
 // —— Qt 相关能力（仅在启用 Qt 时引入）——

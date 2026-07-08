@@ -246,6 +246,9 @@ Result<T> await(Awaitable<T>&& a){
 }
 /**
  * @brief 消费一个 Awaitable：带超时取一次消息（左值重载）。
+ *
+ * 与不带超时的 await(a) 分属两个名字（而非 await 的重载），使自由函数命名与
+ * Awaitable 成员方法 await()/await_for(timeout) 保持一致的语义。
  * @tparam T 等待/传递的数据类型
  * @tparam Rep 时长的计数类型
  * @tparam Period 时长的周期类型
@@ -254,7 +257,7 @@ Result<T> await(Awaitable<T>&& a){
  * @return 取到数据返回 Result 值；超时返回 timed_out 错误
  */
 template<typename T, typename Rep, typename Period>
-Result<T> await(Awaitable<T>& a, const std::chrono::duration<Rep, Period>& timeout){
+Result<T> await_for(Awaitable<T>& a, const std::chrono::duration<Rep, Period>& timeout){
     return a.await_for(timeout);
 }
 /**
@@ -267,7 +270,7 @@ Result<T> await(Awaitable<T>& a, const std::chrono::duration<Rep, Period>& timeo
  * @return 取到数据返回 Result 值；超时返回 timed_out 错误
  */
 template<typename T, typename Rep, typename Period>
-Result<T> await(Awaitable<T>&& a, const std::chrono::duration<Rep, Period>& timeout){
+Result<T> await_for(Awaitable<T>&& a, const std::chrono::duration<Rep, Period>& timeout){
     return a.await_for(timeout);
 }
 
