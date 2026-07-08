@@ -3,8 +3,6 @@
 #include "detail/asyncdefine.h"
 #include <boost/fiber/all.hpp>
 
-std::atomic_bool Coro::QtFiberScheduler::s_exit_{ false };
-
 Coro::QtFiberScheduler::QtFiberScheduler(void):FiberScheduler()
 {
 }
@@ -13,16 +11,12 @@ Coro::QtFiberScheduler::~QtFiberScheduler(void)
 {
 }
 
-void Coro::QtFiberScheduler::signalExit(void)
-{
-    s_exit_.store(true, std::memory_order_release);
-}
-
 void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time_point &time_point) noexcept
 {
     std::call_once(pump_once_, [this]{
         boost::fibers::fiber(launch_properties([this]{
-            while (!s_exit_.load(std::memory_order_acquire)) {
+            while (!FiberScheduler::s_exit_.load(std::memory_order_acquire)
+                   && !FiberScheduler::t_stop_.load(std::memory_order_acquire)) {
                 eventloop.processEvents(QEventLoop::AllEvents);
                 Coro::msleep(pump_interval_ms_);
             }

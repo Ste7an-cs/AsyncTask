@@ -4,7 +4,6 @@
 #include "fiberscheduler.h"
 #include <QEventLoop>
 #include <mutex>
-#include <atomic>
 
 namespace Coro {
 
@@ -27,11 +26,8 @@ public:
      */
     void suspend_until(std::chrono::steady_clock::time_point const& time_point) noexcept override;
 
-    /** @brief 设置全局退出标志，令所有泵协程退出（Coro::quit() 中调用） */
-    static void signalExit(void);
 protected:
     QEventLoop eventloop;                    ///< 本线程 Qt 事件循环
-    static std::atomic_bool s_exit_;         ///< 全局退出标志
     std::once_flag pump_once_;               ///< 每线程一次
     int pump_interval_ms_{ 1 };              ///< 事件分发间隔（ms）
 };

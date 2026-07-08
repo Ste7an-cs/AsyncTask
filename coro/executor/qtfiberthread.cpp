@@ -31,9 +31,6 @@ void Coro::QtFiberThread::quit()
     QThread::quit();
 }
 
-/**
- * @brief 线程主体：安装 QtLocalFiberScheduler 后 block.wait() 挂起待命
- */
 void Coro::QtFiberThread::run()
 {
     boost::fibers::use_scheduling_algorithm<QtLocalFiberScheduler>();

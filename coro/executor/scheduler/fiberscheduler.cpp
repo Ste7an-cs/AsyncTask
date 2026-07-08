@@ -6,6 +6,8 @@ using namespace boost::fibers::algo;
 using namespace Coro;
 
 std::mutex FiberScheduler::global_mtx{};
+std::atomic_bool FiberScheduler::s_exit_{ false };
+thread_local std::atomic_bool FiberScheduler::t_stop_{ false };
 
 /**
  * @brief 构造
@@ -20,6 +22,22 @@ FiberScheduler::FiberScheduler()
  */
 FiberScheduler::~FiberScheduler()
 {
+}
+
+/**
+ * @brief 设全局退出标志，令所有线程的常驻（泵）协程退出
+ */
+void FiberScheduler::signalExit(void)
+{
+    s_exit_.store(true, std::memory_order_release);
+}
+
+/**
+ * @brief 停止当前线程的常驻（泵）协程
+ */
+void FiberScheduler::stopCurrentThreadPump(void)
+{
+    t_stop_.store(true, std::memory_order_release);
 }
 
 /**

@@ -6,6 +6,7 @@
 #include <boost/fiber/fiber.hpp>
 #include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
+#include <atomic>
 #include <deque>
 #include <queue>
 #include "fiberproperty.h"
@@ -18,8 +19,11 @@ using fiber = boost::fibers::fiber;
  * @brief 带优先级和线程模型的调度器。
  *
  * 实现 boost.fiber 的 algorithm_with_properties<MetaContext> 调度算法接口，
- * 是自定义调度的基类：就绪协程按亲和放入全局队列，各线程按“本线程 Fixed →
- * Sticky → 未分配 Sticky → Shared”的顺序取出执行。
+ * 是自定义调度的基类：就绪协程按亲和放入全局队列，各线程按"本线程 Fixed →
+ * Sticky → 未分配 Sticky → Shared"的顺序取出执行。
+ *
+ * 同时提供调度器退出所需的线程级 / 全局级停止接口（派生类可用，线程函数
+ * block.wait 返回后需停所在线程的常驻协程时调用）。
  */
 class FiberScheduler
         : public boost::fibers::algo::algorithm_with_properties<MetaContext>
@@ -81,6 +85,12 @@ public:
      */
     void property_change( boost::fibers::context * ctx, MetaContext & props) noexcept override;
 
+    // —— 调度器退出接口 ——
+    /** @brief 设置全局退出标志，令所有线程的常驻（泵）协程退出（Coro::quit() 中调用） */
+    static void signalExit(void);
+    /** @brief 停止当前线程的常驻（泵）协程（单线程提前退出时调用） */
+    static void stopCurrentThreadPump(void);
+
 protected://全局
     static std::mutex                       global_mtx;///< 全局锁，串行化全局队列的跨线程访问
 protected:
@@ -88,6 +98,10 @@ protected:
     boost::mutex                            mtx_{};///< 保护 suspend_until 等待的互斥量
     boost::condition_variable               cnd_{};///< suspend_until 的条件变量
     bool                                    flag_{ false };///< 唤醒标志
+
+    // 退出控制（static，所有调度器实例共享；子类可直接用）
+    static std::atomic_bool s_exit_;         ///< 全局退出标志
+    static thread_local std::atomic_bool t_stop_;///< 当前线程退出标志
 };
 
 }

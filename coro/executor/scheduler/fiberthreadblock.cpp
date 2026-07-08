@@ -1,5 +1,7 @@
 #include "fiberthreadblock.h"
 #include <boost/fiber/scheduler.hpp>
+#include <boost/fiber/operations.hpp>
+#include <chrono>
 #include "fiberscheduler.h"
 
 /**
@@ -21,11 +23,16 @@ void Coro::FiberThreadBlock::schedulerWait()
 }
 
 /**
- * @brief 阻塞当前线程直至 close
+ * @brief 阻塞当前线程直至 close。
+ *
+ * close() 唤醒后，自动停止本线程的常驻（泵）协程并短暂让出使其退出——之后再返回，
+ * 保证 boost.fiber 的 ~scheduler 不会因残留的无限泵协程而挂死。
  */
 void Coro::FiberThreadBlock::wait()
 {
     this->schedulerWait();
+    FiberScheduler::stopCurrentThreadPump();
+    boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
 }
 
 /**
