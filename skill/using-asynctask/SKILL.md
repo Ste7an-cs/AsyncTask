@@ -11,8 +11,8 @@ AsyncTask 是基于 boost.fiber 的**有栈协程**框架，面向 Qt/C++17。�
 
 三条核心规则（违反其一是绝大多数 bug 的根源）：
 
-1. **用 `Coro::exec()` 驱动主循环，不要用 `QCoreApplication::exec()`。** 协程调度器就是主循环，它自己会泵送 Qt 事件；二者在同一线程互斥。
-2. **用 `Coro::quit()` 退出** —— 它会唤醒挂起协程、排空在途任务再退出。不调用会导致退出时卡死或崩溃。
+1. **用 `Coro::exec()` 驱动主循环，不要用 `QCoreApplication::exec()`。** 协程调度器即主循环，Qt 事件由每个安装 `QtFiberScheduler` 的线程上的**常驻泵协程**（首次空闲时懒启动、在 worker 上下文持续 `processEvents`）分发；二者在同一线程互斥。
+2. **用 `Coro::quit()` 退出** —— 设置全局退出标志 → 各线程泵协程自行终止 → 唤醒挂起协程 → 排空在途任务 → 退出。**`block.wait()` 返回后会自动停止本线程的泵协程**，因此 `QtFiberThread` 等单独退出也安全。不调用 `quit()` 会导致退出时卡死或崩溃。
 3. **所有 API 都在命名空间 `Coro` 下。** 先 `using namespace Coro;`。
 
 ## 何时使用
@@ -155,6 +155,13 @@ makeTask([]{
 int rc = exec();
 worker->quit(); delete worker;
 ```
+
+## 调度与退出机制（简要）
+
+- **工作原理**：`QtFiberScheduler` 重写 `suspend_until`（无就绪协程时调用）：首次进入用 `std::call_once` 创建一个常驻泵协程（固定当前线程、worker 上下文、detach），它循环 `processEvents(AllEvents)` 分发 Qt 事件；`suspend_until` 自身委托基类 `FiberScheduler` 做真正的 cv 阻塞——因此空闲时线程真正睡眠、不满核空转。
+- **退出**：`Coro::quit()` 设全局退出标志 `FiberScheduler::s_exit_` → 各线程泵协程醒来看到标志、自行退出；`FiberThreadBlock::wait()` 返回前自动调 `FiberScheduler::stopCurrentThreadPump()` 设 `thread_local` 退出标志并短暂让出，确保 `~scheduler` 不挂死。`QtFiberThread::quit/析构 → block.close() → block.wait() 返回 → 自动停泵 → ~scheduler 干净` —— 无额外调用。
+- **泵在 worker 上下文**：泵协程不是调度器 dispatcher，Qt 回调跑在 worker 协程上 → 回调里**可以安全做协程阻塞**(`await`/`msleep`/`get`)；不会在 dispatcher 上下文 yield 而崩溃。
+- **QTimer / socket 在 worker 上可用**：`QtFiberScheduler` 构造时创建 `QEventLoop` 成员，为本线程创建 Qt 事件派发器 → QTimer/socket 等 Qt 对象在工作线程上也能工作（泵协程负责分发）。
 
 ## 关键规则与常见问题
 
