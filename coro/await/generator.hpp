@@ -34,6 +34,8 @@ public:
          * @param v 待产出的值
          */
         void operator()(const T& v){p_awaiter_->resolve(v);}
+        /** @brief 输出侧是否已关闭 */
+        bool is_closed() const{return p_awaiter_->channel()->is_closed();}
     };
 
     /**
@@ -179,6 +181,8 @@ public:
         explicit Yield(Awaitable<void> *c):p_awaiter_(c){}
         /** @brief 产出一次事件 */
         void operator()(){p_awaiter_->resolve();}
+        /** @brief 输出侧是否已关闭 */
+        bool is_closed() const{return p_awaiter_->channel()->is_closed();}
     };
 
     /**
@@ -332,6 +336,39 @@ Generator<T> generate(Awaitable<T> a){
                 yield(r.value());
             }
         }
+    });
+}
+
+/**
+ * @brief 把共享 Awaitable 适配为 Generator（流式消费）。
+ * @tparam T 产出的元素类型
+ * @param a 待消费等待器的共享句柄；按值强持有至源迭代结束
+ * @return 适配后的 Generator；空句柄返回可安全结束的关闭生成器
+ */
+template<typename T>
+Generator<T> generate(std::shared_ptr<Awaitable<T>> a){
+    return Generator<T>([a = std::move(a)](auto yield) mutable {
+        if(!a){
+            return;
+        }
+        while(!yield.is_closed()){
+            Result<T> r = a->await_for(std::chrono::milliseconds(10));
+            if(!r.has_value()){
+                if(r.error() == std::make_error_code(std::errc::timed_out)){
+                    auto channel = a->channel();
+                    if(channel && !channel->is_closed()){
+                        continue;
+                    }
+                }
+                break;
+            }
+            if constexpr (std::is_void_v<T>){
+                yield();
+            }else{
+                yield(r.value());
+            }
+        }
+        a.reset();
     });
 }
 }

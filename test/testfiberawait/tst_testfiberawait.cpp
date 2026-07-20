@@ -51,6 +51,9 @@ private slots:
     void test_case_channel_terminal_error();
     void test_case_await_timeout_then_value();
     void test_case_void_terminal_error();
+    void test_case_shared_awaitable();
+    void test_case_shared_generator_terminal_timeout();
+    void test_case_shared_awaitable_void();
     void test_case_generator();
     void test_case_signalawait();
     void test_case_signal_generate();
@@ -147,6 +150,105 @@ void TestFiberAwait::test_case_void_terminal_error()
     QCOMPARE(timeout.error(), std::make_error_code(std::errc::timed_out));
     QVERIFY(value.resolve());
     QVERIFY(Coro::await(value).has_value());
+}
+
+void TestFiberAwait::test_case_shared_awaitable()
+{
+    auto once = std::make_shared<Coro::Awaitable<int>>();
+    once->resolve(9);
+    QCOMPARE(Coro::await(once).value(), 9);
+
+    auto delayed = std::make_shared<Coro::Awaitable<int>>();
+    QCOMPARE(Coro::await_for(delayed, std::chrono::milliseconds(5)).error(),
+             std::make_error_code(std::errc::timed_out));
+    QVERIFY(delayed->resolve(42));
+    QCOMPARE(Coro::await(delayed).value(), 42);
+
+    std::shared_ptr<Coro::Awaitable<int>> nullAwaitable;
+    QCOMPARE(Coro::await(nullAwaitable).error(),
+             std::make_error_code(std::errc::invalid_argument));
+    QCOMPARE(Coro::await_for(nullAwaitable, std::chrono::milliseconds(5)).error(),
+             std::make_error_code(std::errc::invalid_argument));
+
+    auto stream = std::make_shared<Coro::Awaitable<int>>();
+    stream->resolve(1);
+    stream->resolve(2);
+    stream->close();
+    int total = 0;
+    for(int value : Coro::generate(stream)) total += value;
+    QCOMPARE(total, 3);
+
+    std::weak_ptr<Coro::Awaitable<int>> weakRetained;
+    {
+        auto retained = std::make_shared<Coro::Awaitable<int>>();
+        retained->resolve(4);
+        weakRetained = retained;
+        auto retainedGenerator = Coro::generate(retained);
+        retained.reset();
+        QVERIFY(!weakRetained.expired());
+        QCOMPARE(retainedGenerator.next().value(), 4);
+        weakRetained.lock()->close();
+        QCOMPARE(retainedGenerator.next().error(),
+                 std::make_error_code(std::errc::no_message));
+        QVERIFY(weakRetained.expired());
+    }
+
+    int nullTotal = 0;
+    for(int value : Coro::generate(nullAwaitable)) nullTotal += value;
+    QCOMPARE(nullTotal, 0);
+
+    auto sharedSource = std::make_shared<Coro::Awaitable<int>>();
+    auto destroyStart = std::chrono::steady_clock::now();
+    {
+        auto abandonedGenerator = Coro::generate(sharedSource);
+    }
+    auto destroyElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - destroyStart);
+    QVERIFY(destroyElapsed < std::chrono::milliseconds(100));
+    QVERIFY(sharedSource->resolve(17));
+    QCOMPARE(Coro::await(sharedSource).value(), 17);
+    sharedSource->close();
+}
+
+void TestFiberAwait::test_case_shared_generator_terminal_timeout()
+{
+    auto source = std::make_shared<Coro::Awaitable<int>>();
+    source->close(std::make_error_code(std::errc::timed_out));
+    std::weak_ptr<Coro::Awaitable<int>> weakSource = source;
+    auto generator = Coro::generate(source);
+    source.reset();
+
+    auto finishStart = std::chrono::steady_clock::now();
+    QCOMPARE(generator.next().error(),
+             std::make_error_code(std::errc::no_message));
+    auto finishElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - finishStart);
+    QVERIFY(finishElapsed < std::chrono::milliseconds(100));
+    QVERIFY(weakSource.expired());
+}
+
+void TestFiberAwait::test_case_shared_awaitable_void()
+{
+    auto once = std::make_shared<Coro::Awaitable<void>>();
+    QVERIFY(once->resolve());
+    QVERIFY(Coro::await(once).has_value());
+
+    auto delayed = std::make_shared<Coro::Awaitable<void>>();
+    QCOMPARE(Coro::await_for(delayed, std::chrono::milliseconds(5)).error(),
+             std::make_error_code(std::errc::timed_out));
+    QVERIFY(delayed->resolve());
+    QVERIFY(Coro::await(delayed).has_value());
+
+    auto stream = std::make_shared<Coro::Awaitable<void>>();
+    QVERIFY(stream->resolve());
+    QVERIFY(stream->resolve());
+    stream->close();
+    int events = 0;
+    for(bool event : Coro::generate(stream)){
+        QVERIFY(event);
+        ++events;
+    }
+    QCOMPARE(events, 2);
 }
 
 void TestFiberAwait::test_case_generator()

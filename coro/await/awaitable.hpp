@@ -66,7 +66,7 @@ public:
 
     /**
      * @brief 等待一条消息（无数据时让出当前协程，不阻塞线程）
-     * @return 取到数据返回 Result 值；队列已关闭返回 no_message 错误
+     * @return 取到数据返回 Result 值；队列关闭后返回首次终止错误，默认关闭为 no_message
      */
     Result<T, std::error_code> await(){
         if(ch_){
@@ -84,7 +84,7 @@ public:
      * @tparam Rep 时长的计数类型
      * @tparam Period 时长的周期类型
      * @param timeout 最长等待时长
-     * @return 取到数据返回 Result 值；超时返回 timed_out 错误
+     * @return 取到数据返回 Result 值；超时返回 timed_out，关闭返回首次终止错误
      */
     template<typename Rep, typename Period>
     Result<T, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
@@ -179,7 +179,7 @@ public:
 
     /**
      * @brief 等待事件发生一次（无数据时让出协程）
-     * @return 事件到达返回成功 Result；队列已关闭返回 no_message 错误
+     * @return 事件到达返回成功 Result；队列关闭后返回首次终止错误，默认关闭为 no_message
      */
     Result<void, std::error_code> await(){
         if(ch_){
@@ -198,7 +198,7 @@ public:
      * @tparam Rep 时长的计数类型
      * @tparam Period 时长的周期类型
      * @param timeout 最长等待时长
-     * @return 事件到达返回成功 Result；超时返回 timed_out 错误
+     * @return 事件到达返回成功 Result；超时返回 timed_out，关闭返回首次终止错误
      */
     template<typename Rep, typename Period>
     Result<void, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
@@ -252,7 +252,7 @@ public:
  * @brief 消费一个 Awaitable：取一次消息（左值重载，具名可反复取）。
  * @tparam T 等待/传递的数据类型
  * @param a 待消费的等待器
- * @return 取到数据返回 Result 值；来源关闭返回 no_message 错误
+ * @return 取到数据返回 Result 值；来源关闭返回首次终止错误，默认关闭为 no_message
  */
 template<typename T>
 Result<T> await(Awaitable<T>& a){
@@ -262,11 +262,24 @@ Result<T> await(Awaitable<T>& a){
  * @brief 消费一个临时 Awaitable：取一次消息（右值重载）。
  * @tparam T 等待/传递的数据类型
  * @param a 待消费的等待器（右值临时对象）
- * @return 取到数据返回 Result 值；来源关闭返回 no_message 错误
+ * @return 取到数据返回 Result 值；来源关闭返回首次终止错误，默认关闭为 no_message
  */
 template<typename T>
 Result<T> await(Awaitable<T>&& a){
     return a.await();
+}
+/**
+ * @brief 通过共享句柄消费一个 Awaitable：取一次消息。
+ * @tparam T 等待/传递的数据类型
+ * @param a 待消费等待器的共享句柄
+ * @return 取到数据返回 Result 值；空句柄返回 invalid_argument；来源关闭返回首次终止错误，默认关闭为 no_message
+ */
+template<typename T>
+Result<T> await(const std::shared_ptr<Awaitable<T>>& a){
+    if(!a){
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    return a->await();
 }
 /**
  * @brief 消费一个 Awaitable：带超时取一次消息（左值重载）。
@@ -278,7 +291,7 @@ Result<T> await(Awaitable<T>&& a){
  * @tparam Period 时长的周期类型
  * @param a 待消费的等待器
  * @param timeout 最长等待时长
- * @return 取到数据返回 Result 值；超时返回 timed_out 错误
+ * @return 取到数据返回 Result 值；超时返回 timed_out，关闭返回首次终止错误
  */
 template<typename T, typename Rep, typename Period>
 Result<T> await_for(Awaitable<T>& a, const std::chrono::duration<Rep, Period>& timeout){
@@ -291,11 +304,28 @@ Result<T> await_for(Awaitable<T>& a, const std::chrono::duration<Rep, Period>& t
  * @tparam Period 时长的周期类型
  * @param a 待消费的等待器（右值临时对象）
  * @param timeout 最长等待时长
- * @return 取到数据返回 Result 值；超时返回 timed_out 错误
+ * @return 取到数据返回 Result 值；超时返回 timed_out，关闭返回首次终止错误
  */
 template<typename T, typename Rep, typename Period>
 Result<T> await_for(Awaitable<T>&& a, const std::chrono::duration<Rep, Period>& timeout){
     return a.await_for(timeout);
+}
+/**
+ * @brief 通过共享句柄带超时消费一个 Awaitable。
+ * @tparam T 等待/传递的数据类型
+ * @tparam Rep 时长的计数类型
+ * @tparam Period 时长的周期类型
+ * @param a 待消费等待器的共享句柄
+ * @param timeout 最长等待时长
+ * @return 取到数据返回 Result 值；空句柄返回 invalid_argument；超时返回 timed_out，关闭返回首次终止错误
+ */
+template<typename T, typename Rep, typename Period>
+Result<T> await_for(const std::shared_ptr<Awaitable<T>>& a,
+                    const std::chrono::duration<Rep, Period>& timeout){
+    if(!a){
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    return a->await_for(timeout);
 }
 
 }
