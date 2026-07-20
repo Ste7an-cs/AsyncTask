@@ -31,3 +31,6 @@ Makefile.*
 # 编辑器/系统
 .DS_Store
 *.swp
+
+# 本地隔离开发工作区
+.worktrees/
