@@ -177,7 +177,7 @@ disconnectFromServer();
 nextConnection();
 ```
 
-返回 `std::shared_ptr<Awaitable<QLocalSocket*>>`；一次信号取完 pending connections，错误和关闭语义与 `QTcpServer` 对齐。
+返回 `std::shared_ptr<Awaitable<QLocalSocket*>>`；一次信号取完 pending connections。Qt 5.15 的 `QLocalServer` 没有与 `QTcpServer::acceptError()` 对应的运行期错误信号，因此 `listen()` 的同步失败由调用方立即检查 `serverError()/errorString()`，连接流仅在 server 关闭、销毁或应用退出时正常结束，不伪造异步 accept error。
 
 ### 6.5 QSslSocket
 
