@@ -6,6 +6,7 @@
 #include <boost/fiber/channel_op_status.hpp>
 #include <boost/fiber/exceptions.hpp>
 #include <deque>
+#include <system_error>
 
 namespace Coro {
 
@@ -62,13 +63,17 @@ public:
      * @tparam Period 时长的周期类型
      * @param out 输出参数，取到的元素
      * @param timeout_duration 超时时间
-     * @return 成功返回 success；如果 channel 已关闭或超时返回 closed
+     * @return 成功返回 success；超时返回 timeout；channel 已关闭返回 closed
      */
     template< typename Rep, typename Period >
     channel_status pop_wait_for( T & out,
                                  std::chrono::duration< Rep, Period > const& timeout_duration){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
-        cv_consumer_.wait_for(lck, timeout_duration, [this](){return !queue_.empty() || closed_.load();});
+        const bool ready = cv_consumer_.wait_for(
+                    lck, timeout_duration, [this](){return !queue_.empty() || closed_.load();});
+        if(!ready){
+            return channel_status::timeout;
+        }
         if(queue_.empty()){
             return channel_status::closed;
         }
@@ -109,15 +114,32 @@ public:
      * @brief 关闭 channel，唤醒并收敛所有等待者
      */
     void close() noexcept {
+        close(std::make_error_code(std::errc::no_message));
+    }
+    /**
+     * @brief 关闭 channel 并记录终止原因，唤醒并收敛所有等待者
+     * @param error 终止原因
+     */
+    void close(std::error_code error) noexcept {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        if(closed_.load()){
+            return;
+        }
+        close_error_ = error ? error : std::make_error_code(std::errc::no_message);
         closed_.store(true);
         cv_consumer_.notify_all();
     }
+    /** @brief 返回首次关闭 channel 时记录的终止原因 */
+    std::error_code close_error() const {
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        return close_error_;
+    }
 private:
-    boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量
+    mutable boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量
     boost::fibers::condition_variable cv_consumer_;///< 通知消费者的条件变量
     std::deque<T> queue_{};///< 底层元素队列
     std::atomic_bool closed_{false};///< 关闭标志
+    std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 终止原因
 
 
 };

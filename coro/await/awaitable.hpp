@@ -75,6 +75,7 @@ public:
             if(status == boost::fibers::channel_op_status::success){
                 return value;
             }
+            return ch_->close_error();
         }
         return std::make_error_code(std::errc::no_message);
     }
@@ -93,6 +94,10 @@ public:
             if(status == boost::fibers::channel_op_status::success){
                 return value;
             }
+            if(status == boost::fibers::channel_op_status::timeout){
+                return std::make_error_code(std::errc::timed_out);
+            }
+            return ch_->close_error();
         }
         return std::make_error_code(std::errc::timed_out);
     }
@@ -115,8 +120,15 @@ public:
      * @brief 关闭内部队列，唤醒并收敛所有等待者
      */
     void close(){
+        close(std::make_error_code(std::errc::no_message));
+    }
+    /**
+     * @brief 关闭内部队列并记录终止原因，唤醒并收敛所有等待者
+     * @param error 终止原因
+     */
+    void close(std::error_code error){
         if(ch_){
-            ch_->close();
+            ch_->close(error);
         }
     }
 };
@@ -176,6 +188,7 @@ public:
             if(status == boost::fibers::channel_op_status::success){
                 return Result<void, std::error_code>();
             }
+            return ch_->close_error();
         }
         return std::make_error_code(std::errc::no_message);
     }
@@ -195,6 +208,10 @@ public:
             if(status == boost::fibers::channel_op_status::success){
                 return Result<void, std::error_code>();
             }
+            if(status == boost::fibers::channel_op_status::timeout){
+                return std::make_error_code(std::errc::timed_out);
+            }
+            return ch_->close_error();
         }
         return std::make_error_code(std::errc::timed_out);
     }
@@ -218,8 +235,15 @@ public:
      * @brief 关闭内部队列，唤醒并收敛所有等待者
      */
     void close(){
+        close(std::make_error_code(std::errc::no_message));
+    }
+    /**
+     * @brief 关闭内部队列并记录终止原因，唤醒并收敛所有等待者
+     * @param error 终止原因
+     */
+    void close(std::error_code error){
         if(ch_){
-            ch_->close();
+            ch_->close(error);
         }
     }
 };

@@ -47,13 +47,17 @@ public:
 private slots:
     void begin();
     void test_case_awaiter();
+    void test_case_close_overloads();
+    void test_case_channel_terminal_error();
+    void test_case_await_timeout_then_value();
+    void test_case_void_terminal_error();
     void test_case_generator();
     void test_case_signalawait();
     void test_case_signal_generate();
     void test_case_iodevice_await();
     void test_case_iodevice_generate();
     void test_case_socket_await();
-    void end();
+    void cleanupTestCase();
 
 };
 
@@ -97,6 +101,52 @@ void TestFiberAwait::test_case_awaiter()
     task1.get();
     Coro::Result<int> res = task2.get();
     TQVERIFY(res.value() == 100);
+}
+
+void TestFiberAwait::test_case_close_overloads()
+{
+    void (Coro::FiberChannel<int>::*channelClose)() noexcept = &Coro::FiberChannel<int>::close;
+    void (Coro::Awaitable<int>::*valueClose)() = &Coro::Awaitable<int>::close;
+    void (Coro::Awaitable<void>::*voidClose)() = &Coro::Awaitable<void>::close;
+    QVERIFY(channelClose != nullptr);
+    QVERIFY(valueClose != nullptr);
+    QVERIFY(voidClose != nullptr);
+}
+
+void TestFiberAwait::test_case_channel_terminal_error()
+{
+    Coro::Awaitable<int> normal;
+    normal.close();
+    QCOMPARE(normal.await().error(), std::make_error_code(std::errc::no_message));
+
+    Coro::Awaitable<int> failed;
+    failed.resolve(7);
+    failed.close(std::make_error_code(std::errc::connection_refused));
+    failed.close(std::make_error_code(std::errc::timed_out));
+    QCOMPARE(failed.await().value(), 7);
+    QCOMPARE(failed.await().error(), std::make_error_code(std::errc::connection_refused));
+}
+
+void TestFiberAwait::test_case_await_timeout_then_value()
+{
+    Coro::Awaitable<int> value;
+    auto timeout = Coro::await_for(value, std::chrono::milliseconds(5));
+    QCOMPARE(timeout.error(), std::make_error_code(std::errc::timed_out));
+    QVERIFY(value.resolve(42));
+    QCOMPARE(Coro::await(value).value(), 42);
+}
+
+void TestFiberAwait::test_case_void_terminal_error()
+{
+    Coro::Awaitable<void> failed;
+    failed.close(std::make_error_code(std::errc::connection_refused));
+    QCOMPARE(failed.await().error(), std::make_error_code(std::errc::connection_refused));
+
+    Coro::Awaitable<void> value;
+    auto timeout = Coro::await_for(value, std::chrono::milliseconds(5));
+    QCOMPARE(timeout.error(), std::make_error_code(std::errc::timed_out));
+    QVERIFY(value.resolve());
+    QVERIFY(Coro::await(value).has_value());
 }
 
 void TestFiberAwait::test_case_generator()
@@ -347,7 +397,7 @@ void TestFiberAwait::test_case_socket_await()
     task_server.get();
 }
 
-void TestFiberAwait::end()
+void TestFiberAwait::cleanupTestCase()
 {
     Coro::quit();
     qDebug() << "instance quit";
