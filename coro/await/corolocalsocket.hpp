@@ -3,68 +3,222 @@
 
 /**
  * @file corolocalsocket.hpp
- * @brief QLocalSocket 的协程包装器：coro(QLocalSocket*).connectToServer()/waitForConnected()。
+ * @brief QLocalSocket 的协程包装器。
  */
 
 #include <memory>
+#include <utility>
 #include <QObject>
 #include <QPointer>
 #include <QIODevice>
 #include <QLocalSocket>
+#include <QThread>
 
 #include "awaitable.hpp"
-#include "detail/lifecycle.hpp"
+#include "detail/socketawait.hpp"
+#include "detail/socketerror.hpp"
 
 namespace Coro {
 
-/**
- * @brief QLocalSocket 的协程包装器（方法名镜像原 Qt API）
- */
 class CoroLocalSocket{
-    QPointer<QLocalSocket> local_;///< 被包装的本地套接字（弱引用）
-public:
-    /**
-     * @brief 构造
-     * @param s 被包装的本地套接字
-     */
-    explicit CoroLocalSocket(QLocalSocket* s): local_(s){}
+    QPointer<QLocalSocket> local_;
 
-    /**
-     * @brief 等待连接成功（若已连接则立即就绪）
-     * @return 连接成功触发一次的 Awaitable<void>
-     */
-    Awaitable<void> waitForConnected(){
-        Awaitable<void> a;
-        auto ch = a.channel();
-        auto c  = std::make_shared<QMetaObject::Connection>();
-        if(local_) *c = QObject::connect(local_, &QLocalSocket::connected, [ch]{ ch->push(1); });
-        a.setOnClose(detail::bind_close(local_.data(), ch, {c}));
-        if(local_ && local_->state() == QLocalSocket::ConnectedState){ ch->push(1); }
-        return a;
-    }
-    /**
-     * @brief 发起连接到指定服务并等待连接成功
-     * @param name 服务名
-     * @param mode 打开模式
-     * @return 连接成功触发一次的 Awaitable<void>
-     */
-    Awaitable<void> connectToServer(const QString& name,
-                                    QIODevice::OpenMode mode = QIODevice::ReadWrite){
-        auto a = waitForConnected();
-        if(local_ && local_->state() != QLocalSocket::ConnectedState){
-            local_->connectToServer(name, mode);
+    template<typename Function>
+    static void onSocketThread(QPointer<QLocalSocket> socket, Function function){
+        if(!socket) return;
+        if(socket->thread() == QThread::currentThread()){
+            function(socket.data());
+            return;
         }
-        return a;
+        QMetaObject::invokeMethod(
+            socket.data(),
+            [socket, function = std::move(function)]() mutable {
+                if(socket) function(socket.data());
+            },
+            Qt::QueuedConnection);
+    }
+
+    template<typename Signal, typename Check, typename Action>
+    std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
+                                                   Action action){
+        auto connections = detail::socket_connections();
+        auto awaitable = detail::socket_awaitable<void>(connections);
+        QPointer<QLocalSocket> socket = local_;
+
+        if(socket){
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), signal,
+                                 [awaitable, connections](auto...){
+                    awaitable->resolve();
+                    awaitable->close();
+                    detail::cleanup_socket_connections(connections);
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QLocalSocket::errorOccurred,
+                                 [awaitable, connections](
+                                     QLocalSocket::LocalSocketError error){
+                    if(error == QLocalSocket::PeerClosedError){
+                        awaitable->close();
+                    }else{
+                        awaitable->close(detail::local_socket_error_code(error));
+                    }
+                    detail::cleanup_socket_connections(connections);
+                }));
+        }
+        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        onSocketThread(socket,
+                       [awaitable, connections, check = std::move(check),
+                        action = std::move(action)](QLocalSocket* current) mutable {
+            action(current);
+            if(check(current)){
+                awaitable->resolve();
+                awaitable->close();
+                detail::cleanup_socket_connections(connections);
+            }else if(current->state() == QLocalSocket::UnconnectedState &&
+                     current->error() != QLocalSocket::UnknownSocketError){
+                const auto error = current->error();
+                if(error == QLocalSocket::PeerClosedError){
+                    awaitable->close();
+                }else{
+                    awaitable->close(detail::local_socket_error_code(error));
+                }
+                detail::cleanup_socket_connections(connections);
+            }
+        });
+        return awaitable;
+    }
+
+    template<typename Signal, typename Check>
+    std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
+        return waitForSignal(signal, std::move(check), [](QLocalSocket*){});
+    }
+
+public:
+    explicit CoroLocalSocket(QLocalSocket* socket): local_(socket){}
+
+    std::shared_ptr<Awaitable<QByteArray>> readAll(){
+        auto connections = detail::socket_connections();
+        auto awaitable = detail::socket_awaitable<QByteArray>(connections);
+        QPointer<QLocalSocket> socket = local_;
+
+        auto drain = [awaitable](QLocalSocket* current){
+            if(current->bytesAvailable() > 0){
+                const QByteArray bytes = current->readAll();
+                if(!bytes.isEmpty()) awaitable->resolve(bytes);
+            }
+        };
+        if(socket){
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QIODevice::readyRead,
+                                 [awaitable, socket]{
+                    if(socket && socket->bytesAvailable() > 0){
+                        const QByteArray bytes = socket->readAll();
+                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                    }
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QLocalSocket::disconnected,
+                                 [awaitable, connections, socket]{
+                    if(socket && socket->bytesAvailable() > 0){
+                        const QByteArray bytes = socket->readAll();
+                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                    }
+                    awaitable->close();
+                    detail::cleanup_socket_connections(connections);
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QLocalSocket::errorOccurred,
+                                 [awaitable, connections, socket](
+                                     QLocalSocket::LocalSocketError error){
+                    if(socket && socket->bytesAvailable() > 0){
+                        const QByteArray bytes = socket->readAll();
+                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                    }
+                    if(error == QLocalSocket::PeerClosedError){
+                        awaitable->close();
+                    }else{
+                        awaitable->close(detail::local_socket_error_code(error));
+                    }
+                    detail::cleanup_socket_connections(connections);
+                }));
+        }
+        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        onSocketThread(socket, [awaitable, connections, drain](QLocalSocket* current){
+            drain(current);
+            if(current->state() == QLocalSocket::UnconnectedState){
+                const auto error = current->error();
+                if(error != QLocalSocket::UnknownSocketError &&
+                   error != QLocalSocket::PeerClosedError){
+                    awaitable->close(detail::local_socket_error_code(error));
+                }else{
+                    awaitable->close();
+                }
+                detail::cleanup_socket_connections(connections);
+            }
+        });
+        return awaitable;
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForReadyRead(){
+        return waitForSignal(&QIODevice::readyRead, [](QLocalSocket* socket){
+            return socket->bytesAvailable() > 0;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForBytesWritten(){
+        return waitForSignal(&QIODevice::bytesWritten, [](QLocalSocket*){
+            return false;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForConnected(){
+        return waitForSignal(&QLocalSocket::connected, [](QLocalSocket* socket){
+            return socket->state() == QLocalSocket::ConnectedState;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForDisconnected(){
+        return waitForSignal(&QLocalSocket::disconnected, [](QLocalSocket* socket){
+            return socket->state() == QLocalSocket::UnconnectedState;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> connectToServer(
+        const QString& name,
+        QIODevice::OpenMode mode = QIODevice::ReadWrite){
+        return waitForSignal(
+            &QLocalSocket::connected,
+            [](QLocalSocket* socket){
+                return socket->state() == QLocalSocket::ConnectedState;
+            },
+            [name, mode](QLocalSocket* socket){
+                if(socket->state() != QLocalSocket::ConnectedState){
+                    socket->connectToServer(name, mode);
+                }
+            });
+    }
+
+    std::shared_ptr<Awaitable<void>> disconnectFromServer(){
+        auto awaitable = waitForDisconnected();
+        QPointer<QLocalSocket> socket = local_;
+        onSocketThread(socket, [](QLocalSocket* current){
+            if(current->state() != QLocalSocket::UnconnectedState){
+                current->disconnectFromServer();
+            }
+        });
+        return awaitable;
     }
 };
 
-/**
- * @brief 构造 QLocalSocket 的协程包装器
- * @param local 被包装的本地套接字
- * @return CoroLocalSocket 包装器
- */
-inline CoroLocalSocket coro(QLocalSocket* local){ return CoroLocalSocket(local); }
-
+inline CoroLocalSocket coro(QLocalSocket* socket){
+    return CoroLocalSocket(socket);
 }
+
+} // namespace Coro
 
 #endif // COROLOCALSOCKET_HPP

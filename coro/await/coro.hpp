@@ -12,6 +12,7 @@
  *   - corosocket.hpp      —— coro(QAbstractSocket*)
  *   - corotcpserver.hpp   —— coro(QTcpServer*)
  *   - corolocalsocket.hpp —— coro(QLocalSocket*)
+ *   - corolocalserver.hpp —— coro(QLocalServer*)
  *
  * 消费统一用自由函数 await(a)/await_for(a,timeout)（awaitable.hpp）与 generate(a)（generator.hpp）。
  * 全部 Qt 依赖集中在这些 coro* 头文件中；Awaitable 本体与 Qt 解耦。
@@ -25,5 +26,6 @@
 #include "corosocket.hpp"
 #include "corotcpserver.hpp"
 #include "corolocalsocket.hpp"
+#include "corolocalserver.hpp"
 
 #endif // CORO_HPP
