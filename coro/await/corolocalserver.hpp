@@ -64,21 +64,36 @@ public:
         detail::bind_socket_lifecycle(server, awaitable, connections);
         onServerThread(server, [awaitable, connections, drain, server](
                                    QLocalServer* current){
-            if(awaitable->channel()->is_closed()) return;
+            if(awaitable->channel()->is_closed()){
+                detail::cleanup_socket_connections(connections);
+                return;
+            }
             auto timer = new QTimer(current);
             timer->setInterval(10);
             QPointer<QTimer> timerGuard(timer);
+            detail::register_socket_cleanup(connections, [timerGuard]{
+                if(!timerGuard) return;
+                if(timerGuard->thread() == QThread::currentThread()){
+                    timerGuard->stop();
+                    timerGuard->deleteLater();
+                    return;
+                }
+                QMetaObject::invokeMethod(timerGuard.data(), [timerGuard]{
+                    if(timerGuard){
+                        timerGuard->stop();
+                        timerGuard->deleteLater();
+                    }
+                }, Qt::QueuedConnection);
+            });
             detail::register_socket_connection(
                 connections,
                 QObject::connect(timer, &QTimer::timeout,
                                  [awaitable, connections, server, timerGuard]{
                     if(awaitable->channel()->is_closed()){
-                        if(timerGuard) timerGuard->stop();
                         detail::cleanup_socket_connections(connections);
                         return;
                     }
                     if(!server || !server->isListening()){
-                        if(timerGuard) timerGuard->stop();
                         awaitable->close();
                         detail::cleanup_socket_connections(connections);
                     }
@@ -86,7 +101,6 @@ public:
             timer->start();
             drain(current);
             if(!current->isListening()){
-                timer->stop();
                 awaitable->close();
                 detail::cleanup_socket_connections(connections);
             }

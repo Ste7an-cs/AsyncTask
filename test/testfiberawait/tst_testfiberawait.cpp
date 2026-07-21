@@ -107,11 +107,13 @@ private slots:
     void test_case_tcp_read_then_remote_close();
     void test_case_tcp_server_close();
     void test_case_tcp_server_closed_stream_release();
+    void test_case_tcp_server_queued_close_release();
     void test_case_tcp_server_connection_stream();
     void test_case_local_ping_pong_disconnect();
     void test_case_local_connection_stream_and_close();
     void test_case_local_missing_server();
     void test_case_local_closed_stream_release();
+    void test_case_local_server_queued_close_release();
     void test_case_local_retry_after_missing_server();
     void test_case_local_read_then_peer_close();
     void cleanupTestCase();
@@ -364,6 +366,13 @@ void TestFiberAwait::test_case_socket_connection_cleanup()
     std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
     int firstCalls = 0;
     int secondCalls = 0;
+    int firstCleanupCalls = 0;
+    int secondCleanupCalls = 0;
+
+    Coro::detail::register_socket_cleanup(
+        connections, [&firstCleanupCalls]{ ++firstCleanupCalls; });
+    Coro::detail::register_socket_cleanup(
+        connections, [&secondCleanupCalls]{ ++secondCleanupCalls; });
 
     Coro::detail::register_socket_connection(
         connections,
@@ -382,6 +391,8 @@ void TestFiberAwait::test_case_socket_connection_cleanup()
 
     Coro::detail::cleanup_socket_connections(connections);
     Coro::detail::cleanup_socket_connections(connections);
+    QCOMPARE(firstCleanupCalls, 1);
+    QCOMPARE(secondCleanupCalls, 1);
     awaitable.reset();
     QVERIFY(observed.expired());
     sender->fire();
@@ -400,6 +411,10 @@ void TestFiberAwait::test_case_socket_connection_cleanup()
     }));
     lateAwaitable.reset();
     QVERIFY(lateObserved.expired());
+    int lateCleanupCalls = 0;
+    Coro::detail::register_socket_cleanup(
+        connections, [&lateCleanupCalls]{ ++lateCleanupCalls; });
+    QCOMPARE(lateCleanupCalls, 1);
     sender->fire();
     QCOMPARE(lateCalls, 0);
     delete sender.data();
@@ -827,6 +842,38 @@ void TestFiberAwait::test_case_tcp_server_closed_stream_release()
 
     QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 2000);
     QVERIFY(server.isListening());
+    QTRY_COMPARE_WITH_TIMEOUT(server.findChildren<QTimer*>().size(), 0, 2000);
+}
+
+void TestFiberAwait::test_case_tcp_server_queued_close_release()
+{
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    QThread worker;
+    server->moveToThread(&worker);
+
+    auto incoming = Coro::coro(server).nextConnection();
+    std::weak_ptr<Coro::Awaitable<QTcpSocket*>> observed = incoming;
+    incoming->close();
+    incoming.reset();
+    worker.start();
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while(!observed.expired() && elapsed.elapsed() < 2000) QTest::qWait(10);
+
+    bool listening = false;
+    QMetaObject::invokeMethod(server, [server, &listening]{
+        listening = server->isListening();
+        server->close();
+        delete server;
+    }, Qt::BlockingQueuedConnection);
+    worker.quit();
+    const bool stopped = worker.wait(2000);
+
+    QVERIFY(observed.expired());
+    QVERIFY(listening);
+    QVERIFY(stopped);
 }
 
 void TestFiberAwait::test_case_tcp_server_connection_stream()
@@ -966,6 +1013,39 @@ void TestFiberAwait::test_case_local_closed_stream_release()
 
     QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 500);
     QVERIFY(server.isListening());
+    QTRY_COMPARE_WITH_TIMEOUT(server.findChildren<QTimer*>().size(), 0, 2000);
+}
+
+void TestFiberAwait::test_case_local_server_queued_close_release()
+{
+    LocalServerNameGuard serverName;
+    auto server = new QLocalServer;
+    QVERIFY(server->listen(serverName.name()));
+    QThread worker;
+    server->moveToThread(&worker);
+
+    auto incoming = Coro::coro(server).nextConnection();
+    std::weak_ptr<Coro::Awaitable<QLocalSocket*>> observed = incoming;
+    incoming->close();
+    incoming.reset();
+    worker.start();
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while(!observed.expired() && elapsed.elapsed() < 2000) QTest::qWait(10);
+
+    bool listening = false;
+    QMetaObject::invokeMethod(server, [server, &listening]{
+        listening = server->isListening();
+        server->close();
+        delete server;
+    }, Qt::BlockingQueuedConnection);
+    worker.quit();
+    const bool stopped = worker.wait(2000);
+
+    QVERIFY(observed.expired());
+    QVERIFY(listening);
+    QVERIFY(stopped);
 }
 
 void TestFiberAwait::test_case_local_retry_after_missing_server()

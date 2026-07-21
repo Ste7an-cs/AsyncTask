@@ -30,20 +30,39 @@ public:
         if(disconnectImmediately) QObject::disconnect(connection);
     }
 
+    void registerCleanup(std::function<void()> cleanup){
+        bool cleanupImmediately = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(cleaned_){
+                cleanupImmediately = true;
+            }else{
+                cleanups_.push_back(std::move(cleanup));
+            }
+        }
+        if(cleanupImmediately && cleanup) cleanup();
+    }
+
     void cleanup(){
         std::vector<QMetaObject::Connection> connections;
+        std::vector<std::function<void()>> cleanups;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if(cleaned_) return;
             cleaned_ = true;
             connections.swap(connections_);
+            cleanups.swap(cleanups_);
         }
         for(const auto& connection : connections) QObject::disconnect(connection);
+        for(auto& cleanup : cleanups){
+            if(cleanup) cleanup();
+        }
     }
 
 private:
     std::mutex mutex_;
     std::vector<QMetaObject::Connection> connections_;
+    std::vector<std::function<void()>> cleanups_;
     bool cleaned_{false};
 };
 
@@ -59,6 +78,15 @@ inline void register_socket_connection(const SocketConnections& connections,
         connections->registerConnection(connection);
     }else{
         QObject::disconnect(connection);
+    }
+}
+
+inline void register_socket_cleanup(const SocketConnections& connections,
+                                    std::function<void()> cleanup){
+    if(connections){
+        connections->registerCleanup(std::move(cleanup));
+    }else if(cleanup){
+        cleanup();
     }
 }
 
