@@ -72,6 +72,11 @@ public:
                 connections,
                 QObject::connect(timer, &QTimer::timeout,
                                  [awaitable, connections, server, timerGuard]{
+                    if(awaitable->channel()->is_closed()){
+                        if(timerGuard) timerGuard->stop();
+                        detail::cleanup_socket_connections(connections);
+                        return;
+                    }
                     if(!server || !server->isListening()){
                         if(timerGuard) timerGuard->stop();
                         awaitable->close();

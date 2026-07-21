@@ -110,6 +110,9 @@ private slots:
     void test_case_local_ping_pong_disconnect();
     void test_case_local_connection_stream_and_close();
     void test_case_local_missing_server();
+    void test_case_local_closed_stream_release();
+    void test_case_local_retry_after_missing_server();
+    void test_case_local_read_then_peer_close();
     void cleanupTestCase();
 
 };
@@ -933,6 +936,78 @@ void TestFiberAwait::test_case_local_missing_server()
              QStringLiteral("qt.local_socket"));
     QCOMPARE(result.error().value(),
              static_cast<int>(QLocalSocket::ServerNotFoundError));
+}
+
+void TestFiberAwait::test_case_local_closed_stream_release()
+{
+    LocalServerNameGuard serverName;
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+    auto incoming = Coro::coro(&server).nextConnection();
+    std::weak_ptr<Coro::Awaitable<QLocalSocket*>> observed = incoming;
+
+    incoming->close();
+    incoming.reset();
+
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 500);
+    QVERIFY(server.isListening());
+}
+
+void TestFiberAwait::test_case_local_retry_after_missing_server()
+{
+    using namespace std::chrono_literals;
+    LocalServerNameGuard missingName;
+    LocalServerNameGuard serverName;
+    QLocalSocket client;
+
+    auto missing = Coro::await_for(
+        Coro::coro(&client).connectToServer(missingName.name()), 2s);
+    QVERIFY(!missing);
+    QCOMPARE(QString::fromLatin1(missing.error().category().name()),
+             QStringLiteral("qt.local_socket"));
+    QCOMPARE(missing.error().value(),
+             static_cast<int>(QLocalSocket::ServerNotFoundError));
+
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+    auto incoming = Coro::coro(&server).nextConnection();
+    auto retry = Coro::await_for(
+        Coro::coro(&client).connectToServer(serverName.name()), 2s);
+    auto accepted = Coro::await_for(incoming, 2s);
+
+    QVERIFY(retry);
+    QVERIFY(accepted);
+    QVERIFY(accepted.value() != nullptr);
+}
+
+void TestFiberAwait::test_case_local_read_then_peer_close()
+{
+    using namespace std::chrono_literals;
+    LocalServerNameGuard serverName;
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QLocalSocket client;
+    QVERIFY(Coro::await_for(
+        Coro::coro(&client).connectToServer(serverName.name()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QLocalSocket* peer = accepted.value();
+    QVERIFY(peer != nullptr);
+    auto stream = Coro::coro(&client).readAll();
+
+    auto written = Coro::coro(peer).waitForBytesWritten();
+    QCOMPARE(peer->write("final-bytes"), qint64(11));
+    QVERIFY(Coro::await_for(written, 2s));
+    peer->disconnectFromServer();
+
+    auto bytes = Coro::await_for(stream, 2s);
+    auto finished = Coro::await_for(stream, 2s);
+    QVERIFY(bytes);
+    QCOMPARE(bytes.value(), QByteArray("final-bytes"));
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
 void TestFiberAwait::cleanupTestCase()
