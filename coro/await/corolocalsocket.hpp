@@ -56,8 +56,8 @@ class CoroLocalSocket{
                 }));
             detail::register_socket_connection(
                 connections,
-                QObject::connect(socket.data(), &QLocalSocket::errorOccurred,
-                                 [awaitable, connections](
+                detail::connect_local_socket_error(
+                    socket.data(), [awaitable, connections](
                                      QLocalSocket::LocalSocketError error){
                     if(error == QLocalSocket::PeerClosedError){
                         awaitable->close();
@@ -132,8 +132,8 @@ public:
                 }));
             detail::register_socket_connection(
                 connections,
-                QObject::connect(socket.data(), &QLocalSocket::errorOccurred,
-                                 [awaitable, connections, socket](
+                detail::connect_local_socket_error(
+                    socket.data(), [awaitable, connections, socket](
                                      QLocalSocket::LocalSocketError error){
                     if(socket && socket->bytesAvailable() > 0){
                         const QByteArray bytes = socket->readAll();

@@ -57,8 +57,8 @@ class CoroAbstractSocket{
                 }));
             detail::register_socket_connection(
                 connections,
-                QObject::connect(socket.data(), &QAbstractSocket::errorOccurred,
-                                 [awaitable, connections](QAbstractSocket::SocketError error){
+                detail::connect_socket_error(
+                    socket.data(), [awaitable, connections](QAbstractSocket::SocketError error){
                     awaitable->close(detail::socket_error_code(error));
                     detail::cleanup_socket_connections(connections);
                 }));
@@ -124,8 +124,8 @@ public:
                 }));
             detail::register_socket_connection(
                 connections,
-                QObject::connect(socket.data(), &QAbstractSocket::errorOccurred,
-                                 [awaitable, connections, socket](
+                detail::connect_socket_error(
+                    socket.data(), [awaitable, connections, socket](
                                      QAbstractSocket::SocketError error){
                     if(socket && socket->bytesAvailable() > 0){
                         const QByteArray bytes = socket->readAll();

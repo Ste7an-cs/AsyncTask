@@ -54,8 +54,8 @@ class CoroSslSocket : public CoroAbstractSocket {
                 }));
             detail::register_socket_connection(
                 connections,
-                QObject::connect(socket.data(), &QAbstractSocket::errorOccurred,
-                                 [awaitable, connections](
+                detail::connect_socket_error(
+                    socket.data(), [awaitable, connections](
                                      QAbstractSocket::SocketError error){
                     awaitable->close(detail::socket_error_code(error));
                     detail::cleanup_socket_connections(connections);

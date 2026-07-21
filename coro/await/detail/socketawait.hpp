@@ -4,12 +4,15 @@
 #include "await/awaitable.hpp"
 
 #include <QCoreApplication>
+#include <QAbstractSocket>
+#include <QLocalSocket>
 #include <QMetaObject>
 #include <QObject>
 #include <QPointer>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace Coro {
@@ -92,6 +95,36 @@ inline void register_socket_cleanup(const SocketConnections& connections,
 
 inline void cleanup_socket_connections(const SocketConnections& connections){
     if(connections) connections->cleanup();
+}
+
+template<typename Function>
+QMetaObject::Connection connect_socket_error(QAbstractSocket* socket,
+                                             Function&& function){
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    return QObject::connect(socket, &QAbstractSocket::errorOccurred,
+                            std::forward<Function>(function));
+#else
+    return QObject::connect(
+        socket,
+        static_cast<void (QAbstractSocket::*)(QAbstractSocket::SocketError)>(
+            &QAbstractSocket::error),
+        std::forward<Function>(function));
+#endif
+}
+
+template<typename Function>
+QMetaObject::Connection connect_local_socket_error(QLocalSocket* socket,
+                                                   Function&& function){
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    return QObject::connect(socket, &QLocalSocket::errorOccurred,
+                            std::forward<Function>(function));
+#else
+    return QObject::connect(
+        socket,
+        static_cast<void (QLocalSocket::*)(QLocalSocket::LocalSocketError)>(
+            &QLocalSocket::error),
+        std::forward<Function>(function));
+#endif
 }
 
 inline std::function<void()> socket_cleanup(SocketConnections connections){
