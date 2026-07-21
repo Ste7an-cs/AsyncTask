@@ -29,6 +29,7 @@ class SigObject : public QObject
     Q_OBJECT
 public:
     SigObject():QObject(nullptr){}
+    void fire(){ emit sig1(); }
     void run(){
         QTimer::singleShot(500, this, [this](){
             emit this->sig1();
@@ -60,6 +61,8 @@ private slots:
     void test_case_shared_awaitable_void();
     void test_case_socket_error_conversion();
     void test_case_socket_awaitable_lifetime();
+    void test_case_socket_connection_cleanup();
+    void test_case_application_lifetime_cleanup();
     void test_case_generator();
     void test_case_signalawait();
     void test_case_signal_generate();
@@ -290,18 +293,97 @@ void TestFiberAwait::test_case_socket_awaitable_lifetime()
     QPointer<SigObject> sender = new SigObject;
     auto connections = Coro::detail::socket_connections();
     auto awaitable = Coro::detail::socket_awaitable<int>(connections);
+    auto channel = awaitable->channel();
     std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
 
-    auto signalConnection = Coro::detail::socket_connection(connections);
-    *signalConnection = QObject::connect(sender, &SigObject::sig1,
-                                         [awaitable]{ awaitable->resolve(1); });
+    Coro::detail::register_socket_connection(
+        connections,
+        QObject::connect(sender, &SigObject::sig1,
+                         [awaitable]{ awaitable->resolve(1); }));
     Coro::detail::bind_socket_lifecycle(sender, awaitable, connections);
     awaitable.reset();
 
     QVERIFY(!observed.expired());
     delete sender.data();
     QVERIFY(sender.isNull());
+    QVERIFY(channel->is_closed());
+    QCOMPARE(channel->close_error(), std::make_error_code(std::errc::no_message));
     QVERIFY(observed.expired());
+}
+
+void TestFiberAwait::test_case_socket_connection_cleanup()
+{
+    QPointer<SigObject> sender = new SigObject;
+    auto connections = Coro::detail::socket_connections();
+    auto awaitable = Coro::detail::socket_awaitable<int>(connections);
+    std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
+    int firstCalls = 0;
+    int secondCalls = 0;
+
+    Coro::detail::register_socket_connection(
+        connections,
+        QObject::connect(sender, &SigObject::sig1,
+                         [awaitable, &firstCalls]{
+        ++firstCalls;
+        awaitable->resolve(1);
+    }));
+    Coro::detail::register_socket_connection(
+        connections,
+        QObject::connect(sender, &SigObject::sig1,
+                         [awaitable, &secondCalls]{
+        ++secondCalls;
+        awaitable->resolve(2);
+    }));
+
+    Coro::detail::cleanup_socket_connections(connections);
+    Coro::detail::cleanup_socket_connections(connections);
+    awaitable.reset();
+    QVERIFY(observed.expired());
+    sender->fire();
+    QCOMPARE(firstCalls, 0);
+    QCOMPARE(secondCalls, 0);
+
+    auto lateAwaitable = Coro::detail::socket_awaitable<int>(connections);
+    std::weak_ptr<Coro::Awaitable<int>> lateObserved = lateAwaitable;
+    int lateCalls = 0;
+    Coro::detail::register_socket_connection(
+        connections,
+        QObject::connect(sender, &SigObject::sig1,
+                         [lateAwaitable, &lateCalls]{
+        ++lateCalls;
+        lateAwaitable->resolve(3);
+    }));
+    lateAwaitable.reset();
+    QVERIFY(lateObserved.expired());
+    sender->fire();
+    QCOMPARE(lateCalls, 0);
+    delete sender.data();
+}
+
+void TestFiberAwait::test_case_application_lifetime_cleanup()
+{
+    QPointer<SigObject> sender = new SigObject;
+    QPointer<QObject> applicationLifetime = new QObject;
+    auto connections = Coro::detail::socket_connections();
+    auto awaitable = Coro::detail::socket_awaitable<int>(connections);
+    auto channel = awaitable->channel();
+    std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
+
+    Coro::detail::register_socket_connection(
+        connections,
+        QObject::connect(sender, &SigObject::sig1,
+                         [awaitable]{ awaitable->resolve(1); }));
+    Coro::detail::bind_socket_lifecycle(sender, awaitable, connections,
+                                        applicationLifetime);
+    awaitable.reset();
+
+    QVERIFY(!observed.expired());
+    delete applicationLifetime.data();
+    QVERIFY(applicationLifetime.isNull());
+    QVERIFY(channel->is_closed());
+    QCOMPARE(channel->close_error(), std::make_error_code(std::errc::no_message));
+    QVERIFY(observed.expired());
+    delete sender.data();
 }
 
 void TestFiberAwait::test_case_generator()
