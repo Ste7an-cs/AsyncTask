@@ -31,7 +31,7 @@
 #ifdef ASYNC_HAS_QTCORE
 #include "executor/qtfiberthread.h" // QtFiberThread
 #include "task/fiberapplication.h"  // installFiberApplication / exec / quit
-#include "await/coro.hpp"           // coro(...) 工厂伞头（信号 / socket / server / future ...）
+#include "await/coro.hpp"           // coro(...) 工厂伞头（信号 / socket / UDP / server / future ...）
 #endif
 
 #endif // ALL_HPP

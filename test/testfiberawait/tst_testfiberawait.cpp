@@ -18,8 +18,10 @@
 #include <QLocalSocket>
 #include <QPointer>
 #include <QNetworkProxy>
+#include <QNetworkDatagram>
 #include <QTcpSocket>
 #include <QTcpServer>
+#include <QUdpSocket>
 #include <QThread>
 #include <chrono>
 #include <atomic>
@@ -116,6 +118,7 @@ private slots:
     void test_case_local_server_queued_close_release();
     void test_case_local_retry_after_missing_server();
     void test_case_local_read_then_peer_close();
+    void test_case_udp_preserves_datagrams_and_sender_metadata();
     void cleanupTestCase();
 
 };
@@ -1103,6 +1106,35 @@ void TestFiberAwait::test_case_local_read_then_peer_close()
     QCOMPARE(bytes.value(), QByteArray("final-bytes"));
     QVERIFY(!finished);
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
+void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
+{
+    using namespace std::chrono_literals;
+    QUdpSocket receiver;
+    QUdpSocket sender;
+    QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    QVERIFY(sender.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+
+    auto datagrams = Coro::coro(&receiver).receiveDatagram();
+    static_assert(std::is_same_v<decltype(datagrams),
+                                 std::shared_ptr<Coro::Awaitable<QNetworkDatagram>>>);
+
+    QCOMPARE(sender.writeDatagram("first", QHostAddress::LocalHost,
+                                  receiver.localPort()), qint64(5));
+    QCOMPARE(sender.writeDatagram("second", QHostAddress::LocalHost,
+                                  receiver.localPort()), qint64(6));
+
+    auto first = Coro::await_for(datagrams, 2s);
+    auto second = Coro::await_for(datagrams, 2s);
+    QVERIFY(first);
+    QVERIFY(second);
+    QCOMPARE(first.value().data(), QByteArray("first"));
+    QCOMPARE(second.value().data(), QByteArray("second"));
+    QCOMPARE(first.value().senderPort(), sender.localPort());
+    QCOMPARE(second.value().senderPort(), sender.localPort());
+    QCOMPARE(first.value().senderAddress(), QHostAddress::LocalHost);
+    QCOMPARE(second.value().senderAddress(), QHostAddress::LocalHost);
 }
 
 void TestFiberAwait::cleanupTestCase()
