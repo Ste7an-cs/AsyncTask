@@ -13,6 +13,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QThread>
+#include <QTimer>
 
 #include "awaitable.hpp"
 #include "detail/socketawait.hpp"
@@ -22,6 +23,19 @@ namespace Coro {
 
 class CoroTcpServer{
     QPointer<QTcpServer> srv_;
+
+    static void stopTimer(
+        const std::shared_ptr<QPointer<QTimer>>& timerState){
+        if(!timerState || !*timerState) return;
+        QPointer<QTimer> timer = *timerState;
+        if(timer->thread() == QThread::currentThread()){
+            timer->stop();
+        }else{
+            QMetaObject::invokeMethod(timer.data(), [timer]{
+                if(timer) timer->stop();
+            }, Qt::QueuedConnection);
+        }
+    }
 
     template<typename Function>
     static void onServerThread(QPointer<QTcpServer> server, Function function){
@@ -45,6 +59,7 @@ public:
         auto connections = detail::socket_connections();
         auto awaitable = detail::socket_awaitable<QTcpSocket*>(connections);
         QPointer<QTcpServer> server = srv_;
+        auto timerState = std::make_shared<QPointer<QTimer>>();
 
         auto drain = [awaitable](QTcpServer* current){
             while(current->hasPendingConnections()){
@@ -63,16 +78,35 @@ public:
             detail::register_socket_connection(
                 connections,
                 QObject::connect(server.data(), &QTcpServer::acceptError,
-                                 [awaitable, connections](
+                                 [awaitable, connections, timerState](
                                      QAbstractSocket::SocketError error){
+                    stopTimer(timerState);
                     awaitable->close(detail::socket_error_code(error));
                     detail::cleanup_socket_connections(connections);
                 }));
         }
         detail::bind_socket_lifecycle(server, awaitable, connections);
-        onServerThread(server, [awaitable, connections, drain](QTcpServer* current){
+        onServerThread(server, [awaitable, connections, drain, server,
+                                timerState](QTcpServer* current){
+            if(awaitable->channel()->is_closed()) return;
+            auto timer = new QTimer(current);
+            timer->setInterval(10);
+            *timerState = timer;
+            QPointer<QTimer> timerGuard(timer);
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(timer, &QTimer::timeout,
+                                 [awaitable, connections, server, timerGuard]{
+                    if(!server || !server->isListening()){
+                        if(timerGuard) timerGuard->stop();
+                        awaitable->close();
+                        detail::cleanup_socket_connections(connections);
+                    }
+                }));
+            timer->start();
             drain(current);
             if(!current->isListening()){
+                timer->stop();
                 awaitable->close();
                 detail::cleanup_socket_connections(connections);
             }

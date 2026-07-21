@@ -74,7 +74,10 @@ private slots:
     void test_case_iodevice_generate();
     void test_case_tcp_ping_pong();
     void test_case_tcp_connection_refused();
+    void test_case_tcp_retry_after_refusal();
     void test_case_tcp_disconnect();
+    void test_case_tcp_read_then_remote_close();
+    void test_case_tcp_server_close();
     void test_case_tcp_server_connection_stream();
     void cleanupTestCase();
 
@@ -628,15 +631,90 @@ void TestFiberAwait::test_case_tcp_connection_refused()
     auto connected = Coro::coro(client).connectToHost(
         QStringLiteral("127.0.0.1"), unusedPort);
     auto result = Coro::await_for(connected, 2s);
-    QMetaObject::invokeMethod(client, [client]{ delete client; },
-                              Qt::BlockingQueuedConnection);
-    socketThread.quit();
-    QVERIFY(socketThread.wait(2000));
+    QPointer<QTcpSocket> clientGuard(client);
+    const bool cleanupQueued = QMetaObject::invokeMethod(
+        client, [clientGuard]{
+            if(clientGuard) clientGuard->deleteLater();
+            QThread::currentThread()->quit();
+        }, Qt::QueuedConnection);
+    if(!cleanupQueued) socketThread.quit();
+    const bool stopped = socketThread.wait(2000);
+    QVERIFY(stopped);
+    QVERIFY(cleanupQueued);
+    QVERIFY(clientGuard.isNull());
     QVERIFY(!result);
     QCOMPARE(QString::fromLatin1(result.error().category().name()),
              QStringLiteral("qt.socket"));
     QCOMPARE(result.error().value(),
              static_cast<int>(QAbstractSocket::ConnectionRefusedError));
+}
+
+void TestFiberAwait::test_case_tcp_retry_after_refusal()
+{
+    using namespace std::chrono_literals;
+    QTcpServer firstProbe;
+    QTcpServer secondProbe;
+    QTcpServer server;
+    QVERIFY(firstProbe.listen(QHostAddress::LocalHost, 0));
+    QVERIFY(secondProbe.listen(QHostAddress::LocalHost, 0));
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    const quint16 firstUnusedPort = firstProbe.serverPort();
+    const quint16 secondUnusedPort = secondProbe.serverPort();
+    firstProbe.close();
+    secondProbe.close();
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QThread socketThread;
+    socketThread.start();
+    auto client = new QTcpSocket;
+    client->setProxy(QNetworkProxy::NoProxy);
+    client->moveToThread(&socketThread);
+
+    auto firstFailure = Coro::await_for(
+        Coro::coro(client).connectToHost(QStringLiteral("127.0.0.1"),
+                                         firstUnusedPort), 2s);
+    auto addressRetry = Coro::await_for(
+        Coro::coro(client).connectToHost(QHostAddress::LocalHost,
+                                         server.serverPort()), 2s);
+    auto firstAccepted = Coro::await_for(incoming, 2s);
+    auto firstDisconnect = Coro::await_for(
+        Coro::coro(client).disconnectFromHost(), 2s);
+
+    auto secondFailure = Coro::await_for(
+        Coro::coro(client).connectToHost(QHostAddress::LocalHost,
+                                         secondUnusedPort), 2s);
+    auto stringRetry = Coro::await_for(
+        Coro::coro(client).connectToHost(QStringLiteral("127.0.0.1"),
+                                         server.serverPort()), 2s);
+    auto secondAccepted = Coro::await_for(incoming, 2s);
+
+    QPointer<QTcpSocket> clientGuard(client);
+    const bool cleanupQueued = QMetaObject::invokeMethod(
+        client, [clientGuard]{
+            if(clientGuard) clientGuard->deleteLater();
+            QThread::currentThread()->quit();
+        }, Qt::QueuedConnection);
+    if(!cleanupQueued) socketThread.quit();
+    const bool stopped = socketThread.wait(2000);
+
+    QVERIFY(stopped);
+    QVERIFY(cleanupQueued);
+    QVERIFY(clientGuard.isNull());
+    QVERIFY(!firstFailure);
+    QCOMPARE(QString::fromLatin1(firstFailure.error().category().name()),
+             QStringLiteral("qt.socket"));
+    QCOMPARE(firstFailure.error().value(),
+             static_cast<int>(QAbstractSocket::ConnectionRefusedError));
+    QVERIFY(addressRetry);
+    QVERIFY(firstAccepted);
+    QVERIFY(firstDisconnect);
+    QVERIFY(!secondFailure);
+    QCOMPARE(QString::fromLatin1(secondFailure.error().category().name()),
+             QStringLiteral("qt.socket"));
+    QCOMPARE(secondFailure.error().value(),
+             static_cast<int>(QAbstractSocket::ConnectionRefusedError));
+    QVERIFY(stringRetry);
+    QVERIFY(secondAccepted);
 }
 
 void TestFiberAwait::test_case_tcp_disconnect()
@@ -658,6 +736,48 @@ void TestFiberAwait::test_case_tcp_disconnect()
     QCOMPARE(client.state(), QAbstractSocket::UnconnectedState);
     QVERIFY(Coro::await_for(Coro::coro(&client).waitForDisconnected(), 2s));
     delete peer;
+}
+
+void TestFiberAwait::test_case_tcp_read_then_remote_close()
+{
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QTcpSocket client;
+    QVERIFY(Coro::await_for(Coro::coro(&client).connectToHost(
+        QHostAddress::LocalHost, server.serverPort()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QTcpSocket* peer = accepted.value();
+    auto stream = Coro::coro(&client).readAll();
+
+    auto written = Coro::coro(peer).waitForBytesWritten();
+    QCOMPARE(peer->write("final-bytes"), qint64(11));
+    QVERIFY(Coro::await_for(written, 2s));
+    peer->disconnectFromHost();
+
+    auto bytes = Coro::await_for(stream, 2s);
+    auto finished = Coro::await_for(stream, 2s);
+    QVERIFY(bytes);
+    QCOMPARE(bytes.value(), QByteArray("final-bytes"));
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+    delete peer;
+}
+
+void TestFiberAwait::test_case_tcp_server_close()
+{
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    server.close();
+    auto finished = Coro::await_for(incoming, 2s);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
 void TestFiberAwait::test_case_tcp_server_connection_stream()

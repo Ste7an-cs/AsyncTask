@@ -39,8 +39,9 @@ class CoroAbstractSocket{
             Qt::QueuedConnection);
     }
 
-    template<typename Signal, typename Check>
-    std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
+    template<typename Signal, typename Check, typename Action>
+    std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
+                                                   Action action){
         auto connections = detail::socket_connections();
         auto awaitable = detail::socket_awaitable<void>(connections);
         QPointer<QAbstractSocket> socket = sock_;
@@ -64,8 +65,10 @@ class CoroAbstractSocket{
         }
         detail::bind_socket_lifecycle(socket, awaitable, connections);
         onSocketThread(socket,
-                       [awaitable, connections, check = std::move(check)](
+                       [awaitable, connections, check = std::move(check),
+                        action = std::move(action)](
                            QAbstractSocket* current) mutable {
+            action(current);
             if(check(current)){
                 awaitable->resolve();
                 awaitable->close();
@@ -77,6 +80,11 @@ class CoroAbstractSocket{
             }
         });
         return awaitable;
+    }
+
+    template<typename Signal, typename Check>
+    std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
+        return waitForSignal(signal, std::move(check), [](QAbstractSocket*){});
     }
 
 public:
@@ -175,27 +183,31 @@ public:
     std::shared_ptr<Awaitable<void>> connectToHost(
         const QString& host, quint16 port,
         QIODevice::OpenMode mode = QIODevice::ReadWrite){
-        auto awaitable = waitForConnected();
-        QPointer<QAbstractSocket> socket = sock_;
-        onSocketThread(socket, [host, port, mode](QAbstractSocket* current){
-            if(current->state() != QAbstractSocket::ConnectedState){
-                current->connectToHost(host, port, mode);
-            }
-        });
-        return awaitable;
+        return waitForSignal(
+            &QAbstractSocket::connected,
+            [](QAbstractSocket* socket){
+                return socket->state() == QAbstractSocket::ConnectedState;
+            },
+            [host, port, mode](QAbstractSocket* socket){
+                if(socket->state() != QAbstractSocket::ConnectedState){
+                    socket->connectToHost(host, port, mode);
+                }
+            });
     }
 
     std::shared_ptr<Awaitable<void>> connectToHost(
         const QHostAddress& address, quint16 port,
         QIODevice::OpenMode mode = QIODevice::ReadWrite){
-        auto awaitable = waitForConnected();
-        QPointer<QAbstractSocket> socket = sock_;
-        onSocketThread(socket, [address, port, mode](QAbstractSocket* current){
-            if(current->state() != QAbstractSocket::ConnectedState){
-                current->connectToHost(address, port, mode);
-            }
-        });
-        return awaitable;
+        return waitForSignal(
+            &QAbstractSocket::connected,
+            [](QAbstractSocket* socket){
+                return socket->state() == QAbstractSocket::ConnectedState;
+            },
+            [address, port, mode](QAbstractSocket* socket){
+                if(socket->state() != QAbstractSocket::ConnectedState){
+                    socket->connectToHost(address, port, mode);
+                }
+            });
     }
 
     std::shared_ptr<Awaitable<void>> disconnectFromHost(){
