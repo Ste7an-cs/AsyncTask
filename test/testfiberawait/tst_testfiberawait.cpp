@@ -119,6 +119,8 @@ private slots:
     void test_case_local_retry_after_missing_server();
     void test_case_local_read_then_peer_close();
     void test_case_udp_preserves_datagrams_and_sender_metadata();
+    void test_case_udp_close_ends_stream_and_releases();
+    void test_case_udp_destruction_ends_stream_and_releases();
     void cleanupTestCase();
 
 };
@@ -1135,6 +1137,40 @@ void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
     QCOMPARE(second.value().senderPort(), sender.localPort());
     QCOMPARE(first.value().senderAddress(), QHostAddress::LocalHost);
     QCOMPARE(second.value().senderAddress(), QHostAddress::LocalHost);
+}
+
+void TestFiberAwait::test_case_udp_close_ends_stream_and_releases()
+{
+    using namespace std::chrono_literals;
+    QUdpSocket receiver;
+    QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    auto datagrams = Coro::coro(&receiver).receiveDatagram();
+    std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
+
+    receiver.close();
+    auto finished = Coro::await_for(datagrams, 2s);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+
+    datagrams.reset();
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 2000);
+}
+
+void TestFiberAwait::test_case_udp_destruction_ends_stream_and_releases()
+{
+    using namespace std::chrono_literals;
+    auto receiver = new QUdpSocket;
+    QVERIFY(receiver->bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    auto datagrams = Coro::coro(receiver).receiveDatagram();
+    std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
+
+    delete receiver;
+    auto finished = Coro::await_for(datagrams, 2s);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+
+    datagrams.reset();
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 2000);
 }
 
 void TestFiberAwait::cleanupTestCase()
