@@ -9,8 +9,12 @@
 #include "await/generator.hpp"
 #include "detail/result.hpp"
 #include "await/coro.hpp"
+#include "await/detail/socketawait.hpp"
+#include "await/detail/socketerror.hpp"
 #include <QBuffer>
 #include <QAbstractSocket>
+#include <QLocalSocket>
+#include <QPointer>
 #include <QTcpSocket>
 #include <QTcpServer>
 
@@ -54,6 +58,8 @@ private slots:
     void test_case_shared_awaitable();
     void test_case_shared_generator_terminal_timeout();
     void test_case_shared_awaitable_void();
+    void test_case_socket_error_conversion();
+    void test_case_socket_awaitable_lifetime();
     void test_case_generator();
     void test_case_signalawait();
     void test_case_signal_generate();
@@ -249,6 +255,53 @@ void TestFiberAwait::test_case_shared_awaitable_void()
         ++events;
     }
     QCOMPARE(events, 2);
+}
+
+void TestFiberAwait::test_case_socket_error_conversion()
+{
+    const auto socketError = Coro::detail::socket_error_code(
+        QAbstractSocket::ConnectionRefusedError);
+    QCOMPARE(socketError.value(),
+             static_cast<int>(QAbstractSocket::ConnectionRefusedError));
+    QCOMPARE(QString::fromLatin1(socketError.category().name()),
+             QStringLiteral("qt.socket"));
+    QVERIFY(!QString::fromStdString(socketError.message()).isEmpty());
+
+    const auto localError = Coro::detail::local_socket_error_code(
+        QLocalSocket::ServerNotFoundError);
+    QCOMPARE(localError.value(),
+             static_cast<int>(QLocalSocket::ServerNotFoundError));
+    QCOMPARE(QString::fromLatin1(localError.category().name()),
+             QStringLiteral("qt.local_socket"));
+    QVERIFY(!QString::fromStdString(localError.message()).isEmpty());
+
+    QCOMPARE(QString::fromStdString(
+                 Coro::detail::socket_error_code(
+                     static_cast<QAbstractSocket::SocketError>(-12345)).message()),
+             QStringLiteral("unknown socket error"));
+    QCOMPARE(QString::fromStdString(
+                 Coro::detail::local_socket_error_code(
+                     static_cast<QLocalSocket::LocalSocketError>(-12345)).message()),
+             QStringLiteral("unknown socket error"));
+}
+
+void TestFiberAwait::test_case_socket_awaitable_lifetime()
+{
+    QPointer<SigObject> sender = new SigObject;
+    auto connections = Coro::detail::socket_connections();
+    auto awaitable = Coro::detail::socket_awaitable<int>(connections);
+    std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
+
+    auto signalConnection = Coro::detail::socket_connection(connections);
+    *signalConnection = QObject::connect(sender, &SigObject::sig1,
+                                         [awaitable]{ awaitable->resolve(1); });
+    Coro::detail::bind_socket_lifecycle(sender, awaitable, connections);
+    awaitable.reset();
+
+    QVERIFY(!observed.expired());
+    delete sender.data();
+    QVERIFY(sender.isNull());
+    QVERIFY(observed.expired());
 }
 
 void TestFiberAwait::test_case_generator()

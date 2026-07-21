@@ -29,7 +29,9 @@ HEADERS += \
     $$PWD/coro/await/corotcpserver.hpp \
     $$PWD/coro/await/corolocalsocket.hpp \
     $$PWD/coro/await/detail/signalpack.hpp \
-    $$PWD/coro/await/detail/lifecycle.hpp
+    $$PWD/coro/await/detail/lifecycle.hpp \
+    $$PWD/coro/await/detail/socketawait.hpp \
+    $$PWD/coro/await/detail/socketerror.hpp
 SOURCES += \
     $$PWD/coro/executor/scheduler/qtfiberscheduler.cpp \
     $$PWD/coro/executor/qtfiberthread.cpp \
