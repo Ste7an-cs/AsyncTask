@@ -40,7 +40,8 @@ SOURCES += main.cpp
 #include "task/fibertask.h"          // makeTask / FiberTask / Priority / Affinity
 #include "await/coro.hpp"            // 伞头：一次性引入所有来源的 coro()/await()/generate()
 // 或按来源单独引入：await/corosignal.hpp、corosocket.hpp、corotcpserver.hpp、
-//    coroiodevice.hpp、corolocalsocket.hpp、corofuture.hpp、await/generator.hpp
+//    corolocalsocket.hpp、corolocalserver.hpp、coroudpsocket.hpp、corosslsocket.hpp、
+//    coroiodevice.hpp、corofuture.hpp、await/generator.hpp
 #include "detail/asyncdefine.h"      // sleep / msleep / launch_properties
 #include "executor/qtfiberthread.h"  // QtFiberThread（专用协程线程）
 using namespace Coro;
@@ -78,7 +79,7 @@ int main(int argc, char* argv[]) {
 | 等待信号 | `auto r = await(coro(obj, &Obj::sig));` |
 | 等待并指定类型 | `await(coro<int>(obj, &Obj::sig));` |
 | 带超时等待 | `await_for(coro(...), std::chrono::milliseconds(500))` |
-| socket / iodevice | `await(coro(sock).waitForConnected());` `await(coro(dev).readAll())` |
+| TCP socket / iodevice | `await_for(coro(sock).connectToHost(host, port), 2s);` `await(coro(dev).readAll())` |
 | 接受连接 | `for (QTcpSocket* s : generate(coro(server).nextConnection())) {...}` |
 | 等待 future | `await(coro(std::move(fut)));` |
 | 把任意 Awaitable 当流 | `for (auto v : generate(coro(...))) {...}` |
@@ -87,6 +88,42 @@ int main(int argc, char* argv[]) {
 | 底层创建协程 | `auto fb = launch_properties(fn, pri, affine); fb.detach();` |
 
 信号参数目数 → 结果类型：无参 → `Awaitable<void>`；单参 → `Awaitable<Value>`；多参 → `Awaitable<tuple<...>>`。等待无参(void)信号返回 `Result<void>` —— 可当 bool 用（`if (await(coro(obj,&sig)))`），也可忽略返回值作“触发即继续”。
+
+## Socket Awaitable Contract
+
+**所有 socket 包装器方法返回 `std::shared_ptr<Awaitable<T>>`，不是按值 Awaitable。**
+Qt 回调和调用者强持有同一 handle；可直接传给 `await`、`await_for`、`generate`。
+按值 move-only `Awaitable<T>` 及其既有消费 API 仍用于通用/手工 Awaitable，不适用于
+socket 方法的返回值。空 shared handle 的等待结果为 `invalid_argument`。
+
+```cpp
+auto connected = await_for(coro(&socket).connectToHost(host, port), 2s);
+if(!connected) qWarning() << connected.error().message();
+```
+
+- `close()`：正常终止；已排队数据先被消费，最终 `Result.error()` 是
+  `std::errc::no_message`。
+- `close(std::error_code)`：记录第一个终止错误；TCP/UDP 为 `qt.socket`，本地 socket
+  为 `qt.localsocket`，SSL 为 `qt.ssl`，保留 Qt 枚举值。
+- `await_for(...)` 的 `std::errc::timed_out` 仅结束本次等待；**不取消 Awaitable，
+  不断开订阅，也不关闭/取消底层 socket 操作**。停止来源必须显式调用 Qt 的
+  `disconnectFromHost`、`disconnectFromServer`、`close` 等操作。
+- **QObject 方法只能在对象所属线程执行。** 不要从任意协程线程直接调用
+  socket/server；对象跨线程时使用 queued invocation。包装器自身将发起动作调度到
+  所属线程，但对象必须在等待完成前存活。
+
+| 包装器 | 完整方法库存 |
+|---|---|
+| `CoroAbstractSocket` / `QTcpSocket` | `readAll`、`waitForReadyRead`、`waitForBytesWritten`、`waitForConnected`、`waitForDisconnected`、两个 `connectToHost` 重载（`QString` / `QHostAddress`）、`disconnectFromHost` |
+| `CoroTcpServer` | `nextConnection` → `Awaitable<QTcpSocket*>` 流 |
+| `CoroLocalSocket` | `readAll`、`waitForReadyRead`、`waitForBytesWritten`、`waitForConnected`、`waitForDisconnected`、`connectToServer`、`disconnectFromServer` |
+| `CoroLocalServer` | `nextConnection` → `Awaitable<QLocalSocket*>` 流 |
+| `CoroUdpSocket` | `receiveDatagram` → `Awaitable<QNetworkDatagram>` 流；每个元素保留一个 UDP datagram 的边界、payload、发送者/目标地址和端口 metadata |
+| `CoroSslSocket` | 继承 TCP 方法；`waitForEncrypted`、`connectToHostEncrypted` |
+
+`QSslSocket` 的握手、证书和 peer verification 失败产生 `qt.ssl` 错误；框架**从不**
+自动调用 `ignoreSslErrors()`，应用必须明确实现自己的证书策略。`nextConnection` 和
+`receiveDatagram` 传给 `generate(shared_ptr)` 后，来源正常关闭会使迭代自然结束。
 
 **跨协程协调退出：** `quit()` 应在工作真正完成后才调用。若要先等其它协程/任务结束，**捕获其 `FiberTask` 并调用 `.get()`**（让出而非阻塞）再 `quit()`：
 ```cpp
@@ -119,10 +156,12 @@ makeTask([]{
 **socket 收发 / 流式读取**
 ```cpp
 QTcpSocket* c = new QTcpSocket();
-c->connectToHost(QHostAddress::LocalHost, 40088);
-await(coro(c).waitForConnected());
-c->write("ping");
-QByteArray data = await(coro(c).readAll()).value_or(QByteArray());
+auto connected = await_for(coro(c).connectToHost(QHostAddress::LocalHost, 40088), 2s);
+if(connected){
+    auto data = await_for(coro(c).readAll(), 2s);
+    auto written = coro(c).waitForBytesWritten();
+    if(c->write("ping") == 4 && await_for(written, 2s) && data) { /* use data.value() */ }
+}
 // 流式：for (const QByteArray& msg : generate(coro(c).readAll())) { ... }
 ```
 
@@ -181,7 +220,8 @@ worker->quit(); delete worker;
 - 忘记 `quit()` —— 程序退出时卡死。
 - 在协程内做阻塞调用（`QThread::sleep`、`waitForXxx`、`future.get()`）：这些会阻塞整个线程。请改用 `sleep`/`msleep`/`this_fiber::yield` 与 `await(coro(...))`。
 - 在生产者 lambda 中捕获整个 `Awaitable` —— 应捕获 `a.channel()`（一个 `shared_ptr`），以避免引用环。
-- 按值拷贝 `Awaitable` —— 它是 move-only；请移动它，或直接交给 `await`/`generate`。
+- 按值拷贝通用 `Awaitable` —— 它是 move-only；请移动它。socket 方法返回的是
+  `shared_ptr<Awaitable<T>>`，可直接交给 `await`/`await_for`/`generate`。
 
 ## 参考
 

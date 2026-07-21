@@ -121,7 +121,48 @@ auto prod = makeTask([ch = a.channel()]{ for(int i=0;i<10;i++) ch->push(i); ch->
 auto cons = makeTask([&a]{ while(auto v = a.await()) { /* 消费 v.value() */ } });
 ```
 
-### 3.4 常见问题与排除方法
+### 3.4 Socket Awaitable
+
+`coro(socket/server)` 返回轻量包装器；**所有 socket 包装器方法均返回
+`std::shared_ptr<Awaitable<T>>`**。连接的 Qt 回调和调用者共同持有该 handle，
+可直接传给 `await`、`await_for` 或 `generate`：
+
+```cpp
+auto connected = await_for(coro(client).connectToHost(host, port), std::chrono::seconds(2));
+if(!connected) { /* 检查 connected.error() */ }
+```
+
+此前的按值 `Awaitable<T>` API 仍受支持：可继续构造、移动、`await(a)`、
+`await_for(a, timeout)` 和 `generate(std::move(a))`。这是通用 Awaitable 的
+move-only 所有权语义；不要把 socket 包装器的返回值当作按值 Awaitable。对
+`shared_ptr<Awaitable<T>>` 同样可使用 `await`/`await_for`/`generate`，空 handle
+返回 `invalid_argument`。
+
+**终止、错误和超时**：`Awaitable::close()` 是正常关闭，未消费完的数据仍会先
+被读取，随后返回 `std::errc::no_message`；`close(std::error_code)` 保存第一个
+终止错误。socket 的异常关闭返回保留 Qt 枚举值的 typed error（TCP/UDP 为
+`qt.socket`，本地 socket 为 `qt.localsocket`，SSL 为 `qt.ssl`）。`await_for` 的
+`timed_out` 只表示这一次等待到期，**不会取消 Awaitable、断开信号或关闭/取消
+底层 socket 操作**；需要停止来源时显式调用 Qt 的断开/关闭 API。
+
+| Qt 来源 | `coro(...)` 包装器及方法 | 结果 |
+| --- | --- | --- |
+| `QAbstractSocket` / `QTcpSocket` | `readAll()`、`waitForReadyRead()`、`waitForBytesWritten()`、`waitForConnected()`、`waitForDisconnected()`、`connectToHost(QString,port[,mode])`、`connectToHost(QHostAddress,port[,mode])`、`disconnectFromHost()` | `shared_ptr<Awaitable<QByteArray>>` 或 `shared_ptr<Awaitable<void>>` |
+| `QTcpServer` | `nextConnection()` | `shared_ptr<Awaitable<QTcpSocket*>>`；可用 `generate` 连续接受连接 |
+| `QLocalSocket` | `readAll()`、`waitForReadyRead()`、`waitForBytesWritten()`、`waitForConnected()`、`waitForDisconnected()`、`connectToServer(name[,mode])`、`disconnectFromServer()` | `shared_ptr<Awaitable<QByteArray>>` 或 `shared_ptr<Awaitable<void>>` |
+| `QLocalServer` | `nextConnection()` | `shared_ptr<Awaitable<QLocalSocket*>>`；支持本地 server 连接流 |
+| `QUdpSocket` | `receiveDatagram()` | `shared_ptr<Awaitable<QNetworkDatagram>>`；每个元素是一整个 UDP datagram，不合并/拆分边界，并保留 payload、发送者、目标和端口等 metadata |
+| `QSslSocket` | 继承 TCP 方法，另有 `waitForEncrypted()`、`connectToHostEncrypted(host,port[,mode,protocol])` | `shared_ptr<Awaitable<void>>`；握手/证书失败为 `qt.ssl` 或 socket typed error |
+
+`QSslSocket` 的包装器不会调用 `ignoreSslErrors()`。应用必须依据证书策略处理
+`qt.ssl` 错误，不能把证书错误自动忽略。
+
+Qt 对象保持 Qt 的线程亲和规则：**所有 QObject 方法都在该对象所属线程执行**。
+不要从任意协程线程直接调用 socket/server；将对象创建在需要的线程，或通过该线程
+的 queued invocation 调度操作。包装器发起的 QObject 操作会切换到对象所属线程，
+但调用者仍须保证对象生命周期覆盖等待期。
+
+### 3.5 常见问题与排除方法
 
 | 现象 | 原因与排除 |
 |---|---|
@@ -131,4 +172,3 @@ auto cons = makeTask([&a]{ while(auto v = a.await()) { /* 消费 v.value() */ } 
 | `deleteLater` 迟迟不生效 | 调度期 Qt 不派发 `DeferredDelete`（见 `doc/需求文档.md` LIM-2），通常到 `quit()` 才处理；需要即时释放可显式 `delete`。 |
 | 运行中改线程亲和后未迁移到目标线程 | 不受支持（LIM-1）。线程归属请在协程创建时用 `Affinity` 指定，勿运行中反复 `setAffinity` 迁移。 |
 | qmake 报找不到 boost | 未按 2.2 安装 boost 到 `/usr/local`，或未在 `.pro` 中 `include(AsyncTask.pri)`。 |
-
