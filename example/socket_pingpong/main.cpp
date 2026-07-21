@@ -11,6 +11,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <system_error>
@@ -39,10 +40,15 @@ int main(int argc, char* argv[])
     QCoreApplication app(argc, argv);
     installFiberApplication();
 
-    makeTask([]{
+    // Coro::exec() always returns zero. Store the task outcome before quit()
+    // unblocks it; the atomic also remains correct if this task is affined to
+    // a worker thread in a future revision.
+    std::atomic_int exitCode{1};
+    makeTask([&exitCode]{
         auto server = std::make_unique<QTcpServer>();
         if(!server->listen(QHostAddress::LocalHost, 0)){
             qCritical() << "[server] listen failed:" << server->errorString();
+            exitCode.store(1, std::memory_order_release);
             quit();
             return 1;
         }
@@ -150,9 +156,11 @@ int main(int argc, char* argv[])
         }
 
         qDebug() << (ok ? "socket ping-pong passed" : "socket ping-pong failed");
+        exitCode.store(ok ? 0 : 1, std::memory_order_release);
         quit();
         return ok ? 0 : 1;
     });
 
-    return exec();
+    exec();
+    return exitCode.load(std::memory_order_acquire);
 }

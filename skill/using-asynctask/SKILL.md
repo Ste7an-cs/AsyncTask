@@ -103,8 +103,9 @@ if(!connected) qWarning() << connected.error().message();
 
 - `close()`：正常终止；已排队数据先被消费，最终 `Result.error()` 是
   `std::errc::no_message`。
-- `close(std::error_code)`：记录第一个终止错误；TCP/UDP 为 `qt.socket`，本地 socket
-  为 `qt.localsocket`，SSL 为 `qt.ssl`，保留 Qt 枚举值。
+- `close(std::error_code)`：记录第一个终止错误；TCP/UDP 和 `QAbstractSocket` 的传输或
+  握手失败为 `qt.socket`，本地 socket 为 `qt.local_socket`；`sslErrors()` /
+  `peerVerifyError()` 的证书和 peer verification 事件为 `qt.ssl`，保留 Qt 枚举值。
 - `await_for(...)` 的 `std::errc::timed_out` 仅结束本次等待；**不取消 Awaitable，
   不断开订阅，也不关闭/取消底层 socket 操作**。停止来源必须显式调用 Qt 的
   `disconnectFromHost`、`disconnectFromServer`、`close` 等操作。
@@ -121,8 +122,9 @@ if(!connected) qWarning() << connected.error().message();
 | `CoroUdpSocket` | `receiveDatagram` → `Awaitable<QNetworkDatagram>` 流；每个元素保留一个 UDP datagram 的边界、payload、发送者/目标地址和端口 metadata |
 | `CoroSslSocket` | 继承 TCP 方法；`waitForEncrypted`、`connectToHostEncrypted` |
 
-`QSslSocket` 的握手、证书和 peer verification 失败产生 `qt.ssl` 错误；框架**从不**
-自动调用 `ignoreSslErrors()`，应用必须明确实现自己的证书策略。`nextConnection` 和
+`QSslSocket` 的 `sslErrors()` / `peerVerifyError()` 证书和 peer verification 事件产生
+`qt.ssl` 错误；传输或握手失败可以是 `qt.socket`。框架**从不**自动调用
+`ignoreSslErrors()`，应用必须明确实现自己的证书策略。`nextConnection` 和
 `receiveDatagram` 传给 `generate(shared_ptr)` 后，来源正常关闭会使迭代自然结束。
 
 **跨协程协调退出：** `quit()` 应在工作真正完成后才调用。若要先等其它协程/任务结束，**捕获其 `FiberTask` 并调用 `.get()`**（让出而非阻塞）再 `quit()`：
@@ -158,9 +160,20 @@ makeTask([]{
 QTcpSocket* c = new QTcpSocket();
 auto connected = await_for(coro(c).connectToHost(QHostAddress::LocalHost, 40088), 2s);
 if(connected){
-    auto data = await_for(coro(c).readAll(), 2s);
+    auto response = coro(c).readAll();
     auto written = coro(c).waitForBytesWritten();
-    if(c->write("ping") == 4 && await_for(written, 2s) && data) { /* use data.value() */ }
+    const QByteArray ping("ping");
+    if(c->write(ping) != ping.size()) {
+        /* handle c->error() */
+    }else if(const auto flushed = await_for(written, 2s); !flushed) {
+        /* handle flushed.error() */
+    }else if(const auto reply = await_for(response, 2s); !reply) {
+        /* handle reply.error() */
+    }else if(reply.value() != ping) {
+        /* handle unexpected reply */
+    }else {
+        /* use reply.value() */
+    }
 }
 // 流式：for (const QByteArray& msg : generate(coro(c).readAll())) { ... }
 ```

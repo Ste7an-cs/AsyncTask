@@ -141,7 +141,9 @@ move-only 所有权语义；不要把 socket 包装器的返回值当作按值 A
 **终止、错误和超时**：`Awaitable::close()` 是正常关闭，未消费完的数据仍会先
 被读取，随后返回 `std::errc::no_message`；`close(std::error_code)` 保存第一个
 终止错误。socket 的异常关闭返回保留 Qt 枚举值的 typed error（TCP/UDP 为
-`qt.socket`，本地 socket 为 `qt.localsocket`，SSL 为 `qt.ssl`）。`await_for` 的
+`qt.socket`，本地 socket 为 `qt.local_socket`；`sslErrors()` / `peerVerifyError()`
+的证书和 peer verification 事件为 `qt.ssl`。`QAbstractSocket` 的传输或握手失败
+可以为 `qt.socket`）。`await_for` 的
 `timed_out` 只表示这一次等待到期，**不会取消 Awaitable、断开信号或关闭/取消
 底层 socket 操作**；需要停止来源时显式调用 Qt 的断开/关闭 API。
 
@@ -152,7 +154,7 @@ move-only 所有权语义；不要把 socket 包装器的返回值当作按值 A
 | `QLocalSocket` | `readAll()`、`waitForReadyRead()`、`waitForBytesWritten()`、`waitForConnected()`、`waitForDisconnected()`、`connectToServer(name[,mode])`、`disconnectFromServer()` | `shared_ptr<Awaitable<QByteArray>>` 或 `shared_ptr<Awaitable<void>>` |
 | `QLocalServer` | `nextConnection()` | `shared_ptr<Awaitable<QLocalSocket*>>`；支持本地 server 连接流 |
 | `QUdpSocket` | `receiveDatagram()` | `shared_ptr<Awaitable<QNetworkDatagram>>`；每个元素是一整个 UDP datagram，不合并/拆分边界，并保留 payload、发送者、目标和端口等 metadata |
-| `QSslSocket` | 继承 TCP 方法，另有 `waitForEncrypted()`、`connectToHostEncrypted(host,port[,mode,protocol])` | `shared_ptr<Awaitable<void>>`；握手/证书失败为 `qt.ssl` 或 socket typed error |
+| `QSslSocket` | 继承 TCP 方法，另有 `waitForEncrypted()`、`connectToHostEncrypted(host,port[,mode,protocol])` | `shared_ptr<Awaitable<void>>`；`sslErrors()` / `peerVerifyError()` 的证书和 peer verification 事件为 `qt.ssl`，传输或握手失败可为 `qt.socket` |
 
 `QSslSocket` 的包装器不会调用 `ignoreSslErrors()`。应用必须依据证书策略处理
 `qt.ssl` 错误，不能把证书错误自动忽略。
