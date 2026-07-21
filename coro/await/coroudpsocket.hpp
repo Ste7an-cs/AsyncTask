@@ -12,7 +12,6 @@
 #include <QPointer>
 #include <QNetworkDatagram>
 #include <QThread>
-#include <QTimer>
 #include <QUdpSocket>
 
 #include "awaitable.hpp"
@@ -71,60 +70,24 @@ public:
                     awaitable->close(detail::socket_error_code(error));
                     detail::cleanup_socket_connections(connections);
                 }));
-        }
-        detail::bind_socket_lifecycle(socket, awaitable, connections);
-        onSocketThread(socket, [awaitable, connections, drain = std::move(drain),
-                                socket](QUdpSocket* current){
-            if(awaitable->channel()->is_closed()){
-                detail::cleanup_socket_connections(connections);
-                return;
-            }
-            auto timer = new QTimer(current);
-            timer->setInterval(10);
-            QPointer<QTimer> timerGuard(timer);
-            auto isActive = [](const QUdpSocket* current){
-                return current->state() != QAbstractSocket::UnconnectedState
-                    || current->isValid();
-            };
-            auto wasActive = std::make_shared<bool>(isActive(current));
-            detail::register_socket_cleanup(connections, [timerGuard]{
-                if(!timerGuard) return;
-                if(timerGuard->thread() == QThread::currentThread()){
-                    timerGuard->stop();
-                    timerGuard->deleteLater();
-                    return;
-                }
-                QMetaObject::invokeMethod(timerGuard.data(), [timerGuard]{
-                    if(timerGuard){
-                        timerGuard->stop();
-                        timerGuard->deleteLater();
-                    }
-                }, Qt::QueuedConnection);
-            });
             detail::register_socket_connection(
                 connections,
-                QObject::connect(timer, &QTimer::timeout,
-                                 [awaitable, connections, socket, wasActive,
-                                  isActive]{
-                    if(awaitable->channel()->is_closed()){
-                        detail::cleanup_socket_connections(connections);
-                        return;
-                    }
-                    if(!socket){
-                        awaitable->close();
-                        detail::cleanup_socket_connections(connections);
-                        return;
-                    }
-                    if(isActive(socket.data())){
-                        *wasActive = true;
-                        return;
-                    }
-                    if(*wasActive){
+                QObject::connect(socket.data(), &QAbstractSocket::stateChanged,
+                                 [awaitable, connections](
+                                     QAbstractSocket::SocketState state){
+                    if(state == QAbstractSocket::UnconnectedState){
                         awaitable->close();
                         detail::cleanup_socket_connections(connections);
                     }
                 }));
-            timer->start();
+        }
+        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        onSocketThread(socket, [awaitable, connections, drain = std::move(drain)](
+                                  QUdpSocket* current){
+            if(awaitable->channel()->is_closed()){
+                detail::cleanup_socket_connections(connections);
+                return;
+            }
             drain(current);
         });
         return awaitable;
