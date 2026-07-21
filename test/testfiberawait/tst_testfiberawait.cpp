@@ -106,6 +106,7 @@ private slots:
     void test_case_tcp_disconnect();
     void test_case_tcp_read_then_remote_close();
     void test_case_tcp_server_close();
+    void test_case_tcp_server_closed_stream_release();
     void test_case_tcp_server_connection_stream();
     void test_case_local_ping_pong_disconnect();
     void test_case_local_connection_stream_and_close();
@@ -812,6 +813,20 @@ void TestFiberAwait::test_case_tcp_server_close()
     auto finished = Coro::await_for(incoming, 2s);
     QVERIFY(!finished);
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
+void TestFiberAwait::test_case_tcp_server_closed_stream_release()
+{
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+    std::weak_ptr<Coro::Awaitable<QTcpSocket*>> observed = incoming;
+
+    incoming->close();
+    incoming.reset();
+
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 2000);
+    QVERIFY(server.isListening());
 }
 
 void TestFiberAwait::test_case_tcp_server_connection_stream()
