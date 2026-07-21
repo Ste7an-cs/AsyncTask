@@ -4,114 +4,216 @@
 /**
  * @file corosocket.hpp
  * @brief QAbstractSocket 的协程包装器。
- *
- * coro(QAbstractSocket*).readAll()/waitForConnected()/connectToHost()/... 返回 Awaitable。
  */
 
 #include <memory>
+#include <utility>
 #include <QObject>
 #include <QPointer>
 #include <QIODevice>
 #include <QAbstractSocket>
 #include <QHostAddress>
+#include <QThread>
 
 #include "awaitable.hpp"
-#include "detail/lifecycle.hpp"
+#include "detail/socketawait.hpp"
+#include "detail/socketerror.hpp"
 
 namespace Coro {
 
-/**
- * @brief QAbstractSocket 的协程包装器（方法名镜像原 Qt API）
- */
 class CoroAbstractSocket{
-    QPointer<QAbstractSocket> sock_;///< 被包装的套接字（弱引用）
-public:
-    /**
-     * @brief 构造
-     * @param s 被包装的套接字
-     */
-    explicit CoroAbstractSocket(QAbstractSocket* s): sock_(s){}
+    QPointer<QAbstractSocket> sock_;
 
-    /**
-     * @brief 等待可读并返回读取的全部数据；socket 断开时结束（用于 generate 流式读取）
-     * @return 产出 QByteArray 的 Awaitable
-     */
-    Awaitable<QByteArray> readAll(){
-        Awaitable<QByteArray> a;
-        auto ch = a.channel();
-        QPointer<QAbstractSocket> dev = sock_;
-        auto c1 = std::make_shared<QMetaObject::Connection>();
-        if(sock_){
-            *c1 = QObject::connect(sock_, &QIODevice::readyRead, [ch, dev]{ if(dev) ch->push(dev->readAll()); });
-            QObject::connect(sock_, &QAbstractSocket::disconnected, [ch]{ ch->close(); });
-            // 避免 check-then-wait 竞态：若数据已就绪(在连接建立前已到达)，立即投递
-            if(sock_->bytesAvailable() > 0){ ch->push(sock_->readAll()); }
+    template<typename Function>
+    static void onSocketThread(QPointer<QAbstractSocket> socket, Function function){
+        if(!socket) return;
+        if(socket->thread() == QThread::currentThread()){
+            function(socket.data());
+            return;
         }
-        a.setOnClose(detail::bind_close(sock_.data(), ch, {c1}));
-        return a;
+        QMetaObject::invokeMethod(
+            socket.data(),
+            [socket, function = std::move(function)]() mutable {
+                if(socket) function(socket.data());
+            },
+            Qt::QueuedConnection);
     }
-    /**
-     * @brief 等待可读（不取数据）
-     * @return 就绪时触发一次的 Awaitable<void>
-     */
-    Awaitable<void> waitForReadyRead(){
-        Awaitable<void> a;
-        auto ch = a.channel();
-        auto c  = std::make_shared<QMetaObject::Connection>();
-        if(sock_) *c = QObject::connect(sock_, &QIODevice::readyRead, [ch]{ ch->push(1); });
-        a.setOnClose(detail::bind_close(sock_.data(), ch, {c}));
-        return a;
-    }
-    /**
-     * @brief 等待连接成功（若已连接则立即就绪）
-     * @return 连接成功触发一次的 Awaitable<void>
-     */
-    Awaitable<void> waitForConnected(){
-        Awaitable<void> a;
-        auto ch = a.channel();
-        auto c  = std::make_shared<QMetaObject::Connection>();
-        if(sock_) *c = QObject::connect(sock_, &QAbstractSocket::connected, [ch]{ ch->push(1); });
-        a.setOnClose(detail::bind_close(sock_.data(), ch, {c}));
-        if(sock_ && sock_->state() == QAbstractSocket::ConnectedState){ ch->push(1); }
-        return a;
-    }
-    /**
-     * @brief 等待断开连接（若已断开则立即就绪）
-     * @return 断开触发一次的 Awaitable<void>
-     */
-    Awaitable<void> waitForDisconnected(){
-        Awaitable<void> a;
-        auto ch = a.channel();
-        auto c  = std::make_shared<QMetaObject::Connection>();
-        if(sock_) *c = QObject::connect(sock_, &QAbstractSocket::disconnected, [ch]{ ch->push(1); });
-        a.setOnClose(detail::bind_close(sock_.data(), ch, {c}));
-        if(sock_ && sock_->state() == QAbstractSocket::UnconnectedState){ ch->push(1); }
-        return a;
-    }
-    /**
-     * @brief 发起连接并等待连接成功
-     * @param host 目标主机
-     * @param port 目标端口
-     * @param mode 打开模式
-     * @return 连接成功触发一次的 Awaitable<void>
-     */
-    Awaitable<void> connectToHost(const QString& host, quint16 port,
-                                  QIODevice::OpenMode mode = QIODevice::ReadWrite){
-        auto a = waitForConnected();
-        if(sock_ && sock_->state() != QAbstractSocket::ConnectedState){
-            sock_->connectToHost(host, port, mode);
+
+    template<typename Signal, typename Check>
+    std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
+        auto connections = detail::socket_connections();
+        auto awaitable = detail::socket_awaitable<void>(connections);
+        QPointer<QAbstractSocket> socket = sock_;
+
+        if(socket){
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), signal,
+                                 [awaitable, connections](auto...){
+                    awaitable->resolve();
+                    awaitable->close();
+                    detail::cleanup_socket_connections(connections);
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QAbstractSocket::errorOccurred,
+                                 [awaitable, connections](QAbstractSocket::SocketError error){
+                    awaitable->close(detail::socket_error_code(error));
+                    detail::cleanup_socket_connections(connections);
+                }));
         }
-        return a;
+        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        onSocketThread(socket,
+                       [awaitable, connections, check = std::move(check)](
+                           QAbstractSocket* current) mutable {
+            if(check(current)){
+                awaitable->resolve();
+                awaitable->close();
+                detail::cleanup_socket_connections(connections);
+            }else if(current->state() == QAbstractSocket::UnconnectedState &&
+                     current->error() != QAbstractSocket::UnknownSocketError){
+                awaitable->close(detail::socket_error_code(current->error()));
+                detail::cleanup_socket_connections(connections);
+            }
+        });
+        return awaitable;
+    }
+
+public:
+    explicit CoroAbstractSocket(QAbstractSocket* socket): sock_(socket){}
+
+    std::shared_ptr<Awaitable<QByteArray>> readAll(){
+        auto connections = detail::socket_connections();
+        auto awaitable = detail::socket_awaitable<QByteArray>(connections);
+        QPointer<QAbstractSocket> socket = sock_;
+
+        auto drain = [awaitable](QAbstractSocket* current){
+            if(current->bytesAvailable() > 0){
+                const QByteArray bytes = current->readAll();
+                if(!bytes.isEmpty()) awaitable->resolve(bytes);
+            }
+        };
+        if(socket){
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QIODevice::readyRead,
+                                 [awaitable, socket]{
+                    if(socket && socket->bytesAvailable() > 0){
+                        const QByteArray bytes = socket->readAll();
+                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                    }
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QAbstractSocket::disconnected,
+                                 [awaitable, connections, socket]{
+                    if(socket && socket->bytesAvailable() > 0){
+                        const QByteArray bytes = socket->readAll();
+                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                    }
+                    awaitable->close();
+                    detail::cleanup_socket_connections(connections);
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(socket.data(), &QAbstractSocket::errorOccurred,
+                                 [awaitable, connections, socket](
+                                     QAbstractSocket::SocketError error){
+                    if(socket && socket->bytesAvailable() > 0){
+                        const QByteArray bytes = socket->readAll();
+                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                    }
+                    if(error == QAbstractSocket::RemoteHostClosedError){
+                        awaitable->close();
+                    }else{
+                        awaitable->close(detail::socket_error_code(error));
+                    }
+                    detail::cleanup_socket_connections(connections);
+                }));
+        }
+        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        onSocketThread(socket, [awaitable, connections, drain](QAbstractSocket* current){
+            drain(current);
+            if(current->state() == QAbstractSocket::UnconnectedState){
+                const auto error = current->error();
+                if(error != QAbstractSocket::UnknownSocketError &&
+                   error != QAbstractSocket::RemoteHostClosedError){
+                    awaitable->close(detail::socket_error_code(error));
+                }else{
+                    awaitable->close();
+                }
+                detail::cleanup_socket_connections(connections);
+            }
+        });
+        return awaitable;
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForReadyRead(){
+        return waitForSignal(&QIODevice::readyRead, [](QAbstractSocket* socket){
+            return socket->bytesAvailable() > 0;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForBytesWritten(){
+        return waitForSignal(&QIODevice::bytesWritten, [](QAbstractSocket*){
+            return false;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForConnected(){
+        return waitForSignal(&QAbstractSocket::connected, [](QAbstractSocket* socket){
+            return socket->state() == QAbstractSocket::ConnectedState;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> waitForDisconnected(){
+        return waitForSignal(&QAbstractSocket::disconnected, [](QAbstractSocket* socket){
+            return socket->state() == QAbstractSocket::UnconnectedState;
+        });
+    }
+
+    std::shared_ptr<Awaitable<void>> connectToHost(
+        const QString& host, quint16 port,
+        QIODevice::OpenMode mode = QIODevice::ReadWrite){
+        auto awaitable = waitForConnected();
+        QPointer<QAbstractSocket> socket = sock_;
+        onSocketThread(socket, [host, port, mode](QAbstractSocket* current){
+            if(current->state() != QAbstractSocket::ConnectedState){
+                current->connectToHost(host, port, mode);
+            }
+        });
+        return awaitable;
+    }
+
+    std::shared_ptr<Awaitable<void>> connectToHost(
+        const QHostAddress& address, quint16 port,
+        QIODevice::OpenMode mode = QIODevice::ReadWrite){
+        auto awaitable = waitForConnected();
+        QPointer<QAbstractSocket> socket = sock_;
+        onSocketThread(socket, [address, port, mode](QAbstractSocket* current){
+            if(current->state() != QAbstractSocket::ConnectedState){
+                current->connectToHost(address, port, mode);
+            }
+        });
+        return awaitable;
+    }
+
+    std::shared_ptr<Awaitable<void>> disconnectFromHost(){
+        auto awaitable = waitForDisconnected();
+        QPointer<QAbstractSocket> socket = sock_;
+        onSocketThread(socket, [](QAbstractSocket* current){
+            if(current->state() != QAbstractSocket::UnconnectedState){
+                current->disconnectFromHost();
+            }
+        });
+        return awaitable;
     }
 };
 
-/**
- * @brief 构造 QAbstractSocket 的协程包装器
- * @param sock 被包装的套接字
- * @return CoroAbstractSocket 包装器
- */
-inline CoroAbstractSocket coro(QAbstractSocket* sock){ return CoroAbstractSocket(sock); }
-
+inline CoroAbstractSocket coro(QAbstractSocket* socket){
+    return CoroAbstractSocket(socket);
 }
+
+} // namespace Coro
 
 #endif // COROSOCKET_HPP

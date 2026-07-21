@@ -3,59 +3,88 @@
 
 /**
  * @file corotcpserver.hpp
- * @brief QTcpServer 的协程包装器：coro(QTcpServer*).nextConnection() 返回 Awaitable<QTcpSocket*>。
+ * @brief QTcpServer 的协程包装器。
  */
 
 #include <memory>
+#include <utility>
 #include <QObject>
 #include <QPointer>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThread>
 
 #include "awaitable.hpp"
-#include "detail/lifecycle.hpp"
+#include "detail/socketawait.hpp"
+#include "detail/socketerror.hpp"
 
 namespace Coro {
 
-/**
- * @brief QTcpServer 的协程包装器（方法名镜像原 Qt API）
- */
 class CoroTcpServer{
-    QPointer<QTcpServer> srv_;///< 被包装的服务器（弱引用）
-public:
-    /**
-     * @brief 构造
-     * @param s 被包装的服务器
-     */
-    explicit CoroTcpServer(QTcpServer* s): srv_(s){}
+    QPointer<QTcpServer> srv_;
 
-    /**
-     * @brief 等待新连接，返回新到的 QTcpSocket*；可 generate 持续接收
-     * @return 产出 QTcpSocket* 的 Awaitable
-     */
-    Awaitable<QTcpSocket*> nextConnection(){
-        Awaitable<QTcpSocket*> a;
-        auto ch = a.channel();
-        QPointer<QTcpServer> srv = srv_;
-        auto c1 = std::make_shared<QMetaObject::Connection>();
-        if(srv_){
-            *c1 = QObject::connect(srv_, &QTcpServer::newConnection, [ch, srv]{
-                while(srv && srv->hasPendingConnections()){ ch->push(srv->nextPendingConnection()); }
-            });
-            while(srv_ && srv_->hasPendingConnections()){ ch->push(srv_->nextPendingConnection()); }
+    template<typename Function>
+    static void onServerThread(QPointer<QTcpServer> server, Function function){
+        if(!server) return;
+        if(server->thread() == QThread::currentThread()){
+            function(server.data());
+            return;
         }
-        a.setOnClose(detail::bind_close(srv_.data(), ch, {c1}));
-        return a;
+        QMetaObject::invokeMethod(
+            server.data(),
+            [server, function = std::move(function)]() mutable {
+                if(server) function(server.data());
+            },
+            Qt::QueuedConnection);
+    }
+
+public:
+    explicit CoroTcpServer(QTcpServer* server): srv_(server){}
+
+    std::shared_ptr<Awaitable<QTcpSocket*>> nextConnection(){
+        auto connections = detail::socket_connections();
+        auto awaitable = detail::socket_awaitable<QTcpSocket*>(connections);
+        QPointer<QTcpServer> server = srv_;
+
+        auto drain = [awaitable](QTcpServer* current){
+            while(current->hasPendingConnections()){
+                awaitable->resolve(current->nextPendingConnection());
+            }
+        };
+        if(server){
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(server.data(), &QTcpServer::newConnection,
+                                 [awaitable, server]{
+                    while(server && server->hasPendingConnections()){
+                        awaitable->resolve(server->nextPendingConnection());
+                    }
+                }));
+            detail::register_socket_connection(
+                connections,
+                QObject::connect(server.data(), &QTcpServer::acceptError,
+                                 [awaitable, connections](
+                                     QAbstractSocket::SocketError error){
+                    awaitable->close(detail::socket_error_code(error));
+                    detail::cleanup_socket_connections(connections);
+                }));
+        }
+        detail::bind_socket_lifecycle(server, awaitable, connections);
+        onServerThread(server, [awaitable, connections, drain](QTcpServer* current){
+            drain(current);
+            if(!current->isListening()){
+                awaitable->close();
+                detail::cleanup_socket_connections(connections);
+            }
+        });
+        return awaitable;
     }
 };
 
-/**
- * @brief 构造 QTcpServer 的协程包装器
- * @param srv 被包装的服务器
- * @return CoroTcpServer 包装器
- */
-inline CoroTcpServer coro(QTcpServer* srv){ return CoroTcpServer(srv); }
-
+inline CoroTcpServer coro(QTcpServer* server){
+    return CoroTcpServer(server);
 }
+
+} // namespace Coro
 
 #endif // COROTCPSERVER_HPP

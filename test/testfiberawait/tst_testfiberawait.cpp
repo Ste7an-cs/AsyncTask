@@ -15,8 +15,12 @@
 #include <QAbstractSocket>
 #include <QLocalSocket>
 #include <QPointer>
+#include <QNetworkProxy>
 #include <QTcpSocket>
 #include <QTcpServer>
+#include <QThread>
+#include <chrono>
+#include <type_traits>
 
 #define TQVERIFY(statement) \
 do {\
@@ -68,7 +72,10 @@ private slots:
     void test_case_signal_generate();
     void test_case_iodevice_await();
     void test_case_iodevice_generate();
-    void test_case_socket_await();
+    void test_case_tcp_ping_pong();
+    void test_case_tcp_connection_refused();
+    void test_case_tcp_disconnect();
+    void test_case_tcp_server_connection_stream();
     void cleanupTestCase();
 
 };
@@ -561,77 +568,128 @@ void TestFiberAwait::test_case_iodevice_generate()
     TQVERIFY(k == 100);
 }
 
-///
-/// \brief TestFiberAwait::test_case_socket_await 测试TCP客户端/服务器 ping-pong模式
-///
-void TestFiberAwait::test_case_socket_await()
+void TestFiberAwait::test_case_tcp_ping_pong()
 {
-    QTcpServer *server = new QTcpServer();
-    connect(server, &QTcpServer::acceptError, [](QAbstractSocket::SocketError socketError){
-        qDebug() << "QTcpServer acceptError" << socketError;
-    });
-    auto task_server = Coro::makeTask([server](){
-        server->listen(QHostAddress::LocalHost, 40080);
-        Coro::Generator<QTcpSocket*> gen = Coro::generate(Coro::coro(server).nextConnection());
-        int client_cnt{0};
-        for(QTcpSocket* p_socket : gen){
-            client_cnt++;
-            connect(p_socket, &QTcpSocket::aboutToClose, [client_cnt](){
-                qDebug() << "p_socket about to close" << client_cnt;
-            });
-            connect(p_socket, &QTcpSocket::stateChanged, [client_cnt](QAbstractSocket::SocketState state){
-                QMetaEnum metaEnum = QMetaEnum::fromType<QAbstractSocket::SocketState>();
-                qDebug() << "p_socket stateChanged "<< client_cnt << metaEnum.valueToKey(state);
-            });
-            Coro::makeTask([p_socket, client_cnt](){
-                int k = 0;
-                auto gen_msg = Coro::generate(Coro::coro(p_socket).readAll());
-                for(const auto & msg : gen_msg){///ping pong服务端
-                    p_socket->write(msg);
-                    boost::this_fiber::yield();
-                }
-                qDebug() << "p_socket done " << client_cnt;
-            });
-            boost::this_fiber::yield();
-        }
-    });
-    auto task_client = Coro::makeTask([](){
-        for(int i=0; i<100; i++){
-            Coro::makeTask([i](){
-                QTcpSocket *client = new QTcpSocket();
-                client->connectToHost(QHostAddress::LocalHost, 40080);
-                Coro::await(Coro::coro(client).waitForConnected());
-                connect(client, &QTcpSocket::aboutToClose, [i](){
-                    qDebug() << "client about to close" << i;
-                });
-                for(int k=0; k<10; k++){
-                    if(client->state() != QTcpSocket::ConnectedState){
-                        break ;
-                    }
-                    int size = client->write("aaaaaa");
-                    Coro::Result<QByteArray> r = Coro::await(Coro::coro(client).readAll());
-                    if(r){
-                        TQVERIFY(r.value() == "aaaaaa");
-                        qDebug() << "awaitReadAll true" << i << " " << k;
-                    }else{
-//                        break;
-                        qDebug() << "awaitReadAll false" << i;
-                    }
-                    boost::this_fiber::yield();
-                }
-                client->close();
-                client->deleteLater();
-            });
-        }
-    });
-    task_client.get();
-    Coro::sleep(4);
-    server->close();
-    // 立即销毁 server：触发 coro(server).nextConnection() 的 destroyed 收尾，使
-    // 服务端生成器结束、task_server.get() 返回。此时全部 ping-pong 已完成、
-    // 各连接处理协程均已结束，销毁其子 socket 是安全的。
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+    static_assert(std::is_same_v<decltype(incoming),
+                                 std::shared_ptr<Coro::Awaitable<QTcpSocket*>>>);
+
+    QTcpSocket client;
+    client.setProxy(QNetworkProxy::NoProxy);
+    auto connected = Coro::coro(&client).connectToHost(
+        QStringLiteral("127.0.0.1"), server.serverPort());
+    static_assert(std::is_same_v<decltype(connected),
+                                 std::shared_ptr<Coro::Awaitable<void>>>);
+    QVERIFY(Coro::await_for(connected, 2s));
+
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QTcpSocket* peer = accepted.value();
+    QVERIFY(peer != nullptr);
+
+    auto serverReady = Coro::coro(peer).waitForReadyRead();
+    auto clientWritten = Coro::coro(&client).waitForBytesWritten();
+    QCOMPARE(client.write("ping"), qint64(4));
+    QVERIFY(Coro::await_for(clientWritten, 2s));
+    QVERIFY(Coro::await_for(serverReady, 2s));
+    auto request = Coro::await_for(Coro::coro(peer).readAll(), 2s);
+    QVERIFY(request);
+    QCOMPARE(request.value(), QByteArray("ping"));
+
+    auto clientReady = Coro::coro(&client).waitForReadyRead();
+    auto serverWritten = Coro::coro(peer).waitForBytesWritten();
+    QCOMPARE(peer->write("pong"), qint64(4));
+    QVERIFY(Coro::await_for(serverWritten, 2s));
+    QVERIFY(Coro::await_for(clientReady, 2s));
+    auto response = Coro::await_for(Coro::coro(&client).readAll(), 2s);
+    QVERIFY(response);
+    QCOMPARE(response.value(), QByteArray("pong"));
+
+    client.abort();
+    delete peer;
+}
+
+void TestFiberAwait::test_case_tcp_connection_refused()
+{
+    using namespace std::chrono_literals;
+    QTcpServer portProbe;
+    QVERIFY(portProbe.listen(QHostAddress::LocalHost, 0));
+    const quint16 unusedPort = portProbe.serverPort();
+    portProbe.close();
+
+    QThread socketThread;
+    socketThread.start();
+    auto client = new QTcpSocket;
+    client->setProxy(QNetworkProxy::NoProxy);
+    client->moveToThread(&socketThread);
+    auto connected = Coro::coro(client).connectToHost(
+        QStringLiteral("127.0.0.1"), unusedPort);
+    auto result = Coro::await_for(connected, 2s);
+    QMetaObject::invokeMethod(client, [client]{ delete client; },
+                              Qt::BlockingQueuedConnection);
+    socketThread.quit();
+    QVERIFY(socketThread.wait(2000));
+    QVERIFY(!result);
+    QCOMPARE(QString::fromLatin1(result.error().category().name()),
+             QStringLiteral("qt.socket"));
+    QCOMPARE(result.error().value(),
+             static_cast<int>(QAbstractSocket::ConnectionRefusedError));
+}
+
+void TestFiberAwait::test_case_tcp_disconnect()
+{
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QTcpSocket client;
+    QVERIFY(Coro::await_for(Coro::coro(&client).connectToHost(
+        QHostAddress::LocalHost, server.serverPort()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QTcpSocket* peer = accepted.value();
+
+    auto disconnected = Coro::coro(&client).disconnectFromHost();
+    QVERIFY(Coro::await_for(disconnected, 2s));
+    QCOMPARE(client.state(), QAbstractSocket::UnconnectedState);
+    QVERIFY(Coro::await_for(Coro::coro(&client).waitForDisconnected(), 2s));
+    delete peer;
+}
+
+void TestFiberAwait::test_case_tcp_server_connection_stream()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+
+    QTcpSocket firstClient;
+    QTcpSocket secondClient;
+    firstClient.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    secondClient.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QVERIFY(Coro::await_for(Coro::coro(&firstClient).waitForConnected(), 2s));
+    QVERIFY(Coro::await_for(Coro::coro(&secondClient).waitForConnected(), 2s));
+
+    auto first = Coro::await_for(incoming, 2s);
+    auto second = Coro::await_for(incoming, 2s);
+    QVERIFY(first);
+    QVERIFY(second);
+    QVERIFY(first.value() != second.value());
+    QPointer<QTcpSocket> firstPeer(first.value());
+    QPointer<QTcpSocket> secondPeer(second.value());
+
     delete server;
-    task_server.get();
+    auto finished = Coro::await_for(incoming, 2s);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+    QVERIFY(firstPeer.isNull());
+    QVERIFY(secondPeer.isNull());
+    firstClient.abort();
+    secondClient.abort();
 }
 
 void TestFiberAwait::cleanupTestCase()
