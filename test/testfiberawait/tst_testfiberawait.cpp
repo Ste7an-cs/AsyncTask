@@ -158,22 +158,36 @@ private slots:
     void test_case_tcp_connection_refused();
     void test_case_tcp_retry_after_refusal();
     void test_case_tcp_disconnect();
+    void test_case_tcp_remote_disconnect_wait();
     void test_case_tcp_read_then_remote_close();
+    void test_case_tcp_read_stream_direct_close();
     void test_case_tcp_server_close();
     void test_case_tcp_server_closed_stream_release();
     void test_case_tcp_server_queued_close_release();
+    void test_case_tcp_server_stream_direct_close();
+    void test_case_tcp_server_destroy_purges_queued_connection();
+    void test_case_tcp_closed_server_stream_purges_on_destroy();
     void test_case_tcp_server_connection_stream();
+    void test_case_tcp_queued_connect_cancel();
     void test_case_ssl_error_conversion();
     void test_case_ssl_encrypted_ping_pong();
     void test_case_ssl_plain_peer_handshake_failure();
+    void test_case_ssl_queued_connect_cancel();
     void test_case_local_ping_pong_disconnect();
+    void test_case_local_remote_disconnect_wait();
     void test_case_local_connection_stream_and_close();
     void test_case_local_missing_server();
     void test_case_local_closed_stream_release();
     void test_case_local_server_queued_close_release();
+    void test_case_local_server_stream_direct_close();
+    void test_case_local_server_destroy_purges_queued_connection();
+    void test_case_local_closed_server_stream_purges_on_destroy();
     void test_case_local_retry_after_missing_server();
     void test_case_local_read_then_peer_close();
+    void test_case_local_read_stream_direct_close();
+    void test_case_local_queued_connect_cancel();
     void test_case_udp_preserves_datagrams_and_sender_metadata();
+    void test_case_udp_stream_direct_close();
     void test_case_udp_close_ends_stream_and_releases();
     void test_case_udp_destruction_ends_stream_and_releases();
     void cleanupTestCase();
@@ -230,6 +244,20 @@ void TestFiberAwait::test_case_close_overloads()
     QVERIFY(channelClose != nullptr);
     QVERIFY(valueClose != nullptr);
     QVERIFY(voidClose != nullptr);
+
+    int valueCleanupCalls = 0;
+    Coro::Awaitable<int> value;
+    value.setOnClose([&valueCleanupCalls]{ ++valueCleanupCalls; });
+    value.close();
+    value.close(std::make_error_code(std::errc::timed_out));
+    QCOMPARE(valueCleanupCalls, 1);
+
+    int voidCleanupCalls = 0;
+    Coro::Awaitable<void> event;
+    event.setOnClose([&voidCleanupCalls]{ ++voidCleanupCalls; });
+    event.close();
+    event.close(std::make_error_code(std::errc::timed_out));
+    QCOMPARE(voidCleanupCalls, 1);
 }
 
 void TestFiberAwait::test_case_channel_terminal_error()
@@ -856,6 +884,29 @@ void TestFiberAwait::test_case_tcp_disconnect()
     delete peer;
 }
 
+void TestFiberAwait::test_case_tcp_remote_disconnect_wait()
+{
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QTcpSocket client;
+    QVERIFY(Coro::await_for(Coro::coro(&client).connectToHost(
+        QHostAddress::LocalHost, server.serverPort()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QTcpSocket* peer = accepted.value();
+
+    auto disconnected = Coro::coro(&client).waitForDisconnected();
+    peer->disconnectFromHost();
+
+    auto result = Coro::await_for(disconnected, 2s);
+    QVERIFY(result);
+    QCOMPARE(client.state(), QAbstractSocket::UnconnectedState);
+    delete peer;
+}
+
 void TestFiberAwait::test_case_tcp_read_then_remote_close()
 {
     using namespace std::chrono_literals;
@@ -882,6 +933,34 @@ void TestFiberAwait::test_case_tcp_read_then_remote_close()
     QCOMPARE(bytes.value(), QByteArray("final-bytes"));
     QVERIFY(!finished);
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+    delete peer;
+}
+
+void TestFiberAwait::test_case_tcp_read_stream_direct_close()
+{
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QTcpSocket client;
+    QVERIFY(Coro::await_for(Coro::coro(&client).connectToHost(
+        QHostAddress::LocalHost, server.serverPort()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QTcpSocket* peer = accepted.value();
+
+    auto stream = Coro::coro(&client).readAll();
+    std::weak_ptr<Coro::Awaitable<QByteArray>> observed = stream;
+    stream->close();
+    stream.reset();
+
+    const QByteArray payload("after-close");
+    QCOMPARE(peer->write(payload), qint64(payload.size()));
+    peer->flush();
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired() &&
+                             client.bytesAvailable() == payload.size(), 1000);
+    QCOMPARE(client.readAll(), payload);
     delete peer;
 }
 
@@ -944,6 +1023,71 @@ void TestFiberAwait::test_case_tcp_server_queued_close_release()
     QVERIFY(stopped);
 }
 
+void TestFiberAwait::test_case_tcp_server_stream_direct_close()
+{
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+    std::weak_ptr<Coro::Awaitable<QTcpSocket*>> observed = incoming;
+    const auto monitors = server.findChildren<QTimer*>();
+    QCOMPARE(monitors.size(), 1);
+    for(QTimer* monitor : monitors) monitor->stop();
+
+    incoming->close();
+    incoming.reset();
+    const bool releasedOnClose = observed.expired();
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTest::qWait(50);
+
+    QVERIFY(releasedOnClose);
+    QVERIFY(server.hasPendingConnections());
+    delete server.nextPendingConnection();
+}
+
+void TestFiberAwait::test_case_tcp_server_destroy_purges_queued_connection()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+    QSignalSpy connectionSignal(server, &QTcpServer::newConnection);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());
+
+    delete server;
+    auto finished = Coro::await_for(incoming, 100ms);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
+void TestFiberAwait::test_case_tcp_closed_server_stream_purges_on_destroy()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+    QSignalSpy connectionSignal(server, &QTcpServer::newConnection);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());
+
+    incoming->close();
+    delete server;
+    auto finished = Coro::await_for(incoming, 100ms);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
 void TestFiberAwait::test_case_tcp_server_connection_stream()
 {
     using namespace std::chrono_literals;
@@ -974,6 +1118,35 @@ void TestFiberAwait::test_case_tcp_server_connection_stream()
     QVERIFY(secondPeer.isNull());
     firstClient.abort();
     secondClient.abort();
+}
+
+void TestFiberAwait::test_case_tcp_queued_connect_cancel()
+{
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QThread worker;
+    auto client = new QTcpSocket;
+    client->setProxy(QNetworkProxy::NoProxy);
+    client->moveToThread(&worker);
+    auto operation = Coro::coro(client).connectToHost(
+        QStringLiteral("127.0.0.1"), server.serverPort());
+    operation->close();
+    worker.start();
+
+    QAbstractSocket::SocketState state = QAbstractSocket::ConnectedState;
+    const bool inspected = QMetaObject::invokeMethod(
+        client, [client, &state]{
+            state = client->state();
+            delete client;
+        }, Qt::BlockingQueuedConnection);
+    worker.quit();
+    const bool stopped = worker.wait(2000);
+
+    QVERIFY(inspected);
+    QVERIFY(stopped);
+    QCOMPARE(state, QAbstractSocket::UnconnectedState);
+    QVERIFY(!server.hasPendingConnections());
 }
 
 void TestFiberAwait::test_case_ssl_encrypted_ping_pong()
@@ -1055,6 +1228,35 @@ void TestFiberAwait::test_case_ssl_plain_peer_handshake_failure()
     QVERIFY(!QString::fromStdString(result.error().message()).isEmpty());
 }
 
+void TestFiberAwait::test_case_ssl_queued_connect_cancel()
+{
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QThread worker;
+    auto client = new QSslSocket;
+    client->setProxy(QNetworkProxy::NoProxy);
+    client->moveToThread(&worker);
+    auto operation = Coro::coro(client).connectToHostEncrypted(
+        QStringLiteral("127.0.0.1"), server.serverPort());
+    operation->close();
+    worker.start();
+
+    QAbstractSocket::SocketState state = QAbstractSocket::ConnectedState;
+    const bool inspected = QMetaObject::invokeMethod(
+        client, [client, &state]{
+            state = client->state();
+            delete client;
+        }, Qt::BlockingQueuedConnection);
+    worker.quit();
+    const bool stopped = worker.wait(2000);
+
+    QVERIFY(inspected);
+    QVERIFY(stopped);
+    QCOMPARE(state, QAbstractSocket::UnconnectedState);
+    QVERIFY(!server.hasPendingConnections());
+}
+
 void TestFiberAwait::test_case_local_ping_pong_disconnect()
 {
     using namespace std::chrono_literals;
@@ -1097,6 +1299,29 @@ void TestFiberAwait::test_case_local_ping_pong_disconnect()
 
     QVERIFY(Coro::await_for(Coro::coro(&client).disconnectFromServer(), 2s));
     QVERIFY(Coro::await_for(Coro::coro(&client).waitForDisconnected(), 2s));
+    QCOMPARE(client.state(), QLocalSocket::UnconnectedState);
+}
+
+void TestFiberAwait::test_case_local_remote_disconnect_wait()
+{
+    using namespace std::chrono_literals;
+    LocalServerNameGuard serverName;
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QLocalSocket client;
+    QVERIFY(Coro::await_for(
+        Coro::coro(&client).connectToServer(serverName.name()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QLocalSocket* peer = accepted.value();
+
+    auto disconnected = Coro::coro(&client).waitForDisconnected();
+    peer->disconnectFromServer();
+
+    auto result = Coro::await_for(disconnected, 2s);
+    QVERIFY(result);
     QCOMPARE(client.state(), QLocalSocket::UnconnectedState);
 }
 
@@ -1195,6 +1420,74 @@ void TestFiberAwait::test_case_local_server_queued_close_release()
     QVERIFY(stopped);
 }
 
+void TestFiberAwait::test_case_local_server_stream_direct_close()
+{
+    LocalServerNameGuard serverName;
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+    auto incoming = Coro::coro(&server).nextConnection();
+    std::weak_ptr<Coro::Awaitable<QLocalSocket*>> observed = incoming;
+    const auto monitors = server.findChildren<QTimer*>();
+    QCOMPARE(monitors.size(), 1);
+    for(QTimer* monitor : monitors) monitor->stop();
+
+    incoming->close();
+    incoming.reset();
+    const bool releasedOnClose = observed.expired();
+
+    QLocalSocket client;
+    client.connectToServer(serverName.name());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QLocalSocket::ConnectedState, 2000);
+    QTest::qWait(50);
+
+    QVERIFY(releasedOnClose);
+    QVERIFY(server.hasPendingConnections());
+    delete server.nextPendingConnection();
+}
+
+void TestFiberAwait::test_case_local_server_destroy_purges_queued_connection()
+{
+    using namespace std::chrono_literals;
+    LocalServerNameGuard serverName;
+    auto server = new QLocalServer;
+    QVERIFY(server->listen(serverName.name()));
+    auto incoming = Coro::coro(server).nextConnection();
+    QSignalSpy connectionSignal(server, &QLocalServer::newConnection);
+
+    QLocalSocket client;
+    client.connectToServer(serverName.name());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QLocalSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());
+
+    delete server;
+    auto finished = Coro::await_for(incoming, 100ms);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
+void TestFiberAwait::test_case_local_closed_server_stream_purges_on_destroy()
+{
+    using namespace std::chrono_literals;
+    LocalServerNameGuard serverName;
+    auto server = new QLocalServer;
+    QVERIFY(server->listen(serverName.name()));
+    auto incoming = Coro::coro(server).nextConnection();
+    QSignalSpy connectionSignal(server, &QLocalServer::newConnection);
+
+    QLocalSocket client;
+    client.connectToServer(serverName.name());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QLocalSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());
+
+    incoming->close();
+    delete server;
+    auto finished = Coro::await_for(incoming, 100ms);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
 void TestFiberAwait::test_case_local_retry_after_missing_server()
 {
     using namespace std::chrono_literals;
@@ -1252,6 +1545,62 @@ void TestFiberAwait::test_case_local_read_then_peer_close()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+void TestFiberAwait::test_case_local_read_stream_direct_close()
+{
+    using namespace std::chrono_literals;
+    LocalServerNameGuard serverName;
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QLocalSocket client;
+    QVERIFY(Coro::await_for(
+        Coro::coro(&client).connectToServer(serverName.name()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QLocalSocket* peer = accepted.value();
+
+    auto stream = Coro::coro(&client).readAll();
+    std::weak_ptr<Coro::Awaitable<QByteArray>> observed = stream;
+    stream->close();
+    stream.reset();
+
+    const QByteArray payload("after-close");
+    QCOMPARE(peer->write(payload), qint64(payload.size()));
+    peer->flush();
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired() &&
+                             client.bytesAvailable() == payload.size(), 1000);
+    QCOMPARE(client.readAll(), payload);
+}
+
+void TestFiberAwait::test_case_local_queued_connect_cancel()
+{
+    LocalServerNameGuard serverName;
+    QLocalServer server;
+    QVERIFY(server.listen(serverName.name()));
+
+    QThread worker;
+    auto client = new QLocalSocket;
+    client->moveToThread(&worker);
+    auto operation = Coro::coro(client).connectToServer(serverName.name());
+    operation->close();
+    worker.start();
+
+    QLocalSocket::LocalSocketState state = QLocalSocket::ConnectedState;
+    const bool inspected = QMetaObject::invokeMethod(
+        client, [client, &state]{
+            state = client->state();
+            delete client;
+        }, Qt::BlockingQueuedConnection);
+    worker.quit();
+    const bool stopped = worker.wait(2000);
+
+    QVERIFY(inspected);
+    QVERIFY(stopped);
+    QCOMPARE(state, QLocalSocket::UnconnectedState);
+    QVERIFY(!server.hasPendingConnections());
+}
+
 void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
 {
     using namespace std::chrono_literals;
@@ -1279,6 +1628,26 @@ void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
     QCOMPARE(second.value().senderPort(), sender.localPort());
     QCOMPARE(first.value().senderAddress(), QHostAddress::LocalHost);
     QCOMPARE(second.value().senderAddress(), QHostAddress::LocalHost);
+}
+
+void TestFiberAwait::test_case_udp_stream_direct_close()
+{
+    QUdpSocket receiver;
+    QUdpSocket sender;
+    QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    QVERIFY(sender.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    auto datagrams = Coro::coro(&receiver).receiveDatagram();
+    std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
+
+    datagrams->close();
+    datagrams.reset();
+    const QByteArray payload("after-close");
+    QCOMPARE(sender.writeDatagram(payload, QHostAddress::LocalHost,
+                                  receiver.localPort()), qint64(payload.size()));
+
+    QTRY_VERIFY_WITH_TIMEOUT(observed.expired() &&
+                             receiver.hasPendingDatagrams(), 1000);
+    QCOMPARE(receiver.receiveDatagram().data(), payload);
 }
 
 void TestFiberAwait::test_case_udp_close_ends_stream_and_releases()

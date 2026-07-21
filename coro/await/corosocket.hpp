@@ -25,13 +25,13 @@ class CoroAbstractSocket{
     QPointer<QAbstractSocket> sock_;
 
     template<typename Function>
-    static void onSocketThread(QPointer<QAbstractSocket> socket, Function function){
-        if(!socket) return;
+    static bool onSocketThread(QPointer<QAbstractSocket> socket, Function function){
+        if(!socket) return false;
         if(socket->thread() == QThread::currentThread()){
             function(socket.data());
-            return;
+            return true;
         }
-        QMetaObject::invokeMethod(
+        return QMetaObject::invokeMethod(
             socket.data(),
             [socket, function = std::move(function)]() mutable {
                 if(socket) function(socket.data());
@@ -41,7 +41,8 @@ class CoroAbstractSocket{
 
     template<typename Signal, typename Check, typename Action>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
-                                                   Action action){
+                                                   Action action,
+                                                   bool peerCloseCompletes = false){
         auto connections = detail::socket_connections();
         auto awaitable = detail::socket_awaitable<void>(connections);
         QPointer<QAbstractSocket> socket = sock_;
@@ -58,16 +59,27 @@ class CoroAbstractSocket{
             detail::register_socket_connection(
                 connections,
                 detail::connect_socket_error(
-                    socket.data(), [awaitable, connections](QAbstractSocket::SocketError error){
+                    socket.data(), [awaitable, connections, socket,
+                                    peerCloseCompletes](QAbstractSocket::SocketError error){
+                    if(awaitable->channel()->is_closed()) return;
+                    if(peerCloseCompletes &&
+                       error == QAbstractSocket::RemoteHostClosedError){
+                        if(socket && socket->state() == QAbstractSocket::UnconnectedState){
+                            awaitable->resolve();
+                            awaitable->close();
+                        }
+                        return;
+                    }
                     awaitable->close(detail::socket_error_code(error));
                     detail::cleanup_socket_connections(connections);
                 }));
         }
         detail::bind_socket_lifecycle(socket, awaitable, connections);
-        onSocketThread(socket,
+        if(!onSocketThread(socket,
                        [awaitable, connections, check = std::move(check),
                         action = std::move(action)](
                            QAbstractSocket* current) mutable {
+            if(awaitable->channel()->is_closed()) return;
             action(current);
             if(check(current)){
                 awaitable->resolve();
@@ -78,7 +90,10 @@ class CoroAbstractSocket{
                 awaitable->close(detail::socket_error_code(current->error()));
                 detail::cleanup_socket_connections(connections);
             }
-        });
+        })){
+            awaitable->close();
+            detail::cleanup_socket_connections(connections);
+        }
         return awaitable;
     }
 
@@ -96,6 +111,7 @@ public:
         QPointer<QAbstractSocket> socket = sock_;
 
         auto drain = [awaitable](QAbstractSocket* current){
+            if(awaitable->channel()->is_closed()) return;
             if(current->bytesAvailable() > 0){
                 const QByteArray bytes = current->readAll();
                 if(!bytes.isEmpty()) awaitable->resolve(bytes);
@@ -106,7 +122,8 @@ public:
                 connections,
                 QObject::connect(socket.data(), &QIODevice::readyRead,
                                  [awaitable, socket]{
-                    if(socket && socket->bytesAvailable() > 0){
+                    if(!awaitable->channel()->is_closed() && socket &&
+                       socket->bytesAvailable() > 0){
                         const QByteArray bytes = socket->readAll();
                         if(!bytes.isEmpty()) awaitable->resolve(bytes);
                     }
@@ -115,6 +132,7 @@ public:
                 connections,
                 QObject::connect(socket.data(), &QAbstractSocket::disconnected,
                                  [awaitable, connections, socket]{
+                    if(awaitable->channel()->is_closed()) return;
                     if(socket && socket->bytesAvailable() > 0){
                         const QByteArray bytes = socket->readAll();
                         if(!bytes.isEmpty()) awaitable->resolve(bytes);
@@ -127,6 +145,7 @@ public:
                 detail::connect_socket_error(
                     socket.data(), [awaitable, connections, socket](
                                      QAbstractSocket::SocketError error){
+                    if(awaitable->channel()->is_closed()) return;
                     if(socket && socket->bytesAvailable() > 0){
                         const QByteArray bytes = socket->readAll();
                         if(!bytes.isEmpty()) awaitable->resolve(bytes);
@@ -140,7 +159,8 @@ public:
                 }));
         }
         detail::bind_socket_lifecycle(socket, awaitable, connections);
-        onSocketThread(socket, [awaitable, connections, drain](QAbstractSocket* current){
+        if(!onSocketThread(socket, [awaitable, connections, drain](QAbstractSocket* current){
+            if(awaitable->channel()->is_closed()) return;
             drain(current);
             if(current->state() == QAbstractSocket::UnconnectedState){
                 const auto error = current->error();
@@ -152,7 +172,10 @@ public:
                 }
                 detail::cleanup_socket_connections(connections);
             }
-        });
+        })){
+            awaitable->close();
+            detail::cleanup_socket_connections(connections);
+        }
         return awaitable;
     }
 
@@ -175,9 +198,12 @@ public:
     }
 
     std::shared_ptr<Awaitable<void>> waitForDisconnected(){
-        return waitForSignal(&QAbstractSocket::disconnected, [](QAbstractSocket* socket){
-            return socket->state() == QAbstractSocket::UnconnectedState;
-        });
+        return waitForSignal(
+            &QAbstractSocket::disconnected,
+            [](QAbstractSocket* socket){
+                return socket->state() == QAbstractSocket::UnconnectedState;
+            },
+            [](QAbstractSocket*){}, true);
     }
 
     std::shared_ptr<Awaitable<void>> connectToHost(
@@ -211,14 +237,16 @@ public:
     }
 
     std::shared_ptr<Awaitable<void>> disconnectFromHost(){
-        auto awaitable = waitForDisconnected();
-        QPointer<QAbstractSocket> socket = sock_;
-        onSocketThread(socket, [](QAbstractSocket* current){
-            if(current->state() != QAbstractSocket::UnconnectedState){
-                current->disconnectFromHost();
-            }
-        });
-        return awaitable;
+        return waitForSignal(
+            &QAbstractSocket::disconnected,
+            [](QAbstractSocket* socket){
+                return socket->state() == QAbstractSocket::UnconnectedState;
+            },
+            [](QAbstractSocket* socket){
+                if(socket->state() != QAbstractSocket::UnconnectedState){
+                    socket->disconnectFromHost();
+                }
+            }, true);
     }
 };
 

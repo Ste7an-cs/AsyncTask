@@ -25,13 +25,13 @@ class CoroTcpServer{
     QPointer<QTcpServer> srv_;
 
     template<typename Function>
-    static void onServerThread(QPointer<QTcpServer> server, Function function){
-        if(!server) return;
+    static bool onServerThread(QPointer<QTcpServer> server, Function function){
+        if(!server) return false;
         if(server->thread() == QThread::currentThread()){
             function(server.data());
-            return;
+            return true;
         }
-        QMetaObject::invokeMethod(
+        return QMetaObject::invokeMethod(
             server.data(),
             [server, function = std::move(function)]() mutable {
                 if(server) function(server.data());
@@ -48,7 +48,8 @@ public:
         QPointer<QTcpServer> server = srv_;
 
         auto drain = [awaitable](QTcpServer* current){
-            while(current->hasPendingConnections()){
+            while(!awaitable->channel()->is_closed() &&
+                  current->hasPendingConnections()){
                 awaitable->resolve(current->nextPendingConnection());
             }
         };
@@ -57,7 +58,8 @@ public:
                 connections,
                 QObject::connect(server.data(), &QTcpServer::newConnection,
                                  [awaitable, server]{
-                    while(server && server->hasPendingConnections()){
+                    while(!awaitable->channel()->is_closed() && server &&
+                          server->hasPendingConnections()){
                         awaitable->resolve(server->nextPendingConnection());
                     }
                 }));
@@ -70,8 +72,14 @@ public:
                     detail::cleanup_socket_connections(connections);
                 }));
         }
+        auto channel = awaitable->channel();
+        if(server){
+            QObject::connect(server.data(), &QObject::destroyed, [channel]{
+                channel->discard_pending();
+            });
+        }
         detail::bind_socket_lifecycle(server, awaitable, connections);
-        onServerThread(server, [awaitable, connections, drain, server](
+        if(!onServerThread(server, [awaitable, connections, drain, server](
                                    QTcpServer* current){
             if(awaitable->channel()->is_closed()){
                 detail::cleanup_socket_connections(connections);
@@ -113,7 +121,10 @@ public:
                 awaitable->close();
                 detail::cleanup_socket_connections(connections);
             }
-        });
+        })){
+            awaitable->close();
+            detail::cleanup_socket_connections(connections);
+        }
         return awaitable;
     }
 };

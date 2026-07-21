@@ -3,10 +3,50 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include "detail/fiberchannel.hpp"
 #include "detail/result.hpp"
 
 namespace Coro {
+
+namespace detail {
+
+class AwaitableCloseGuard {
+    std::mutex mutex_;
+    std::function<void()> cleanup_;
+    bool closed_{false};
+public:
+    ~AwaitableCloseGuard(){ run(); }
+
+    void set(std::function<void()> cleanup){
+        bool runImmediately = false;
+        std::function<void()> previous;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(closed_){
+                runImmediately = true;
+            }else{
+                previous = std::move(cleanup_);
+                cleanup_ = std::move(cleanup);
+            }
+        }
+        if(previous) previous();
+        if(runImmediately && cleanup) cleanup();
+    }
+
+    void run(){
+        std::function<void()> cleanup;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(closed_) return;
+            closed_ = true;
+            cleanup = std::move(cleanup_);
+        }
+        if(cleanup) cleanup();
+    }
+};
+
+} // namespace detail
 
 /**
  * @brief 异步等待器，生产者/消费者模型。
@@ -16,7 +56,7 @@ namespace Coro {
  *
  * 该类与具体来源(Qt/std)解耦：只持有一个共享 channel 与一个不透明的
  * 生命周期守卫 guard_。工厂层通过 setOnClose 注入清理逻辑(如断开信号)，
- * 当最后一个 Awaitable 析构时自动执行，从而实现 "drop 即取消订阅"。
+ * 首次关闭或最终析构时自动执行，从而实现及时取消订阅。
  *
  * move-only，按值传递；内部 channel 为 shared_ptr，生产者只捕获 channel()
  * 而不持有整个 Awaitable，避免引用环。
@@ -26,11 +66,12 @@ namespace Coro {
 template<typename T>
 class Awaitable{
     std::shared_ptr<FiberChannel<T>> ch_{std::make_shared<FiberChannel<T>>()};
-    std::shared_ptr<void>            guard_{};///< RAII 守卫：析构时执行 onClose 清理
+    std::shared_ptr<detail::AwaitableCloseGuard> guard_{
+        std::make_shared<detail::AwaitableCloseGuard>()};
 public:
     /** @brief 默认构造，内部自动创建一个空的共享队列 */
     Awaitable() = default;
-    /** @brief 析构，最后一个持有者析构时触发 guard_ 的清理钩子 */
+    /** @brief 析构，尚未关闭时触发 guard_ 的清理钩子 */
     ~Awaitable() = default;
     /**
      * @brief 移动构造（move-only）
@@ -55,13 +96,13 @@ public:
     std::shared_ptr<FiberChannel<T>> channel() const { return ch_; }
 
     /**
-     * @brief 注册"最后一个 Awaitable 析构时执行"的清理钩子。
+     * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子。
      *
      * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。
      * @param fn 清理回调（如断开信号连接）
      */
     void setOnClose(std::function<void()> fn){
-        guard_ = std::shared_ptr<void>(nullptr, [fn = std::move(fn)](void*){ if(fn) fn(); });
+        if(guard_) guard_->set(std::move(fn));
     }
 
     /**
@@ -130,6 +171,7 @@ public:
         if(ch_){
             ch_->close(error);
         }
+        if(guard_) guard_->run();
     }
 };
 
@@ -141,7 +183,8 @@ public:
 template<>
 class Awaitable<void>{
     std::shared_ptr<FiberChannel<int>> ch_{std::make_shared<FiberChannel<int>>()};
-    std::shared_ptr<void>              guard_{};///< RAII 守卫：析构时执行 onClose 清理
+    std::shared_ptr<detail::AwaitableCloseGuard> guard_{
+        std::make_shared<detail::AwaitableCloseGuard>()};
 public:
     /** @brief 默认构造 */
     Awaitable() = default;
@@ -170,11 +213,11 @@ public:
     std::shared_ptr<FiberChannel<int>> channel() const { return ch_; }
 
     /**
-     * @brief 注册"最后一个 Awaitable 析构时执行"的清理钩子
+     * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子
      * @param fn 清理回调
      */
     void setOnClose(std::function<void()> fn){
-        guard_ = std::shared_ptr<void>(nullptr, [fn = std::move(fn)](void*){ if(fn) fn(); });
+        if(guard_) guard_->set(std::move(fn));
     }
 
     /**
@@ -245,6 +288,7 @@ public:
         if(ch_){
             ch_->close(error);
         }
+        if(guard_) guard_->run();
     }
 };
 

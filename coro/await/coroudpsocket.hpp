@@ -24,13 +24,13 @@ class CoroUdpSocket{
     QPointer<QUdpSocket> socket_;
 
     template<typename Function>
-    static void onSocketThread(QPointer<QUdpSocket> socket, Function function){
-        if(!socket) return;
+    static bool onSocketThread(QPointer<QUdpSocket> socket, Function function){
+        if(!socket) return false;
         if(socket->thread() == QThread::currentThread()){
             function(socket.data());
-            return;
+            return true;
         }
-        QMetaObject::invokeMethod(
+        return QMetaObject::invokeMethod(
             socket.data(),
             [socket, function = std::move(function)]() mutable {
                 if(socket) function(socket.data());
@@ -47,7 +47,8 @@ public:
         QPointer<QUdpSocket> socket = socket_;
 
         auto drain = [awaitable](QUdpSocket* current){
-            while(current->hasPendingDatagrams()){
+            while(!awaitable->channel()->is_closed() &&
+                  current->hasPendingDatagrams()){
                 QNetworkDatagram datagram = current->receiveDatagram();
                 if(datagram.isValid()) awaitable->resolve(datagram);
             }
@@ -57,7 +58,8 @@ public:
                 connections,
                 QObject::connect(socket.data(), &QIODevice::readyRead,
                                  [awaitable, socket]{
-                    while(socket && socket->hasPendingDatagrams()){
+                    while(!awaitable->channel()->is_closed() && socket &&
+                          socket->hasPendingDatagrams()){
                         QNetworkDatagram datagram = socket->receiveDatagram();
                         if(datagram.isValid()) awaitable->resolve(datagram);
                     }
@@ -82,14 +84,17 @@ public:
                 }));
         }
         detail::bind_socket_lifecycle(socket, awaitable, connections);
-        onSocketThread(socket, [awaitable, connections, drain = std::move(drain)](
+        if(!onSocketThread(socket, [awaitable, connections, drain = std::move(drain)](
                                   QUdpSocket* current){
             if(awaitable->channel()->is_closed()){
                 detail::cleanup_socket_connections(connections);
                 return;
             }
             drain(current);
-        });
+        })){
+            awaitable->close();
+            detail::cleanup_socket_connections(connections);
+        }
         return awaitable;
     }
 };

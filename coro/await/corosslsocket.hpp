@@ -23,13 +23,13 @@ class CoroSslSocket : public CoroAbstractSocket {
     QPointer<QSslSocket> socket_;
 
     template<typename Function>
-    static void onSocketThread(QPointer<QSslSocket> socket, Function function){
-        if(!socket) return;
+    static bool onSocketThread(QPointer<QSslSocket> socket, Function function){
+        if(!socket) return false;
         if(socket->thread() == QThread::currentThread()){
             function(socket.data());
-            return;
+            return true;
         }
-        QMetaObject::invokeMethod(
+        return QMetaObject::invokeMethod(
             socket.data(),
             [socket, function = std::move(function)]() mutable {
                 if(socket) function(socket.data());
@@ -82,8 +82,9 @@ class CoroSslSocket : public CoroAbstractSocket {
                 }));
         }
         detail::bind_socket_lifecycle(socket, awaitable, connections);
-        onSocketThread(socket, [awaitable, connections, action = std::move(action)](
+        if(!onSocketThread(socket, [awaitable, connections, action = std::move(action)](
                                    QSslSocket* current) mutable {
+            if(awaitable->channel()->is_closed()) return;
             action(current);
             if(current->isEncrypted()){
                 awaitable->resolve();
@@ -94,7 +95,10 @@ class CoroSslSocket : public CoroAbstractSocket {
                 awaitable->close(detail::socket_error_code(current->error()));
                 detail::cleanup_socket_connections(connections);
             }
-        });
+        })){
+            awaitable->close();
+            detail::cleanup_socket_connections(connections);
+        }
         return awaitable;
     }
 

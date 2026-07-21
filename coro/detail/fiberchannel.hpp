@@ -136,6 +136,11 @@ public:
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         return close_error_;
     }
+    /** @brief 丢弃尚未被消费的值，不改变 channel 的关闭状态。 */
+    void discard_pending(){
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        queue_.clear();
+    }
 private:
     mutable boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量
     boost::fibers::condition_variable cv_consumer_;///< 通知消费者的条件变量
