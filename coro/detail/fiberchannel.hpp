@@ -125,7 +125,9 @@ public:
         if(closed_.load()){
             return;
         }
-        close_error_ = error ? error : std::make_error_code(std::errc::no_message);
+        close_error_ = error == std::error_code{}
+                ? std::make_error_code(std::errc::no_message)
+                : error;
         closed_.store(true);
         cv_consumer_.notify_all();
     }
