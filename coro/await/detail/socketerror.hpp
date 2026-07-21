@@ -3,6 +3,7 @@
 
 #include <QAbstractSocket>
 #include <QLocalSocket>
+#include <QSslError>
 #include <system_error>
 
 namespace Coro {
@@ -65,6 +66,16 @@ public:
     }
 };
 
+class SslErrorCategory final : public std::error_category {
+public:
+    const char* name() const noexcept override { return "qt.ssl"; }
+
+    std::string message(int value) const override {
+        return QSslError(static_cast<QSslError::SslError>(value))
+            .errorString().toStdString();
+    }
+};
+
 inline const std::error_category& socket_error_category() noexcept {
     static const SocketErrorCategory category;
     return category;
@@ -75,12 +86,21 @@ inline const std::error_category& local_socket_error_category() noexcept {
     return category;
 }
 
+inline const std::error_category& ssl_error_category() noexcept {
+    static const SslErrorCategory category;
+    return category;
+}
+
 inline std::error_code socket_error_code(QAbstractSocket::SocketError error) noexcept {
     return {static_cast<int>(error), socket_error_category()};
 }
 
 inline std::error_code local_socket_error_code(QLocalSocket::LocalSocketError error) noexcept {
     return {static_cast<int>(error), local_socket_error_category()};
+}
+
+inline std::error_code ssl_error_code(QSslError::SslError error) noexcept {
+    return {static_cast<int>(error), ssl_error_category()};
 }
 
 } // namespace detail

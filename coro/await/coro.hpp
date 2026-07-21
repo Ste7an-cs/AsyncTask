@@ -10,6 +10,7 @@
  *   - corofuture.hpp      —— coro(std::future/QFuture)
  *   - coroiodevice.hpp    —— coro(QIODevice*)
  *   - corosocket.hpp      —— coro(QAbstractSocket*)
+ *   - corosslsocket.hpp   —— coro(QSslSocket*)
  *   - corotcpserver.hpp   —— coro(QTcpServer*)
  *   - corolocalsocket.hpp —— coro(QLocalSocket*)
  *   - corolocalserver.hpp —— coro(QLocalServer*)
@@ -25,6 +26,7 @@
 #include "corofuture.hpp"
 #include "coroiodevice.hpp"
 #include "corosocket.hpp"
+#include "corosslsocket.hpp"
 #include "corotcpserver.hpp"
 #include "corolocalsocket.hpp"
 #include "corolocalserver.hpp"

@@ -19,9 +19,14 @@
 #include <QPointer>
 #include <QNetworkProxy>
 #include <QNetworkDatagram>
+#include <QSslCertificate>
+#include <QSslConfiguration>
+#include <QSslKey>
+#include <QSslSocket>
 #include <QTcpSocket>
 #include <QTcpServer>
 #include <QUdpSocket>
+#include <QFile>
 #include <QThread>
 #include <chrono>
 #include <atomic>
@@ -75,6 +80,53 @@ private:
 
 std::atomic<unsigned int> LocalServerNameGuard::counter_{0};
 
+class SslLoopbackServer final : public QTcpServer
+{
+public:
+    SslLoopbackServer(const QSslCertificate& certificate, const QSslKey& privateKey)
+        : certificate_(certificate), privateKey_(privateKey){}
+
+    QSslSocket* peer() const { return peer_; }
+    std::shared_ptr<Coro::Awaitable<void>> encrypted() const { return encrypted_; }
+
+protected:
+    void incomingConnection(qintptr socketDescriptor) override
+    {
+        peer_ = new QSslSocket(this);
+        peer_->setLocalCertificate(certificate_);
+        peer_->setPrivateKey(privateKey_);
+        peer_->setPeerVerifyMode(QSslSocket::VerifyNone);
+        if(!peer_->setSocketDescriptor(socketDescriptor)){
+            peer_->deleteLater();
+            peer_ = nullptr;
+            return;
+        }
+        encrypted_ = Coro::coro(peer_).waitForEncrypted();
+        peer_->startServerEncryption();
+    }
+
+private:
+    QSslCertificate certificate_;
+    QSslKey privateKey_;
+    QSslSocket* peer_{nullptr};
+    std::shared_ptr<Coro::Awaitable<void>> encrypted_;
+};
+
+class PlainTextServer final : public QTcpServer
+{
+protected:
+    void incomingConnection(qintptr socketDescriptor) override
+    {
+        auto peer = new QTcpSocket(this);
+        if(!peer->setSocketDescriptor(socketDescriptor)){
+            peer->deleteLater();
+            return;
+        }
+        peer->write("not TLS");
+        peer->flush();
+    }
+};
+
 class TestFiberAwait : public QObject
 {
     Q_OBJECT
@@ -111,6 +163,9 @@ private slots:
     void test_case_tcp_server_closed_stream_release();
     void test_case_tcp_server_queued_close_release();
     void test_case_tcp_server_connection_stream();
+    void test_case_ssl_error_conversion();
+    void test_case_ssl_encrypted_ping_pong();
+    void test_case_ssl_plain_peer_handshake_failure();
     void test_case_local_ping_pong_disconnect();
     void test_case_local_connection_stream_and_close();
     void test_case_local_missing_server();
@@ -338,6 +393,14 @@ void TestFiberAwait::test_case_socket_error_conversion()
                  Coro::detail::local_socket_error_code(
                      static_cast<QLocalSocket::LocalSocketError>(-12345)).message()),
              QStringLiteral("unknown socket error"));
+}
+
+void TestFiberAwait::test_case_ssl_error_conversion()
+{
+    const auto sslError = Coro::detail::ssl_error_code(QSslError::HostNameMismatch);
+    QCOMPARE(sslError.value(), static_cast<int>(QSslError::HostNameMismatch));
+    QCOMPARE(QString::fromLatin1(sslError.category().name()), QStringLiteral("qt.ssl"));
+    QVERIFY(!QString::fromStdString(sslError.message()).isEmpty());
 }
 
 void TestFiberAwait::test_case_socket_awaitable_lifetime()
@@ -911,6 +974,85 @@ void TestFiberAwait::test_case_tcp_server_connection_stream()
     QVERIFY(secondPeer.isNull());
     firstClient.abort();
     secondClient.abort();
+}
+
+void TestFiberAwait::test_case_ssl_encrypted_ping_pong()
+{
+    using namespace std::chrono_literals;
+    if(!QSslSocket::supportsSsl()) QSKIP("QSslSocket runtime SSL support is unavailable");
+
+    QFile certificateFile(QFINDTESTDATA("data/server-cert.pem"));
+    QFile privateKeyFile(QFINDTESTDATA("data/server-key.pem"));
+    QVERIFY2(certificateFile.open(QIODevice::ReadOnly),
+             qPrintable(certificateFile.errorString()));
+    QVERIFY2(privateKeyFile.open(QIODevice::ReadOnly),
+             qPrintable(privateKeyFile.errorString()));
+    const QSslCertificate certificate(&certificateFile, QSsl::Pem);
+    const QSslKey privateKey(&privateKeyFile, QSsl::Rsa, QSsl::Pem);
+    QVERIFY(!certificate.isNull());
+    QVERIFY(!privateKey.isNull());
+
+    SslLoopbackServer server(certificate, privateKey);
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QSslSocket client;
+    client.setProxy(QNetworkProxy::NoProxy);
+    QSslConfiguration clientConfiguration = client.sslConfiguration();
+    clientConfiguration.setCaCertificates(QList<QSslCertificate>() << certificate);
+    client.setSslConfiguration(clientConfiguration);
+    client.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    client.setPeerVerifyName(QStringLiteral("localhost"));
+
+    auto clientEncrypted = Coro::coro(&client).connectToHostEncrypted(
+        QStringLiteral("127.0.0.1"), server.serverPort());
+    QVERIFY(Coro::await_for(clientEncrypted, 2s));
+    QVERIFY(server.peer() != nullptr);
+    QVERIFY(server.encrypted());
+    QVERIFY(Coro::await_for(server.encrypted(), 2s));
+    QVERIFY(client.isEncrypted());
+    QVERIFY(server.peer()->isEncrypted());
+
+    auto peerReady = Coro::coro(server.peer()).waitForReadyRead();
+    auto clientWritten = Coro::coro(&client).waitForBytesWritten();
+    QCOMPARE(client.write("ping"), qint64(4));
+    QVERIFY(Coro::await_for(clientWritten, 2s));
+    QVERIFY(Coro::await_for(peerReady, 2s));
+    auto request = Coro::await_for(Coro::coro(server.peer()).readAll(), 2s);
+    QVERIFY(request);
+    QCOMPARE(request.value(), QByteArray("ping"));
+
+    auto clientReady = Coro::coro(&client).waitForReadyRead();
+    auto peerWritten = Coro::coro(server.peer()).waitForBytesWritten();
+    QCOMPARE(server.peer()->write("pong"), qint64(4));
+    QVERIFY(Coro::await_for(peerWritten, 2s));
+    QVERIFY(Coro::await_for(clientReady, 2s));
+    auto response = Coro::await_for(Coro::coro(&client).readAll(), 2s);
+    QVERIFY(response);
+    QCOMPARE(response.value(), QByteArray("pong"));
+}
+
+void TestFiberAwait::test_case_ssl_plain_peer_handshake_failure()
+{
+    using namespace std::chrono_literals;
+    if(!QSslSocket::supportsSsl()) QSKIP("QSslSocket runtime SSL support is unavailable");
+
+    PlainTextServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QSslSocket client;
+    client.setProxy(QNetworkProxy::NoProxy);
+    const auto result = Coro::await_for(
+        Coro::coro(&client).connectToHostEncrypted(
+            QStringLiteral("localhost"), server.serverPort()), 2s);
+
+    QVERIFY(!result);
+    const bool socketHandshakeFailure =
+        QString::fromLatin1(result.error().category().name()) == QStringLiteral("qt.socket") &&
+        result.error().value() == static_cast<int>(QAbstractSocket::SslHandshakeFailedError);
+    const bool sslHandshakeFailure =
+        QString::fromLatin1(result.error().category().name()) == QStringLiteral("qt.ssl");
+    QVERIFY(socketHandshakeFailure || sslHandshakeFailure);
+    QVERIFY(!QString::fromStdString(result.error().message()).isEmpty());
 }
 
 void TestFiberAwait::test_case_local_ping_pong_disconnect()

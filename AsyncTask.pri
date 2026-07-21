@@ -26,6 +26,7 @@ HEADERS += \
     $$PWD/coro/await/corofuture.hpp \
     $$PWD/coro/await/coroiodevice.hpp \
     $$PWD/coro/await/corosocket.hpp \
+    $$PWD/coro/await/corosslsocket.hpp \
     $$PWD/coro/await/corotcpserver.hpp \
     $$PWD/coro/await/corolocalsocket.hpp \
     $$PWD/coro/await/corolocalserver.hpp \

@@ -6,7 +6,8 @@
  * @brief 总汇入口头文件：一次性引入 AsyncTask 的公开 API。
  *
  * 用法：#include "all.hpp" 即可使用 makeTask / FiberTask / Result / Awaitable /
- * Generator / coro / await / generate 等全部对外接口。也可按需单独引入下列各头，
+ * Generator / coro / await / generate 等全部对外接口，包括 QSslSocket 的加密握手等待。
+ * 也可按需单独引入下列各头，
  * 只拉入用到的部分。Qt 相关能力（协程线程、应用集成、coro() 等待工厂）在宿主
  * 工程启用 Qt（定义 ASYNC_HAS_QTCORE）时才引入。
  */

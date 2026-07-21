@@ -13,3 +13,7 @@ QMAKE_LFLAGS += -fsanitize=address -static-libasan
 include($$PWD/../../AsyncTask.pri)
 
 SOURCES +=  tst_testfiberawait.cpp
+
+DISTFILES += \
+    data/server-cert.pem \
+    data/server-key.pem
