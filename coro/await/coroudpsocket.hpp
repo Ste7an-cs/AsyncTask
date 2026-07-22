@@ -113,11 +113,12 @@ public:
                 detail::cleanup_socket_connections(connections);
                 return;
             }
-            drain(current);
             if(current->state() == QAbstractSocket::UnconnectedState){
                 awaitable->close();
                 detail::cleanup_socket_connections(connections);
+                return;
             }
+            drain(current);
         })){
             awaitable->close();
             detail::cleanup_socket_connections(connections);
