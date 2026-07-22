@@ -20,9 +20,21 @@
 
 namespace Coro {
 
+/**
+ * @brief QLocalSocket 的非拥有协程包装器。
+ * @details 不取得传入 Qt 对象的所有权。所有触及 socket 的操作都在其所属线程直接执行，
+ *          或投递到该线程执行。公开工厂返回 shared Awaitable，Qt 回调强捕获该对象以
+ *          保持等待状态有效；对返回值调用 await_for() 超时不会取消底层操作或订阅。
+ */
 class CoroLocalSocket{
     QPointer<QLocalSocket> local_;
 
+    /**
+     * @brief 在本地 socket 所属线程执行或排队执行函数。
+     * @param socket 非拥有的 socket 守卫指针。
+     * @param function 要在对象线程运行的函数。
+     * @return 已执行或成功投递时为 true；socket 已销毁或投递失败时为 false。
+     */
     template<typename Function>
     static bool onSocketThread(QPointer<QLocalSocket> socket, Function function){
         if(!socket) return false;
@@ -38,6 +50,11 @@ class CoroLocalSocket{
             Qt::QueuedConnection);
     }
 
+    /**
+     * @brief 等待本地 socket 信号并可在对象线程发起动作的内部辅助函数。
+     * @details 成功条件由 check 决定；Qt 错误以 qt.local_socket category 关闭 awaitable。
+     *          回调强捕获 shared awaitable；source 或应用销毁时关闭它。
+     */
     template<typename Signal, typename Check, typename Action>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
                                                    Action action,
@@ -103,14 +120,25 @@ class CoroLocalSocket{
         return awaitable;
     }
 
+    /** @brief 使用空动作等待本地 socket 信号的简化重载。 */
     template<typename Signal, typename Check>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
         return waitForSignal(signal, std::move(check), [](QLocalSocket*){});
     }
 
 public:
+    /**
+     * @brief 用现有 QLocalSocket 创建非拥有包装器。
+     * @param socket 源对象，可为空；包装器不会删除它。
+     */
     explicit CoroLocalSocket(QLocalSocket* socket): local_(socket){}
 
+    /**
+     * @brief 创建持续读取字节块的流式 awaitable。
+     * @return 每个值都是非空的当前可读字节块，直到 socket 关闭；对端关闭正常结束，
+     *         其他本地 socket 错误以 qt.local_socket category 结束。
+     * @note await_for() 超时不停止读取流，也不取消 Qt 信号订阅。
+     */
     std::shared_ptr<Awaitable<QByteArray>> readAll(){
         auto connections = detail::socket_connections();
         auto awaitable = detail::socket_awaitable<QByteArray>(connections);
@@ -185,24 +213,40 @@ public:
         return awaitable;
     }
 
+    /**
+     * @brief 等待至少一个可读字节。
+     * @return bytesAvailable() 大于零时成功；本地 socket 错误以 qt.local_socket category 结束。
+     */
     std::shared_ptr<Awaitable<void>> waitForReadyRead(){
         return waitForSignal(&QIODevice::readyRead, [](QLocalSocket* socket){
             return socket->bytesAvailable() > 0;
         });
     }
 
+    /**
+     * @brief 等待 Qt 发出 bytesWritten 信号。
+     * @return 写入信号发生时成功；本地 socket 错误以 qt.local_socket category 结束。
+     */
     std::shared_ptr<Awaitable<void>> waitForBytesWritten(){
         return waitForSignal(&QIODevice::bytesWritten, [](QLocalSocket*){
             return false;
         });
     }
 
+    /**
+     * @brief 等待本地 socket 进入 ConnectedState。
+     * @return 已连接时成功；连接错误以 qt.local_socket category 结束。
+     */
     std::shared_ptr<Awaitable<void>> waitForConnected(){
         return waitForSignal(&QLocalSocket::connected, [](QLocalSocket* socket){
             return socket->state() == QLocalSocket::ConnectedState;
         });
     }
 
+    /**
+     * @brief 等待本地 socket 进入 UnconnectedState。
+     * @return 已断开或对端正常关闭时成功；其他错误以 qt.local_socket category 结束。
+     */
     std::shared_ptr<Awaitable<void>> waitForDisconnected(){
         return waitForSignal(
             &QLocalSocket::disconnected,
@@ -212,6 +256,12 @@ public:
             [](QLocalSocket*){}, true);
     }
 
+    /**
+     * @brief 在对象线程发起到本地 server 的连接并等待成功。
+     * @param name Qt 本地 server 名称。
+     * @param mode 打开模式。
+     * @return ConnectedState 时成功；连接错误以 qt.local_socket category 结束。
+     */
     std::shared_ptr<Awaitable<void>> connectToServer(
         const QString& name,
         QIODevice::OpenMode mode = QIODevice::ReadWrite){
@@ -227,6 +277,10 @@ public:
             });
     }
 
+    /**
+     * @brief 在对象线程请求从本地 server 断开并等待 UnconnectedState。
+     * @return 已断开或对端正常关闭时成功；其他错误以 qt.local_socket category 结束。
+     */
     std::shared_ptr<Awaitable<void>> disconnectFromServer(){
         return waitForSignal(
             &QLocalSocket::disconnected,
@@ -241,6 +295,11 @@ public:
     }
 };
 
+/**
+ * @brief 创建 QLocalSocket 的非拥有协程包装器。
+ * @param socket 源对象，可为空。
+ * @return 即使 socket 为空也返回可安全关闭的 wrapper，且不会取得对象所有权。
+ */
 inline CoroLocalSocket coro(QLocalSocket* socket){
     return CoroLocalSocket(socket);
 }

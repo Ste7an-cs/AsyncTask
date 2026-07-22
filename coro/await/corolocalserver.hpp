@@ -20,9 +20,21 @@
 
 namespace Coro {
 
+/**
+ * @brief QLocalServer 的非拥有协程包装器。
+ * @details 不取得 server 或其接受 socket 的所有权；所有 server 操作都在所属线程直接
+ *          执行或投递到该线程。返回的 shared Awaitable 会被 Qt 回调强捕获，
+ *          await_for() 超时不会取消连接流或 signal 订阅。
+ */
 class CoroLocalServer{
     QPointer<QLocalServer> server_;
 
+    /**
+     * @brief 在 server 所属线程执行或排队执行函数。
+     * @param server 非拥有的 server 守卫指针。
+     * @param function 要在对象线程运行的函数。
+     * @return 已执行或成功投递时为 true；server 已销毁或投递失败时为 false。
+     */
     template<typename Function>
     static bool onServerThread(QPointer<QLocalServer> server, Function function){
         if(!server) return false;
@@ -39,8 +51,19 @@ class CoroLocalServer{
     }
 
 public:
+    /**
+     * @brief 用现有 QLocalServer 创建非拥有包装器。
+     * @param server 源 server，可为空；包装器不会删除它。
+     */
     explicit CoroLocalServer(QLocalServer* server): server_(server){}
 
+    /**
+     * @brief 创建连续产生本地连接的流式 awaitable。
+     * @return 先排空当前 pending 队列，随后持续投递新连接；server 关闭或销毁时流结束。
+     * @details 每个 QLocalSocket* 仍由 Qt server 管理，消费者不得让它超过 server 生命周期，
+     *          并必须遵守其线程亲和性。10 ms 定时器仅检测未发停止信号的 close()，不是
+     *          连接超时。
+     */
     std::shared_ptr<Awaitable<QLocalSocket*>> nextConnection(){
         auto connections = detail::socket_connections();
         auto awaitable = detail::socket_awaitable<QLocalSocket*>(connections);
@@ -120,6 +143,11 @@ public:
     }
 };
 
+/**
+ * @brief 创建 QLocalServer 的非拥有协程包装器。
+ * @param server 源 server，可为空。
+ * @return 即使 server 为空也返回可安全关闭的 wrapper，且不会取得对象所有权。
+ */
 inline CoroLocalServer coro(QLocalServer* server){
     return CoroLocalServer(server);
 }
