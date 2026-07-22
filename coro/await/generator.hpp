@@ -36,7 +36,8 @@ public:
         void operator()(const T& v){p_awaiter_->resolve(v);}
         /**
          * @brief 查询输出侧是否已关闭。
-         * @details 用于生成器在有界轮询之间感知消费者取消，避免继续等待已关闭的输出端。
+         * @details 供生产者感知消费者关闭。共享 Awaitable 适配器在每次有界轮询后
+         *          使用它退出，避免继续等待已关闭的输出端。
          * @return 输出侧已关闭返回 true
          */
         bool is_closed() const{return p_awaiter_->channel()->is_closed();}
@@ -187,7 +188,8 @@ public:
         void operator()(){p_awaiter_->resolve();}
         /**
          * @brief 查询输出侧是否已关闭。
-         * @details 用于生成器在有界轮询之间感知消费者取消，避免继续等待已关闭的输出端。
+         * @details 供生产者感知消费者关闭。共享 Awaitable 适配器在每次有界轮询后
+         *          使用它退出，避免继续等待已关闭的输出端。
          * @return 输出侧已关闭返回 true
          */
         bool is_closed() const{return p_awaiter_->channel()->is_closed();}

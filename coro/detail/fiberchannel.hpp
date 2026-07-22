@@ -59,8 +59,9 @@ public:
     }
     /**
      * @brief 获取一个元素至引用参数，无可用值则等待，最长等待 timeout_duration
-     * @details 超时仅表示在给定时长内没有可用值，channel 仍可保持开放；关闭则返回
-     *          closed，并由 close_error() 提供首次关闭时记录的终止原因。
+     * @details 超时仅表示在给定时长内没有可用值，channel 仍可保持开放；仅当 channel
+     *          已关闭且队列为空时返回 closed。若仍有排队值则返回 success 并取出该值，
+     *          关闭后的终止原因由 close_error() 提供。
      * @tparam Rep 时长的计数类型
      * @tparam Period 时长的周期类型
      * @param out 输出参数，取到的元素
