@@ -25,6 +25,14 @@ namespace Coro {
  * @details 不取得传入 Qt 对象的所有权。所有触及 socket 的操作都在其所属线程直接执行，
  *          或投递到该线程执行。公开工厂返回 shared Awaitable，Qt 回调强捕获该对象以
  *          保持等待状态有效；对返回值调用 await_for() 超时不会取消底层操作或订阅。
+ *
+ * 源 QObject 销毁或应用结束时，已返回的 awaitable 以默认 no_message 正常关闭；
+ * 消费者仍会先取完已排队的值，随后才观察到该终止结果。消费者也可在返回的
+ * Awaitable 上显式调用 close() 或 close(error)；首次关闭决定终止错误，已排队值
+ * 仍先被消费，且注册的 Qt 信号连接和 cleanup 仅清理一次。Qt 本地 socket 错误
+ * 使用 qt.local_socket category。readAll() 遇到 PeerClosedError 正常结束；
+ * waitForDisconnected() 和 disconnectFromServer() 把对端关闭作为断开成功，
+ * 其他等待或连接操作则正常关闭而不产生成功事件。
  */
 class CoroLocalSocket{
     QPointer<QLocalSocket> local_;
@@ -322,7 +330,8 @@ public:
 /**
  * @brief 创建 QLocalSocket 的非拥有协程包装器。
  * @param socket 源对象，可为空。
- * @return 即使 socket 为空也返回可安全关闭的 wrapper，且不会取得对象所有权。
+ * @return 不取得对象所有权的 wrapper；socket 为空时，之后调用操作会返回
+ *         立即以默认 no_message 正常关闭的 Awaitable。
  */
 inline CoroLocalSocket coro(QLocalSocket* socket){
     return CoroLocalSocket(socket);

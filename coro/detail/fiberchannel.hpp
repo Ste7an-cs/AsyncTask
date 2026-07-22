@@ -137,7 +137,8 @@ public:
     }
     /**
      * @brief 返回首次关闭 channel 时记录的终止原因。
-     * @details 重复关闭不会改变该错误，因此消费者始终观察到首次关闭原因。
+     * @details channel 尚未关闭时返回预置的默认 no_message；关闭后返回首次
+     *          记录的错误。重复关闭不会改变该错误。
      */
     std::error_code close_error() const {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};

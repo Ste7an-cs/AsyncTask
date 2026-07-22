@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 为 `786f05a..67b71a7` 中新增或实质修改的 C++ 代码补充详细、准确的中文 Doxygen 注释，且不改变运行行为。
+**Goal:** 原始目标是为 `786f05a..67b71a7` 中新增或实质修改的 C++ 代码补充详细、准确的中文 Doxygen 注释，且不改变运行行为。后续审查中用户另行批准了两项有限的行为补全，因此最终系列不是纯注释差异。
 
 **Architecture:** 按“基础 await 机制、socket 包装器、示例与测试”三个独立文件组实施。公开接口记录所有权、线程亲和、结果和失败语义；内部实现记录生命周期、强捕获、并发清理及错误传播原因；示例和测试仅解释关键辅助结构和验证目标。
 
@@ -12,11 +12,17 @@
 
 - 所有新增代码注释均使用中文，Doxygen 命令保留标准英文形式。
 - 使用 `/** ... */`、`///` 或 `///<`；正文遵循 Google C++ 注释习惯，写完整句子并避免复述代码。
-- 不修改 API、ABI、控制流、表达式、空白布局或运行行为。
+- 原始注释工作不修改 API、ABI、控制流、表达式、空白布局或运行行为；仅下文“用户后续批准的行为补全”两项作为例外。
 - 不修改证书、qmake 工程文件、既有 Markdown 用户文档或 `docs/research/`。
 - `await_for` 超时只结束本次等待，不关闭或取消底层订阅。
 - socket wrapper 不拥有 Qt 源对象；跨线程操作投递到源对象的线程。
 - socket 回调强捕获 `std::shared_ptr<Awaitable<T>>`，终止时执行幂等清理。
+
+## 用户后续批准的行为补全
+
+- UDP 接收流在初始状态已是 `UnconnectedState` 时，必须在 drain 数据报之前以默认 `no_message` 正常关闭；同时增加了专门回归测试。该测试使完整 Qt test suite 的预期数量从 56 增加为 57。
+- Socket ping-pong 示例先执行一次 20 ms 的预期超时，然后复用同一个仍开放的 Awaitable 发送 `ping` 并继续接收回显，用于证明 `await_for()` 超时不会取消流。
+- 上述两项保留为实施历史；基线 `46ee146` 之后的最终 Doxygen 审查修复仍只能修改 C++ 注释以及本设计/计划 Markdown，不得再改 C++ 行为 token。
 
 ---
 
@@ -93,7 +99,7 @@
 
 - [ ] **Step 3: 注释 TCP 与 local stream wrapper**
 
-  每个类注释必须包含：wrapper 不拥有源对象、调用在对象线程执行或排队、返回 shared awaitable、回调强捕获、超时不取消。为 `readAll()` 说明它持续发出非空字节块直至关闭；为 wait/connect/disconnect 方法说明成功条件和错误结果；为 `coro()` 说明空指针会得到可安全关闭的 wrapper，而不会取得所有权。
+  每个类注释必须包含：wrapper 不拥有源对象、调用在对象线程执行或排队、返回 shared awaitable、回调强捕获、超时不取消。为 `readAll()` 说明它持续发出非空字节块直至关闭；为 wait/connect/disconnect 方法说明成功条件和错误结果；为 `coro()` 说明空指针不会取得所有权，且之后调用 wrapper 操作会返回立即以默认 `no_message` 正常关闭的 Awaitable；不应把 wrapper 本身描述为“可关闭”。
 
 - [ ] **Step 4: 注释 TCP 与 local server wrapper**
 
@@ -153,7 +159,7 @@
 
 **Interfaces:**
 - Consumes: Tasks 1-3 的注释改动。
-- Produces: 术语一致、Doxygen 格式有效且行为完全不变的最终差异。
+- Produces: 术语一致、Doxygen 格式有效的最终系列；其中明确标记上述两项用户批准的行为补全，并确保 `46ee146` 之后的最终审查修复不改变 C++ 行为 token。
 
 - [ ] **Step 1: 检查中文和 Doxygen 格式**
 
@@ -177,7 +183,7 @@
 
   Run: `LSAN_OPTIONS=detect_leaks=0 timeout 90s <test-build>/testfiberawait -maxwarnings 0`
 
-  Expected: `56 passed, 0 failed, 0 skipped`。
+  Expected: `57 passed, 0 failed, 0 skipped`。
 
 - [ ] **Step 5: 运行 socket 示例**
 
@@ -186,6 +192,8 @@
   Expected: 输出监听端口、收到 `ping`、连接拒绝信息、流关闭和 `socket ping-pong passed`，退出码为 0。
 
 - [ ] **Step 6: 提交注释改动**
+
+  该步骤保留原始提交计划的历史记录。用户批准的 UDP 行为与回归测试、以及示例的 20 ms timeout-then-resume 展示已分别在后续提交完成；最终审查修复使用 `docs: complete Doxygen lifecycle contracts`。
 
   ```bash
   git add -- coro/await/awaitable.hpp coro/await/generator.hpp \

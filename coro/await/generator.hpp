@@ -38,7 +38,7 @@ public:
          * @brief 查询输出侧是否已关闭。
          * @details 供生产者感知消费者关闭。共享 Awaitable 适配器在每次有界轮询后
          *          使用它退出，避免继续等待已关闭的输出端。
-         * @return 输出侧已关闭返回 true
+         * @return 输出侧已关闭返回 true。
          */
         bool is_closed() const{return p_awaiter_->channel()->is_closed();}
     };
@@ -190,7 +190,7 @@ public:
          * @brief 查询输出侧是否已关闭。
          * @details 供生产者感知消费者关闭。共享 Awaitable 适配器在每次有界轮询后
          *          使用它退出，避免继续等待已关闭的输出端。
-         * @return 输出侧已关闭返回 true
+         * @return 输出侧已关闭返回 true。
          */
         bool is_closed() const{return p_awaiter_->channel()->is_closed();}
     };
@@ -354,9 +354,9 @@ Generator<T> generate(Awaitable<T> a){
  * @details 生成器强持有共享句柄直至源迭代结束。每次最多轮询 10 ms，此有界轮询仅用于
  *          感知输出端取消；源等待超时而 channel 仍开放时不会终止流。空句柄产生一个
  *          可安全结束的空流。
- * @tparam T 产出的元素类型
- * @param a 待消费等待器的共享句柄
- * @return 适配后的 Generator；空句柄返回可安全结束的关闭生成器
+ * @tparam T 产出的元素类型。
+ * @param a 待消费等待器的共享句柄。
+ * @return 适配后的 Generator；空句柄返回可安全结束的关闭生成器。
  */
 template<typename T>
 Generator<T> generate(std::shared_ptr<Awaitable<T>> a){

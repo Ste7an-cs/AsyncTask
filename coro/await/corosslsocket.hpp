@@ -24,6 +24,13 @@ namespace Coro {
  * @details 不取得传入 Qt 对象的所有权。所有 TLS 操作都在所属线程直接执行或投递到该
  *          线程；Qt 回调强捕获返回的 shared Awaitable。await_for() 超时不会取消正在
  *          进行的连接、握手或 signal 订阅。
+ *
+ * 源 QObject 销毁或应用结束时，已返回的 awaitable 以默认 no_message 正常关闭；
+ * 已排队的成功事件会先于终止结果被消费。消费者显式调用返回 Awaitable 的
+ * close() 或 close(error) 时，首次关闭错误被保留，已排队事件仍先消费，
+ * 注册的 Qt 信号连接和 cleanup 仅清理一次。errorOccurred（包括握手期间的
+ * 对端关闭）使用 qt.socket category，sslErrors 和 peerVerifyError 使用
+ * qt.ssl category；继承的非 TLS 操作遵循 CoroAbstractSocket 的终止契约。
  */
 class CoroSslSocket : public CoroAbstractSocket {
     QPointer<QSslSocket> socket_;
@@ -171,7 +178,8 @@ public:
 /**
  * @brief 创建 QSslSocket 的非拥有协程包装器。
  * @param socket 源对象，可为空。
- * @return 即使 socket 为空也返回可安全关闭的 wrapper，且不会取得对象所有权。
+ * @return 不取得对象所有权的 wrapper；socket 为空时，之后调用 TLS 或继承操作
+ *         会返回立即以默认 no_message 正常关闭的 Awaitable。
  */
 inline CoroSslSocket coro(QSslSocket* socket){
     return CoroSslSocket(socket);

@@ -26,6 +26,12 @@ namespace Coro {
  * @details 不取得 server 或其接受 socket 的所有权；所有 server 操作都在所属线程直接
  *          执行或投递到该线程。返回的 shared Awaitable 会被 Qt 回调强捕获，
  *          await_for() 超时不会取消连接流或 signal 订阅。
+ *
+ * server 停止监听时，连接流以默认 no_message 正常关闭，已排队指针仍先
+ * 被消费；源 QObject 销毁时也正常关闭，但会先丢弃不能再安全返回的已排队
+ * 原始指针。消费者显式调用返回 Awaitable 的 close() 或 close(error) 时，
+ * 已排队指针仍先消费，随后返回首次终止错误；注册的 Qt 信号连接和 cleanup
+ * 仅清理一次。acceptError 使用 qt.socket category 终止流。
  */
 class CoroTcpServer{
     QPointer<QTcpServer> srv_;
@@ -157,7 +163,8 @@ public:
 /**
  * @brief 创建 QTcpServer 的非拥有协程包装器。
  * @param server 源 server，可为空。
- * @return 即使 server 为空也返回可安全关闭的 wrapper，且不会取得对象所有权。
+ * @return 不取得对象所有权的 wrapper；server 为空时，之后调用 nextConnection()
+ *         会返回立即以默认 no_message 正常关闭的 Awaitable。
  */
 inline CoroTcpServer coro(QTcpServer* server){
     return CoroTcpServer(server);

@@ -2,9 +2,11 @@
 
 ## Goal
 
-Add detailed Doxygen-compatible comments to the C++ code introduced or
-substantially changed between commits `786f05a` and `67b71a7`, without changing
-runtime behavior.
+The original goal was to add detailed Doxygen-compatible comments to the C++
+code introduced or substantially changed between commits `786f05a` and
+`67b71a7` without changing runtime behavior. During follow-up review, the user
+separately approved two narrowly scoped behavior-completion changes described
+below; the final series therefore is not a purely comment-only diff.
 
 ## Scope
 
@@ -18,8 +20,28 @@ The socket example and socket-related test additions receive comments for
 helper types, test intent, and the demonstrated success and failure paths.
 Tests do not receive line-by-line narration.
 
-Generated certificates, qmake project files, Markdown documentation, build
-metadata, and unchanged legacy code are outside this comment-only change.
+Generated certificates, qmake project files, user-facing Markdown
+documentation, build metadata, and unchanged legacy code remain outside the
+implementation scope. This design and its companion plan are updated to record
+the approved follow-up history accurately.
+
+## User-Approved Behavior Completion
+
+Follow-up review found two gaps whose fixes the user explicitly approved after
+the original comment-only work:
+
+- `CoroUdpSocket::receiveDatagram()` now checks an initial
+  `UnconnectedState` before draining datagrams, closes the returned awaitable
+  normally, and has a dedicated regression test. This increased the complete
+  Qt test count from 56 to 57.
+- The socket ping-pong example now performs a 20 ms read timeout before sending
+  `ping`, then resumes consumption through the same still-open awaitable to
+  demonstrate that `await_for()` timeout does not cancel the stream.
+
+Those behavior additions are part of the retained design history. The final
+Doxygen-review correction after baseline `46ee146` remains limited to comments
+and these design/plan Markdown files; it does not add further C++ behavior
+changes.
 
 ## Comment Style
 
@@ -89,10 +111,12 @@ destruction, explicit close, timeout, and error propagation.
 
 ## Verification
 
-Because this is a comment-only change, verification focuses on both behavior
-preservation and documentation quality:
+Verification covers both the approved behavior-completion history and the final
+comment-only review correction:
 
-1. Confirm the diff contains only comments and the design/plan documents.
+1. Confirm the final review correction after `46ee146` contains only C++
+   comments and the design/plan documents, while retaining the two approved
+   earlier behavior changes.
 2. Run `git diff --check`.
 3. Build the test target and socket example from clean temporary directories.
 4. Run the complete Qt test executable.
@@ -102,7 +126,8 @@ preservation and documentation quality:
 
 ## Non-Goals
 
-- No API, ABI, ownership, timing, or error-handling changes.
+- No API, ABI, or ownership changes; no timing or error-handling changes beyond
+  the approved initial-UDP-state closure and 20 ms timeout-then-resume example.
 - No refactoring or formatting-only churn.
 - No documentation generation configuration or new Doxygen build target.
 - No changes to pre-existing untracked content under `docs/research/`.

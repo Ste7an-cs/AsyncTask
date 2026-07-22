@@ -1,9 +1,11 @@
-/// @brief TCP Socket Awaitable 的 ping-pong 示例。
-///
-/// @details 服务端绑定临时 loopback 端口并回显一次 ping；客户端先实际验证未发送请求
-/// 时的读取返回 std::errc::timed_out，再复用同一等待器接收回显。客户端随后连接已释放
-/// 的端口，以稳定验证连接被拒绝。所有外部等待均有时限，且每个 Result 都会检查，因此
-/// 既可在 CI 中运行，也可直接从终端运行。
+/**
+ * @file main.cpp
+ * @brief TCP Socket Awaitable 的 ping-pong 示例。
+ * @details 服务端绑定临时 loopback 端口并回显一次 ping；客户端先验证未发送请求时
+ *          的 20 ms 读取返回 std::errc::timed_out，再复用同一等待器接收回显。客户端
+ *          随后连接已释放的端口，以稳定验证连接被拒绝。所有外部等待均有时限，且
+ *          每个 Result 都会检查，因此既可在 CI 中运行，也可直接从终端运行。
+ */
 #include <QCoreApplication>
 #include <QDebug>
 #include <QHostAddress>

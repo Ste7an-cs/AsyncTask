@@ -55,8 +55,10 @@ signals:
     void sig2(int, QString);
 };
 
-/// @brief 为本地 socket 测试分配并回收唯一的服务器名。
-/// @details 构造和析构都移除同名端点，防止临时文件或上次失败测试残留影响后续用例。
+/**
+ * @brief 为本地 socket 测试分配并回收唯一的服务器名。
+ * @details 构造和析构都移除同名端点，防止临时文件或上次失败测试残留影响后续用例。
+ */
 class LocalServerNameGuard
 {
 public:
@@ -87,9 +89,11 @@ private:
 
 std::atomic<unsigned int> LocalServerNameGuard::counter_{0};
 
-/// @brief 在 loopback 上接受 TCP 连接并升级为 TLS 的测试服务器。
-/// @details 服务器按值拥有测试证书和私钥；接受的 QSslSocket 由服务器 QObject
-/// 父对象拥有，随服务器销毁时清理。
+/**
+ * @brief 在 loopback 上接受 TCP 连接并升级为 TLS 的测试服务器。
+ * @details 服务器按值拥有测试证书和私钥；接受的 QSslSocket 由服务器 QObject
+ *          父对象拥有，随服务器销毁时清理。
+ */
 class SslLoopbackServer final : public QTcpServer
 {
 public:
@@ -130,8 +134,10 @@ private:
     std::shared_ptr<Coro::Awaitable<void>> encrypted_;
 };
 
-/// @brief 接受 TCP 连接后发送明文的测试服务器。
-/// @details 接受的 QTcpSocket 由服务器拥有，用于稳定触发 TLS 客户端握手失败。
+/**
+ * @brief 接受 TCP 连接后发送明文的测试服务器。
+ * @details 接受的 QTcpSocket 由服务器拥有，用于稳定触发 TLS 客户端握手失败。
+ */
 class PlainTextServer final : public QTcpServer
 {
 protected:
@@ -490,7 +496,8 @@ void TestFiberAwait::test_case_socket_awaitable_lifetime()
 }
 
 /// @brief 验证 socket 连接和清理回调幂等，且清理后不会再保留 awaitable。
-/// @details 已清理的集合拒绝新连接和回调，防止延迟信号访问释放后的状态。
+/// @details 已清理的注册表会立即 disconnect 晚注册的 connection，并立即执行
+/// 晚注册的 cleanup，从而防止延迟信号访问已释放状态。
 void TestFiberAwait::test_case_socket_connection_cleanup()
 {
     QPointer<SigObject> sender = new SigObject;

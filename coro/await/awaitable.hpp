@@ -27,7 +27,7 @@ public:
     /**
      * @brief 设置终止清理回调。
      * @details 替换旧回调时，旧回调会在互斥锁外立即执行；若已终止，传入回调也会在锁外立即执行。
-     * @param cleanup 终止时执行的清理回调
+     * @param cleanup 终止时执行的清理回调。
      */
     void set(std::function<void()> cleanup){
         bool runImmediately = false;
