@@ -27,8 +27,12 @@ namespace Coro {
  *          await_for() 超时不会取消连接流或 signal 订阅。
  *
  * server 停止监听时，连接流以默认 no_message 正常关闭，已排队指针仍先
- * 被消费；源 QObject 销毁时也正常关闭，但会先丢弃不能再安全返回的已排队
- * 原始指针。消费者显式调用返回 Awaitable 的 close() 或 close(error) 时，
+ * 被消费。applicationLifetime 发出 aboutToQuit 或销毁时也以默认 no_message
+ * 正常关闭并仅清理一次注册的 Qt 信号连接和 cleanup；该路径不丢弃已排队
+ * 连接，消费者会先取完它们，队列耗尽后才观察到 no_message。源 server QObject
+ * 销毁时同样正常关闭，但会先通过 discard_pending() 丢弃不能再安全返回的
+ * 由 server 拥有的原始指针，防止悬空。消费者显式调用返回 Awaitable 的 close() 或
+ * close(error) 时，
  * 已排队指针仍先消费，随后返回首次终止错误；注册的 Qt 信号连接和 cleanup
  * 仅清理一次。该包装器未将 QLocalServer::serverError() 转换为终止错误。
  */
