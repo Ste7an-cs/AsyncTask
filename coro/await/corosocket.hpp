@@ -32,6 +32,7 @@ class CoroAbstractSocket{
 
     /**
      * @brief 在 socket 所属线程执行或排队执行函数。
+     * @tparam Function 可用 QAbstractSocket* 调用的函数类型。
      * @param socket 非拥有的 socket 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；socket 已销毁或投递失败时为 false。
@@ -53,8 +54,17 @@ class CoroAbstractSocket{
 
     /**
      * @brief 等待信号并可在 socket 线程发起动作的内部辅助函数。
-     * @details 成功条件由 check 决定；Qt 错误以 qt.socket category 关闭 awaitable。
-     *          回调强捕获 shared awaitable；source 或应用销毁时关闭它。
+     * @details 目标信号到达时直接 resolve 并关闭 awaitable；check 不约束信号回调，
+     *          仅在 action 执行后提供同步完成的 fast path。Qt 错误以 qt.socket category
+     *          关闭 awaitable；回调强捕获 shared awaitable，source 或应用销毁时关闭它。
+     * @tparam Signal 可传给 QObject::connect() 的目标信号类型。
+     * @tparam Check 可用 QAbstractSocket* 调用并返回完成状态的检查函数类型。
+     * @tparam Action 可用 QAbstractSocket* 调用的动作函数类型。
+     * @param signal 到达时直接完成等待的目标信号。
+     * @param check action 执行后用于同步 fast path 的完成状态检查函数。
+     * @param action 在 socket 所属线程执行一次的动作。
+     * @param peerCloseCompletes 远端关闭是否应作为正常完成处理。
+     * @return 目标信号或同步 fast path 完成时成功，否则携带终止原因的共享 awaitable。
      */
     template<typename Signal, typename Check, typename Action>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
@@ -114,7 +124,14 @@ class CoroAbstractSocket{
         return awaitable;
     }
 
-    /** @brief 使用空动作等待信号的 waitForSignal() 简化重载。 */
+    /**
+     * @brief 使用空动作等待信号的 waitForSignal() 简化重载。
+     * @tparam Signal 可传给 QObject::connect() 的目标信号类型。
+     * @tparam Check 可用 QAbstractSocket* 调用并返回完成状态的检查函数类型。
+     * @param signal 到达时直接完成等待的目标信号。
+     * @param check 空动作执行后用于同步 fast path 的完成状态检查函数。
+     * @return 目标信号或同步 fast path 完成时成功，否则携带终止原因的共享 awaitable。
+     */
     template<typename Signal, typename Check>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
         return waitForSignal(signal, std::move(check), [](QAbstractSocket*){});

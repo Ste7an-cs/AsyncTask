@@ -31,6 +31,7 @@ class CoroLocalServer{
 
     /**
      * @brief 在 server 所属线程执行或排队执行函数。
+     * @tparam Function 可用 QLocalServer* 调用的函数类型。
      * @param server 非拥有的 server 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；server 已销毁或投递失败时为 false。
@@ -62,7 +63,7 @@ public:
      * @return 先排空当前 pending 队列，随后持续投递新连接；server 关闭或销毁时流结束。
      * @details 每个 QLocalSocket* 仍由 Qt server 管理，消费者不得让它超过 server 生命周期，
      *          并必须遵守其线程亲和性。10 ms 定时器仅检测未发停止信号的 close()，不是
-     *          连接超时。
+     *          连接超时；server 析构时会丢弃尚未消费的 queued 原始指针。
      */
     std::shared_ptr<Awaitable<QLocalSocket*>> nextConnection(){
         auto connections = detail::socket_connections();

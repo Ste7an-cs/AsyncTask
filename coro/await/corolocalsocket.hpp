@@ -31,6 +31,7 @@ class CoroLocalSocket{
 
     /**
      * @brief 在本地 socket 所属线程执行或排队执行函数。
+     * @tparam Function 可用 QLocalSocket* 调用的函数类型。
      * @param socket 非拥有的 socket 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；socket 已销毁或投递失败时为 false。
@@ -52,8 +53,18 @@ class CoroLocalSocket{
 
     /**
      * @brief 等待本地 socket 信号并可在对象线程发起动作的内部辅助函数。
-     * @details 成功条件由 check 决定；Qt 错误以 qt.local_socket category 关闭 awaitable。
-     *          回调强捕获 shared awaitable；source 或应用销毁时关闭它。
+     * @details 目标信号到达时直接 resolve 并关闭 awaitable；check 不约束信号回调，
+     *          仅在 action 执行后提供同步完成的 fast path。PeerClosedError 正常关闭
+     *          awaitable，其他 Qt 错误以 qt.local_socket category 关闭它；回调强捕获
+     *          shared awaitable，source 或应用销毁时关闭它。
+     * @tparam Signal 可传给 QObject::connect() 的目标信号类型。
+     * @tparam Check 可用 QLocalSocket* 调用并返回完成状态的检查函数类型。
+     * @tparam Action 可用 QLocalSocket* 调用的动作函数类型。
+     * @param signal 到达时直接完成等待的目标信号。
+     * @param check action 执行后用于同步 fast path 的完成状态检查函数。
+     * @param action 在 socket 所属线程执行一次的动作。
+     * @param peerCloseCompletes 对端关闭是否应作为成功完成处理。
+     * @return 目标信号或同步 fast path 完成时成功，否则携带终止原因的共享 awaitable。
      */
     template<typename Signal, typename Check, typename Action>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
@@ -120,7 +131,14 @@ class CoroLocalSocket{
         return awaitable;
     }
 
-    /** @brief 使用空动作等待本地 socket 信号的简化重载。 */
+    /**
+     * @brief 使用空动作等待本地 socket 信号的简化重载。
+     * @tparam Signal 可传给 QObject::connect() 的目标信号类型。
+     * @tparam Check 可用 QLocalSocket* 调用并返回完成状态的检查函数类型。
+     * @param signal 到达时直接完成等待的目标信号。
+     * @param check 空动作执行后用于同步 fast path 的完成状态检查函数。
+     * @return 目标信号或同步 fast path 完成时成功，否则携带终止原因的共享 awaitable。
+     */
     template<typename Signal, typename Check>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
         return waitForSignal(signal, std::move(check), [](QLocalSocket*){});
@@ -135,8 +153,8 @@ public:
 
     /**
      * @brief 创建持续读取字节块的流式 awaitable。
-     * @return 每个值都是非空的当前可读字节块，直到 socket 关闭；对端关闭正常结束，
-     *         其他本地 socket 错误以 qt.local_socket category 结束。
+     * @return 每个值都是非空的当前可读字节块，直到 socket 关闭；PeerClosedError 正常
+     *         结束流，其他本地 socket 错误以 qt.local_socket category 结束。
      * @note await_for() 超时不停止读取流，也不取消 Qt 信号订阅。
      */
     std::shared_ptr<Awaitable<QByteArray>> readAll(){
@@ -215,7 +233,8 @@ public:
 
     /**
      * @brief 等待至少一个可读字节。
-     * @return bytesAvailable() 大于零时成功；本地 socket 错误以 qt.local_socket category 结束。
+     * @return bytesAvailable() 大于零时成功；PeerClosedError 正常关闭等待，其他本地
+     *         socket 错误以 qt.local_socket category 结束。
      */
     std::shared_ptr<Awaitable<void>> waitForReadyRead(){
         return waitForSignal(&QIODevice::readyRead, [](QLocalSocket* socket){
@@ -225,7 +244,8 @@ public:
 
     /**
      * @brief 等待 Qt 发出 bytesWritten 信号。
-     * @return 写入信号发生时成功；本地 socket 错误以 qt.local_socket category 结束。
+     * @return 写入信号发生时成功；PeerClosedError 正常关闭等待，其他本地 socket 错误
+     *         以 qt.local_socket category 结束。
      */
     std::shared_ptr<Awaitable<void>> waitForBytesWritten(){
         return waitForSignal(&QIODevice::bytesWritten, [](QLocalSocket*){
@@ -235,7 +255,8 @@ public:
 
     /**
      * @brief 等待本地 socket 进入 ConnectedState。
-     * @return 已连接时成功；连接错误以 qt.local_socket category 结束。
+     * @return 已连接时成功；PeerClosedError 正常关闭等待，其他连接错误以
+     *         qt.local_socket category 结束。
      */
     std::shared_ptr<Awaitable<void>> waitForConnected(){
         return waitForSignal(&QLocalSocket::connected, [](QLocalSocket* socket){
@@ -245,7 +266,8 @@ public:
 
     /**
      * @brief 等待本地 socket 进入 UnconnectedState。
-     * @return 已断开或对端正常关闭时成功；其他错误以 qt.local_socket category 结束。
+     * @return 已断开或 PeerClosedError 表示对端正常关闭时成功；其他错误以
+     *         qt.local_socket category 结束。
      */
     std::shared_ptr<Awaitable<void>> waitForDisconnected(){
         return waitForSignal(
@@ -260,7 +282,8 @@ public:
      * @brief 在对象线程发起到本地 server 的连接并等待成功。
      * @param name Qt 本地 server 名称。
      * @param mode 打开模式。
-     * @return ConnectedState 时成功；连接错误以 qt.local_socket category 结束。
+     * @return ConnectedState 时成功；PeerClosedError 正常关闭等待，其他连接错误以
+     *         qt.local_socket category 结束。
      */
     std::shared_ptr<Awaitable<void>> connectToServer(
         const QString& name,
@@ -279,7 +302,8 @@ public:
 
     /**
      * @brief 在对象线程请求从本地 server 断开并等待 UnconnectedState。
-     * @return 已断开或对端正常关闭时成功；其他错误以 qt.local_socket category 结束。
+     * @return 已断开或 PeerClosedError 表示对端正常关闭时成功；其他错误以
+     *         qt.local_socket category 结束。
      */
     std::shared_ptr<Awaitable<void>> disconnectFromServer(){
         return waitForSignal(

@@ -31,6 +31,7 @@ class CoroUdpSocket{
 
     /**
      * @brief 在 UDP socket 所属线程执行或排队执行函数。
+     * @tparam Function 可用 QUdpSocket* 调用的函数类型。
      * @param socket 非拥有的 socket 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；socket 已销毁或投递失败时为 false。
@@ -60,7 +61,8 @@ public:
     /**
      * @brief 创建保留数据报边界的接收流。
      * @return 每个值对应一个完整 QNetworkDatagram，并保留发送端地址、端口等元数据；
-     *         socket 关闭、销毁或报告传输错误时流终止，错误使用 qt.socket category。
+     *         初始检查发现 UnconnectedState 或后续 stateChanged 进入该状态时正常关闭流，
+     *         socket 销毁时也正常关闭；传输错误使用 qt.socket category 终止流。
      */
     std::shared_ptr<Awaitable<QNetworkDatagram>> receiveDatagram(){
         auto connections = detail::socket_connections();
@@ -112,6 +114,10 @@ public:
                 return;
             }
             drain(current);
+            if(current->state() == QAbstractSocket::UnconnectedState){
+                awaitable->close();
+                detail::cleanup_socket_connections(connections);
+            }
         })){
             awaitable->close();
             detail::cleanup_socket_connections(connections);

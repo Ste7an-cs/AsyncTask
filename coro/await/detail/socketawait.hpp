@@ -91,7 +91,10 @@ private:
 /** @brief 共享的 socket 生命周期注册表所有权。 */
 using SocketConnections = std::shared_ptr<SocketConnectionRegistry>;
 
-/** @brief 创建一个独立的 socket 生命周期注册表。 */
+/**
+ * @brief 创建一个独立的 socket 生命周期注册表。
+ * @return 新建的共享 socket 生命周期注册表。
+ */
 inline SocketConnections socket_connections(){
     return std::make_shared<SocketConnectionRegistry>();
 }
@@ -134,6 +137,7 @@ inline void cleanup_socket_connections(const SocketConnections& connections){
 
 /**
  * @brief 连接 QAbstractSocket 的跨 Qt 版本错误信号。
+ * @tparam Function 可接收 QAbstractSocket::SocketError 的回调类型。
  * @param socket 错误信号来源。
  * @param function 接收 SocketError 的回调。
  * @return 建立的 Qt 信号连接。
@@ -155,6 +159,7 @@ QMetaObject::Connection connect_socket_error(QAbstractSocket* socket,
 
 /**
  * @brief 连接 QLocalSocket 的跨 Qt 版本错误信号。
+ * @tparam Function 可接收 QLocalSocket::LocalSocketError 的回调类型。
  * @param socket 错误信号来源。
  * @param function 接收 LocalSocketError 的回调。
  * @return 建立的 Qt 信号连接。

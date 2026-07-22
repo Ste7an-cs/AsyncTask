@@ -186,6 +186,7 @@ private slots:
     void test_case_local_read_then_peer_close();
     void test_case_local_read_stream_direct_close();
     void test_case_local_queued_connect_cancel();
+    void test_case_udp_unconnected_socket_ends_stream();
     void test_case_udp_preserves_datagrams_and_sender_metadata();
     void test_case_udp_stream_direct_close();
     void test_case_udp_close_ends_stream_and_releases();
@@ -1599,6 +1600,18 @@ void TestFiberAwait::test_case_local_queued_connect_cancel()
     QVERIFY(stopped);
     QCOMPARE(state, QLocalSocket::UnconnectedState);
     QVERIFY(!server.hasPendingConnections());
+}
+
+void TestFiberAwait::test_case_udp_unconnected_socket_ends_stream()
+{
+    using namespace std::chrono_literals;
+    QUdpSocket receiver;
+    auto datagrams = Coro::coro(&receiver).receiveDatagram();
+
+    auto finished = Coro::await_for(datagrams, 100ms);
+    QVERIFY(!finished);
+    QVERIFY2(finished.error() == std::make_error_code(std::errc::no_message),
+             finished.error().message().c_str());
 }
 
 void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()

@@ -30,6 +30,7 @@ class CoroSslSocket : public CoroAbstractSocket {
 
     /**
      * @brief 在 SSL socket 所属线程执行或排队执行函数。
+     * @tparam Function 可用 QSslSocket* 调用的函数类型。
      * @param socket 非拥有的 socket 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；socket 已销毁或投递失败时为 false。
@@ -51,8 +52,14 @@ class CoroSslSocket : public CoroAbstractSocket {
 
     /**
      * @brief 等待当前 TLS 握手加密完成的内部辅助函数。
-     * @details action 在对象线程执行。传输错误以 qt.socket category 结束，证书验证和
-     *          握手错误以 qt.ssl category 结束；回调强捕获 shared awaitable。
+     * @details action 在对象线程执行，encrypted 信号或 action 后的同步检查可成功完成
+     *          等待。首次终止信号决定错误 category：errorOccurred 使用 qt.socket，
+     *          sslErrors 或 peerVerifyError 使用 qt.ssl；部分握手失败可能先通过
+     *          errorOccurred 报告，因此不保证所有握手失败都属于 qt.ssl。回调强捕获
+     *          shared awaitable。
+     * @tparam Action 可用 QSslSocket* 调用的握手动作函数类型。
+     * @param action 在 SSL socket 所属线程执行一次的握手动作。
+     * @return socket 已加密时成功，否则携带首次终止信号所确定错误的共享 awaitable。
      */
     template<typename Action>
     std::shared_ptr<Awaitable<void>> waitForEncrypted(Action action){
@@ -129,8 +136,9 @@ public:
 
     /**
      * @brief 仅等待当前已发起的 TLS 握手完成。
-     * @return socket 已加密时成功；传输错误使用 qt.socket category，证书或握手错误
-     *         使用 qt.ssl category。
+     * @return socket 已加密时成功；首次终止的 errorOccurred 使用 qt.socket category，
+     *         sslErrors 或 peerVerifyError 使用 qt.ssl category。部分握手失败可能属于
+     *         qt.socket。
      */
     std::shared_ptr<Awaitable<void>> waitForEncrypted(){
         return waitForEncrypted([](QSslSocket*){});
@@ -142,8 +150,9 @@ public:
      * @param port 目标端口。
      * @param mode 打开模式。
      * @param protocol 网络层协议。
-     * @return 连接并完成握手、socket 加密后成功；传输错误使用 qt.socket category，
-     *         证书或握手错误使用 qt.ssl category。
+     * @return 连接并完成握手、socket 加密后成功；首次终止的 errorOccurred 使用
+     *         qt.socket category，sslErrors 或 peerVerifyError 使用 qt.ssl category。
+     *         部分握手失败可能属于 qt.socket。
      */
     std::shared_ptr<Awaitable<void>> connectToHostEncrypted(
         const QString& host, quint16 port,
