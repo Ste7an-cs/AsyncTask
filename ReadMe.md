@@ -156,6 +156,12 @@ move-only 所有权语义；不要把 socket 包装器的返回值当作按值 A
 | `QUdpSocket` | `receiveDatagram()` | `shared_ptr<Awaitable<QNetworkDatagram>>`；每个元素是一整个 UDP datagram，不合并/拆分边界，并保留 payload、发送者、目标和端口等 metadata |
 | `QSslSocket` | 继承 TCP 方法，另有 `waitForEncrypted()`、`connectToHostEncrypted(host,port[,mode,protocol])` | `shared_ptr<Awaitable<void>>`；`sslErrors()` / `peerVerifyError()` 的证书和 peer verification 事件为 `qt.ssl`，传输或握手失败可为 `qt.socket` |
 
+`QTcpServer::nextConnection()` 与 `QLocalServer::nextConnection()` 返回的元素是裸指针，
+但 accepted socket 的所有权仍属于对应 server，并未转移给 Awaitable 或调用者。
+server 析构会销毁已取出的 accepted socket，并清空 Awaitable 中尚未消费的 queued
+pointer；因此即使 pointer 已从流中消费，也不得把它保留到 server 生命周期之外，
+且对 accepted socket 的访问同样必须遵守 QObject 线程亲和规则。
+
 `QSslSocket` 的包装器不会调用 `ignoreSslErrors()`。应用必须依据证书策略处理
 `qt.ssl` 错误，不能把证书错误自动忽略。
 
