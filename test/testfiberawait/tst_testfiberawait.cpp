@@ -55,9 +55,12 @@ signals:
     void sig2(int, QString);
 };
 
+/// @brief 为本地 socket 测试分配并回收唯一的服务器名。
+/// @details 构造和析构都移除同名端点，防止临时文件或上次失败测试残留影响后续用例。
 class LocalServerNameGuard
 {
 public:
+    /// @brief 创建进程内唯一名称并清理可能遗留的端点。
     LocalServerNameGuard()
         : name_(QStringLiteral("asynctask-local-%1-%2")
                     .arg(QCoreApplication::applicationPid())
@@ -66,30 +69,41 @@ public:
         QLocalServer::removeServer(name_);
     }
 
+    /// @brief 析构时移除临时本地服务器资源。
     ~LocalServerNameGuard()
     {
         QLocalServer::removeServer(name_);
     }
 
+    /// @brief 返回由守卫拥有、可用于本次测试的服务器名。
     const QString& name() const { return name_; }
 
 private:
+    /// @brief 区分同一进程内连续创建的测试服务器名。
     static std::atomic<unsigned int> counter_;
+    /// @brief 守卫负责在生命周期两端清理的本地端点名称。
     QString name_;
 };
 
 std::atomic<unsigned int> LocalServerNameGuard::counter_{0};
 
+/// @brief 在 loopback 上接受 TCP 连接并升级为 TLS 的测试服务器。
+/// @details 服务器按值拥有测试证书和私钥；接受的 QSslSocket 由服务器 QObject
+/// 父对象拥有，随服务器销毁时清理。
 class SslLoopbackServer final : public QTcpServer
 {
 public:
+    /// @brief 复制测试所需的证书和私钥，供后续接受的连接使用。
     SslLoopbackServer(const QSslCertificate& certificate, const QSslKey& privateKey)
         : certificate_(certificate), privateKey_(privateKey){}
 
+    /// @brief 返回服务器拥有的已接受 TLS 对端，未接受连接时返回空指针。
     QSslSocket* peer() const { return peer_; }
+    /// @brief 返回跟踪服务端握手完成的共享 awaitable。
     std::shared_ptr<Coro::Awaitable<void>> encrypted() const { return encrypted_; }
 
 protected:
+    /// @brief 为新描述符创建由服务器拥有的 TLS 对端并启动服务端握手。
     void incomingConnection(qintptr socketDescriptor) override
     {
         peer_ = new QSslSocket(this);
@@ -106,15 +120,22 @@ protected:
     }
 
 private:
+    /// @brief 服务器按值持有的测试证书，避免引用测试调用方的临时对象。
     QSslCertificate certificate_;
+    /// @brief 服务器按值持有的测试私钥，仅用于配置其接受的 TLS 对端。
     QSslKey privateKey_;
+    /// @brief 由此服务器拥有的最近一个 TLS 对端。
     QSslSocket* peer_{nullptr};
+    /// @brief 保持并暴露最近一次服务端握手的完成状态。
     std::shared_ptr<Coro::Awaitable<void>> encrypted_;
 };
 
+/// @brief 接受 TCP 连接后发送明文的测试服务器。
+/// @details 接受的 QTcpSocket 由服务器拥有，用于稳定触发 TLS 客户端握手失败。
 class PlainTextServer final : public QTcpServer
 {
 protected:
+    /// @brief 接受连接并写入非 TLS 数据，以验证握手错误传播。
     void incomingConnection(qintptr socketDescriptor) override
     {
         auto peer = new QTcpSocket(this);
@@ -237,6 +258,7 @@ void TestFiberAwait::test_case_awaiter()
     TQVERIFY(res.value() == 100);
 }
 
+/// @brief 验证关闭接口的重载可用且清理回调至多执行一次。
 void TestFiberAwait::test_case_close_overloads()
 {
     void (Coro::FiberChannel<int>::*channelClose)() noexcept = &Coro::FiberChannel<int>::close;
@@ -261,6 +283,7 @@ void TestFiberAwait::test_case_close_overloads()
     QCOMPARE(voidCleanupCalls, 1);
 }
 
+/// @brief 验证流关闭保留已产生的值，并传播首次终止错误。
 void TestFiberAwait::test_case_channel_terminal_error()
 {
     Coro::Awaitable<int> normal;
@@ -275,6 +298,8 @@ void TestFiberAwait::test_case_channel_terminal_error()
     QCOMPARE(failed.await().error(), std::make_error_code(std::errc::connection_refused));
 }
 
+/// @brief 验证超时只结束等待，随后仍可取得 awaitable 的值。
+/// @details 该不变量确保 await_for 不会取消源 awaitable。
 void TestFiberAwait::test_case_await_timeout_then_value()
 {
     Coro::Awaitable<int> value;
@@ -284,6 +309,7 @@ void TestFiberAwait::test_case_await_timeout_then_value()
     QCOMPARE(Coro::await(value).value(), 42);
 }
 
+/// @brief 验证 void awaitable 的终止错误和超时后成功解析。
 void TestFiberAwait::test_case_void_terminal_error()
 {
     Coro::Awaitable<void> failed;
@@ -297,6 +323,8 @@ void TestFiberAwait::test_case_void_terminal_error()
     QVERIFY(Coro::await(value).has_value());
 }
 
+/// @brief 验证共享 awaitable 的等待、流迭代、空指针错误与生命周期。
+/// @details 生成器必须在持有期间延长源的生命周期，销毁未等待的生成器不得阻塞。
 void TestFiberAwait::test_case_shared_awaitable()
 {
     auto once = std::make_shared<Coro::Awaitable<int>>();
@@ -355,6 +383,8 @@ void TestFiberAwait::test_case_shared_awaitable()
     sharedSource->close();
 }
 
+/// @brief 验证共享生成器遇到终止错误时立即结束并释放源。
+/// @details 对生成器而言，终止错误统一表现为 no_message，而非把超时当作值。
 void TestFiberAwait::test_case_shared_generator_terminal_timeout()
 {
     auto source = std::make_shared<Coro::Awaitable<int>>();
@@ -372,6 +402,7 @@ void TestFiberAwait::test_case_shared_generator_terminal_timeout()
     QVERIFY(weakSource.expired());
 }
 
+/// @brief 验证共享 void awaitable 支持一次结果、超时后解析和事件流。
 void TestFiberAwait::test_case_shared_awaitable_void()
 {
     auto once = std::make_shared<Coro::Awaitable<void>>();
@@ -396,6 +427,7 @@ void TestFiberAwait::test_case_shared_awaitable_void()
     QCOMPARE(events, 2);
 }
 
+/// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
 void TestFiberAwait::test_case_socket_error_conversion()
 {
     const auto socketError = Coro::detail::socket_error_code(
@@ -424,6 +456,7 @@ void TestFiberAwait::test_case_socket_error_conversion()
              QStringLiteral("unknown socket error"));
 }
 
+/// @brief 验证 SSL 错误转换保留 Qt SSL 类别和原始错误值。
 void TestFiberAwait::test_case_ssl_error_conversion()
 {
     const auto sslError = Coro::detail::ssl_error_code(QSslError::HostNameMismatch);
@@ -432,6 +465,7 @@ void TestFiberAwait::test_case_ssl_error_conversion()
     QVERIFY(!QString::fromStdString(sslError.message()).isEmpty());
 }
 
+/// @brief 验证 socket 对象销毁会关闭 awaitable、断开连接并释放引用。
 void TestFiberAwait::test_case_socket_awaitable_lifetime()
 {
     QPointer<SigObject> sender = new SigObject;
@@ -455,6 +489,8 @@ void TestFiberAwait::test_case_socket_awaitable_lifetime()
     QVERIFY(observed.expired());
 }
 
+/// @brief 验证 socket 连接和清理回调幂等，且清理后不会再保留 awaitable。
+/// @details 已清理的集合拒绝新连接和回调，防止延迟信号访问释放后的状态。
 void TestFiberAwait::test_case_socket_connection_cleanup()
 {
     QPointer<SigObject> sender = new SigObject;
@@ -517,6 +553,7 @@ void TestFiberAwait::test_case_socket_connection_cleanup()
     delete sender.data();
 }
 
+/// @brief 验证应用生命周期结束也会关闭 socket awaitable 并释放资源。
 void TestFiberAwait::test_case_application_lifetime_cleanup()
 {
     QPointer<SigObject> sender = new SigObject;
@@ -718,6 +755,7 @@ void TestFiberAwait::test_case_iodevice_generate()
     TQVERIFY(k == 100);
 }
 
+/// @brief 验证 TCP 连接、双向 ping-pong 和共享 awaitable 的类型契约。
 void TestFiberAwait::test_case_tcp_ping_pong()
 {
     using namespace std::chrono_literals;
@@ -762,6 +800,8 @@ void TestFiberAwait::test_case_tcp_ping_pong()
     delete peer;
 }
 
+/// @brief 验证释放的 loopback 端口稳定返回 TCP 连接被拒绝错误。
+/// @details 客户端在线程内创建和销毁，确保失败路径不遗留跨线程 socket。
 void TestFiberAwait::test_case_tcp_connection_refused()
 {
     using namespace std::chrono_literals;
@@ -796,6 +836,7 @@ void TestFiberAwait::test_case_tcp_connection_refused()
              static_cast<int>(QAbstractSocket::ConnectionRefusedError));
 }
 
+/// @brief 验证 TCP 连接被拒绝后可用地址和主机名重试成功。
 void TestFiberAwait::test_case_tcp_retry_after_refusal()
 {
     using namespace std::chrono_literals;
@@ -864,6 +905,7 @@ void TestFiberAwait::test_case_tcp_retry_after_refusal()
     QVERIFY(secondAccepted);
 }
 
+/// @brief 验证本地主动断开能完成并使连接进入未连接状态。
 void TestFiberAwait::test_case_tcp_disconnect()
 {
     using namespace std::chrono_literals;
@@ -885,6 +927,7 @@ void TestFiberAwait::test_case_tcp_disconnect()
     delete peer;
 }
 
+/// @brief 验证对端断开会完成本地的断开等待。
 void TestFiberAwait::test_case_tcp_remote_disconnect_wait()
 {
     using namespace std::chrono_literals;
@@ -908,6 +951,7 @@ void TestFiberAwait::test_case_tcp_remote_disconnect_wait()
     delete peer;
 }
 
+/// @brief 验证读取流先交付缓冲字节，再以正常终止结束。
 void TestFiberAwait::test_case_tcp_read_then_remote_close()
 {
     using namespace std::chrono_literals;
@@ -937,6 +981,7 @@ void TestFiberAwait::test_case_tcp_read_then_remote_close()
     delete peer;
 }
 
+/// @brief 验证直接关闭 TCP 读取流会释放 awaitable 而不影响 socket 接收数据。
 void TestFiberAwait::test_case_tcp_read_stream_direct_close()
 {
     using namespace std::chrono_literals;
@@ -965,6 +1010,7 @@ void TestFiberAwait::test_case_tcp_read_stream_direct_close()
     delete peer;
 }
 
+/// @brief 验证关闭 TCP 监听器会以正常终止结束连接流。
 void TestFiberAwait::test_case_tcp_server_close()
 {
     using namespace std::chrono_literals;
@@ -978,6 +1024,7 @@ void TestFiberAwait::test_case_tcp_server_close()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证主动关闭 TCP 连接流后，连接监视资源会被释放。
 void TestFiberAwait::test_case_tcp_server_closed_stream_release()
 {
     QTcpServer server;
@@ -993,6 +1040,7 @@ void TestFiberAwait::test_case_tcp_server_closed_stream_release()
     QTRY_COMPARE_WITH_TIMEOUT(server.findChildren<QTimer*>().size(), 0, 2000);
 }
 
+/// @brief 验证跨线程关闭 TCP 连接流仍会释放 awaitable 和监视资源。
 void TestFiberAwait::test_case_tcp_server_queued_close_release()
 {
     auto server = new QTcpServer;
@@ -1024,6 +1072,7 @@ void TestFiberAwait::test_case_tcp_server_queued_close_release()
     QVERIFY(stopped);
 }
 
+/// @brief 验证停止监视器后直接关闭 TCP 连接流不会阻止服务器接受连接。
 void TestFiberAwait::test_case_tcp_server_stream_direct_close()
 {
     QTcpServer server;
@@ -1048,6 +1097,7 @@ void TestFiberAwait::test_case_tcp_server_stream_direct_close()
     delete server.nextPendingConnection();
 }
 
+/// @brief 验证销毁 TCP 服务器会清理已排队但未交付的连接并终止流。
 void TestFiberAwait::test_case_tcp_server_destroy_purges_queued_connection()
 {
     using namespace std::chrono_literals;
@@ -1068,6 +1118,7 @@ void TestFiberAwait::test_case_tcp_server_destroy_purges_queued_connection()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证已关闭的 TCP 连接流在服务器销毁时仍清理排队连接。
 void TestFiberAwait::test_case_tcp_closed_server_stream_purges_on_destroy()
 {
     using namespace std::chrono_literals;
@@ -1089,6 +1140,7 @@ void TestFiberAwait::test_case_tcp_closed_server_stream_purges_on_destroy()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证 TCP 连接流按接受顺序交付多个不同的对端。
 void TestFiberAwait::test_case_tcp_server_connection_stream()
 {
     using namespace std::chrono_literals;
@@ -1121,6 +1173,7 @@ void TestFiberAwait::test_case_tcp_server_connection_stream()
     secondClient.abort();
 }
 
+/// @brief 验证在线程启动前关闭排队的 TCP 连接操作不会建立连接。
 void TestFiberAwait::test_case_tcp_queued_connect_cancel()
 {
     QTcpServer server;
@@ -1150,6 +1203,8 @@ void TestFiberAwait::test_case_tcp_queued_connect_cancel()
     QVERIFY(!server.hasPendingConnections());
 }
 
+/// @brief 验证受信任的 loopback TLS 握手后可双向传递 ping-pong 数据。
+/// @details 服务端证书和私钥由测试服务器持有，双方握手完成后才进行数据断言。
 void TestFiberAwait::test_case_ssl_encrypted_ping_pong()
 {
     using namespace std::chrono_literals;
@@ -1205,6 +1260,7 @@ void TestFiberAwait::test_case_ssl_encrypted_ping_pong()
     QCOMPARE(response.value(), QByteArray("pong"));
 }
 
+/// @brief 验证 TLS 客户端连接明文对端时传播可诊断的握手错误。
 void TestFiberAwait::test_case_ssl_plain_peer_handshake_failure()
 {
     using namespace std::chrono_literals;
@@ -1229,6 +1285,7 @@ void TestFiberAwait::test_case_ssl_plain_peer_handshake_failure()
     QVERIFY(!QString::fromStdString(result.error().message()).isEmpty());
 }
 
+/// @brief 验证在线程启动前关闭排队的 TLS 连接操作不会建立连接。
 void TestFiberAwait::test_case_ssl_queued_connect_cancel()
 {
     QTcpServer server;
@@ -1258,6 +1315,7 @@ void TestFiberAwait::test_case_ssl_queued_connect_cancel()
     QVERIFY(!server.hasPendingConnections());
 }
 
+/// @brief 验证本地 socket 的连接、双向 ping-pong 与主动断开契约。
 void TestFiberAwait::test_case_local_ping_pong_disconnect()
 {
     using namespace std::chrono_literals;
@@ -1303,6 +1361,7 @@ void TestFiberAwait::test_case_local_ping_pong_disconnect()
     QCOMPARE(client.state(), QLocalSocket::UnconnectedState);
 }
 
+/// @brief 验证本地 socket 对端断开会完成客户端的断开等待。
 void TestFiberAwait::test_case_local_remote_disconnect_wait()
 {
     using namespace std::chrono_literals;
@@ -1326,6 +1385,7 @@ void TestFiberAwait::test_case_local_remote_disconnect_wait()
     QCOMPARE(client.state(), QLocalSocket::UnconnectedState);
 }
 
+/// @brief 验证本地服务器连接流依次交付连接，并在关闭后终止和释放对端。
 void TestFiberAwait::test_case_local_connection_stream_and_close()
 {
     using namespace std::chrono_literals;
@@ -1358,6 +1418,7 @@ void TestFiberAwait::test_case_local_connection_stream_and_close()
     QVERIFY(secondPeer.isNull());
 }
 
+/// @brief 验证连接不存在的本地服务器返回 ServerNotFoundError。
 void TestFiberAwait::test_case_local_missing_server()
 {
     using namespace std::chrono_literals;
@@ -1373,6 +1434,7 @@ void TestFiberAwait::test_case_local_missing_server()
              static_cast<int>(QLocalSocket::ServerNotFoundError));
 }
 
+/// @brief 验证关闭本地服务器连接流会释放 awaitable 和监视计时器。
 void TestFiberAwait::test_case_local_closed_stream_release()
 {
     LocalServerNameGuard serverName;
@@ -1389,6 +1451,7 @@ void TestFiberAwait::test_case_local_closed_stream_release()
     QTRY_COMPARE_WITH_TIMEOUT(server.findChildren<QTimer*>().size(), 0, 2000);
 }
 
+/// @brief 验证跨线程关闭本地连接流会释放 awaitable，且服务器仍可正常清理。
 void TestFiberAwait::test_case_local_server_queued_close_release()
 {
     LocalServerNameGuard serverName;
@@ -1421,6 +1484,7 @@ void TestFiberAwait::test_case_local_server_queued_close_release()
     QVERIFY(stopped);
 }
 
+/// @brief 验证停止监视器后直接关闭本地连接流不影响服务器接受连接。
 void TestFiberAwait::test_case_local_server_stream_direct_close()
 {
     LocalServerNameGuard serverName;
@@ -1446,6 +1510,7 @@ void TestFiberAwait::test_case_local_server_stream_direct_close()
     delete server.nextPendingConnection();
 }
 
+/// @brief 验证销毁本地服务器会清理未交付的排队连接并终止流。
 void TestFiberAwait::test_case_local_server_destroy_purges_queued_connection()
 {
     using namespace std::chrono_literals;
@@ -1467,6 +1532,7 @@ void TestFiberAwait::test_case_local_server_destroy_purges_queued_connection()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证已关闭的本地连接流在服务器销毁时仍清理排队连接。
 void TestFiberAwait::test_case_local_closed_server_stream_purges_on_destroy()
 {
     using namespace std::chrono_literals;
@@ -1489,6 +1555,7 @@ void TestFiberAwait::test_case_local_closed_server_stream_purges_on_destroy()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证本地服务器缺失失败后，同一客户端可连接新服务器。
 void TestFiberAwait::test_case_local_retry_after_missing_server()
 {
     using namespace std::chrono_literals;
@@ -1516,6 +1583,7 @@ void TestFiberAwait::test_case_local_retry_after_missing_server()
     QVERIFY(accepted.value() != nullptr);
 }
 
+/// @brief 验证本地读取流先交付末尾字节，再以正常终止结束。
 void TestFiberAwait::test_case_local_read_then_peer_close()
 {
     using namespace std::chrono_literals;
@@ -1546,6 +1614,7 @@ void TestFiberAwait::test_case_local_read_then_peer_close()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证直接关闭本地读取流会释放 awaitable 而不吞掉后续 socket 数据。
 void TestFiberAwait::test_case_local_read_stream_direct_close()
 {
     using namespace std::chrono_literals;
@@ -1574,6 +1643,7 @@ void TestFiberAwait::test_case_local_read_stream_direct_close()
     QCOMPARE(client.readAll(), payload);
 }
 
+/// @brief 验证在线程启动前关闭排队的本地连接操作不会建立连接。
 void TestFiberAwait::test_case_local_queued_connect_cancel()
 {
     LocalServerNameGuard serverName;
@@ -1602,6 +1672,8 @@ void TestFiberAwait::test_case_local_queued_connect_cancel()
     QVERIFY(!server.hasPendingConnections());
 }
 
+/// @brief 验证未绑定且未连接的 UDP socket 会立即正常结束数据报流。
+/// @details 该行为不能伪装成超时，消费者必须收到 no_message 终止错误。
 void TestFiberAwait::test_case_udp_unconnected_socket_ends_stream()
 {
     using namespace std::chrono_literals;
@@ -1614,6 +1686,7 @@ void TestFiberAwait::test_case_udp_unconnected_socket_ends_stream()
              finished.error().message().c_str());
 }
 
+/// @brief 验证 UDP 数据报流保留数据报边界、顺序和发送方元数据。
 void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
 {
     using namespace std::chrono_literals;
@@ -1643,6 +1716,7 @@ void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
     QCOMPARE(second.value().senderAddress(), QHostAddress::LocalHost);
 }
 
+/// @brief 验证直接关闭 UDP 数据报流会释放 awaitable 而不影响 socket 缓冲数据。
 void TestFiberAwait::test_case_udp_stream_direct_close()
 {
     QUdpSocket receiver;
@@ -1663,6 +1737,7 @@ void TestFiberAwait::test_case_udp_stream_direct_close()
     QCOMPARE(receiver.receiveDatagram().data(), payload);
 }
 
+/// @brief 验证关闭 UDP socket 会正常终止数据报流并释放 awaitable。
 void TestFiberAwait::test_case_udp_close_ends_stream_and_releases()
 {
     using namespace std::chrono_literals;
@@ -1680,6 +1755,7 @@ void TestFiberAwait::test_case_udp_close_ends_stream_and_releases()
     QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 2000);
 }
 
+/// @brief 验证销毁 UDP socket 会正常终止数据报流并释放 awaitable。
 void TestFiberAwait::test_case_udp_destruction_ends_stream_and_releases()
 {
     using namespace std::chrono_literals;
