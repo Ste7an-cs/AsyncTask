@@ -1,8 +1,9 @@
 /// @brief TCP Socket Awaitable 的 ping-pong 示例。
 ///
-/// @details 服务端绑定临时 loopback 端口并回显一次 ping；客户端随后连接已释放
-/// 的端口，以稳定验证连接被拒绝。所有外部等待均有时限，且每个 Result 都会检查，
-/// 因此既可在 CI 中运行，也可直接从终端运行。
+/// @details 服务端绑定临时 loopback 端口并回显一次 ping；客户端先实际验证未发送请求
+/// 时的读取返回 std::errc::timed_out，再复用同一等待器接收回显。客户端随后连接已释放
+/// 的端口，以稳定验证连接被拒绝。所有外部等待均有时限，且每个 Result 都会检查，因此
+/// 既可在 CI 中运行，也可直接从终端运行。
 #include <QCoreApplication>
 #include <QDebug>
 #include <QHostAddress>
@@ -25,6 +26,7 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr auto kTimeout = 2s;
+constexpr auto kExpectedTimeout = 20ms;
 
 /// @brief 记录操作失败并返回失败状态。
 /// @details 调用方必须检查对应的 Result，并把错误转换为示例的最终退出状态。
@@ -93,8 +95,9 @@ int main(int argc, char* argv[])
         });
 
         bool ok = true;
-        /// @brief 连接本地服务端并验证一次 ping-pong 成功路径。
-        /// @details 连接、写入完成、读取回显和断开连接的每个 Result 都会单独检查。
+        /// @brief 连接本地服务端，并验证超时后仍可完成一次 ping-pong。
+        /// @details 客户端先预期读取超时，再复用相同 Awaitable 接收回显。连接、两次读取、
+        /// 写入完成和断开连接的每个 Result 都会单独检查。
         QTcpSocket client;
         client.setProxy(QNetworkProxy::NoProxy);
         const auto connected = await_for(
@@ -103,6 +106,18 @@ int main(int argc, char* argv[])
             ok = reportFailure("[client] connect", connected.error()) && ok;
         }else{
             auto response = coro(&client).readAll();
+            const auto timedOut = await_for(response, kExpectedTimeout);
+            if(timedOut){
+                qCritical() << "[timeout] response unexpectedly arrived before ping:" << timedOut.value();
+                ok = false;
+            }else if(timedOut.error() != std::make_error_code(std::errc::timed_out)){
+                qCritical() << "[timeout] expected timed_out, got:"
+                            << QString::fromStdString(timedOut.error().message());
+                ok = false;
+            }else{
+                qDebug() << "[timeout] expected timed_out; response awaitable remains open";
+            }
+
             auto written = coro(&client).waitForBytesWritten();
             const QByteArray ping("ping");
             const qint64 count = client.write(ping);
@@ -153,8 +168,6 @@ int main(int argc, char* argv[])
             }
         }
 
-        /// @details await_for 若超时，仅以 timed_out 结束本次等待，不会取消 Awaitable，
-        /// 也不会关闭 socket；因此仍需显式关闭服务端，以终止读取流。
         server->close();
         const auto serverResult = serverTask.get();
         if(!serverResult || !serverResult.value()){
