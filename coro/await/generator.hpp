@@ -34,7 +34,11 @@ public:
          * @param v 待产出的值
          */
         void operator()(const T& v){p_awaiter_->resolve(v);}
-        /** @brief 输出侧是否已关闭 */
+        /**
+         * @brief 查询输出侧是否已关闭。
+         * @details 用于生成器在有界轮询之间感知消费者取消，避免继续等待已关闭的输出端。
+         * @return 输出侧已关闭返回 true
+         */
         bool is_closed() const{return p_awaiter_->channel()->is_closed();}
     };
 
@@ -181,7 +185,11 @@ public:
         explicit Yield(Awaitable<void> *c):p_awaiter_(c){}
         /** @brief 产出一次事件 */
         void operator()(){p_awaiter_->resolve();}
-        /** @brief 输出侧是否已关闭 */
+        /**
+         * @brief 查询输出侧是否已关闭。
+         * @details 用于生成器在有界轮询之间感知消费者取消，避免继续等待已关闭的输出端。
+         * @return 输出侧已关闭返回 true
+         */
         bool is_closed() const{return p_awaiter_->channel()->is_closed();}
     };
 
@@ -341,8 +349,11 @@ Generator<T> generate(Awaitable<T> a){
 
 /**
  * @brief 把共享 Awaitable 适配为 Generator（流式消费）。
+ * @details 生成器强持有共享句柄直至源迭代结束。每次最多轮询 10 ms，此有界轮询仅用于
+ *          感知输出端取消；源等待超时而 channel 仍开放时不会终止流。空句柄产生一个
+ *          可安全结束的空流。
  * @tparam T 产出的元素类型
- * @param a 待消费等待器的共享句柄；按值强持有至源迭代结束
+ * @param a 待消费等待器的共享句柄
  * @return 适配后的 Generator；空句柄返回可安全结束的关闭生成器
  */
 template<typename T>

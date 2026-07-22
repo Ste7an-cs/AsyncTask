@@ -59,6 +59,8 @@ public:
     }
     /**
      * @brief 获取一个元素至引用参数，无可用值则等待，最长等待 timeout_duration
+     * @details 超时仅表示在给定时长内没有可用值，channel 仍可保持开放；关闭则返回
+     *          closed，并由 close_error() 提供首次关闭时记录的终止原因。
      * @tparam Rep 时长的计数类型
      * @tparam Period 时长的周期类型
      * @param out 输出参数，取到的元素
@@ -118,6 +120,7 @@ public:
     }
     /**
      * @brief 关闭 channel 并记录终止原因，唤醒并收敛所有等待者
+     * @details 仅首次关闭会记录终止原因，后续 close() 调用不会覆盖已保留的错误。
      * @param error 终止原因
      */
     void close(std::error_code error) noexcept {
@@ -131,12 +134,18 @@ public:
         closed_.store(true);
         cv_consumer_.notify_all();
     }
-    /** @brief 返回首次关闭 channel 时记录的终止原因 */
+    /**
+     * @brief 返回首次关闭 channel 时记录的终止原因。
+     * @details 重复关闭不会改变该错误，因此消费者始终观察到首次关闭原因。
+     */
     std::error_code close_error() const {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         return close_error_;
     }
-    /** @brief 丢弃尚未被消费的值，不改变 channel 的关闭状态。 */
+    /**
+     * @brief 丢弃尚未被消费的值。
+     * @details 该操作不改变 channel 的关闭状态，也不修改首次关闭时保留的终止错误。
+     */
     void discard_pending(){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         queue_.clear();
@@ -146,7 +155,7 @@ private:
     boost::fibers::condition_variable cv_consumer_;///< 通知消费者的条件变量
     std::deque<T> queue_{};///< 底层元素队列
     std::atomic_bool closed_{false};///< 关闭标志
-    std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 终止原因
+    std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
 
 
 };

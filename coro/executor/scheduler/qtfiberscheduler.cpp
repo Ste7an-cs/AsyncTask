@@ -24,6 +24,7 @@ void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time
             }
         }, Priority::High, Affinity::fixed(std::this_thread::get_id()))).detach();
     });
+    /// @brief 首次调用只启动 Qt 事件泵并立即返回，避免事件泵尚未运行时进入基类休眠。
     if(startedPump) return;
     FiberScheduler::suspend_until(time_point);
 }

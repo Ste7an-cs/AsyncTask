@@ -11,6 +11,12 @@ namespace Coro {
 
 namespace detail {
 
+/**
+ * @brief 管理 Awaitable 的一次性终止清理回调。
+ * @details 首次显式关闭或最后一个共享守卫析构时执行清理。回调在互斥锁外调用，
+ *          避免清理过程重入时发生死锁。
+ * @note 多次调用 run() 只会执行一次清理。
+ */
 class AwaitableCloseGuard {
     std::mutex mutex_;
     std::function<void()> cleanup_;
@@ -18,6 +24,11 @@ class AwaitableCloseGuard {
 public:
     ~AwaitableCloseGuard(){ run(); }
 
+    /**
+     * @brief 设置终止清理回调。
+     * @details 替换旧回调时，旧回调会在互斥锁外立即执行；若已终止，传入回调也会在锁外立即执行。
+     * @param cleanup 终止时执行的清理回调
+     */
     void set(std::function<void()> cleanup){
         bool runImmediately = false;
         std::function<void()> previous;
@@ -34,6 +45,10 @@ public:
         if(runImmediately && cleanup) cleanup();
     }
 
+    /**
+     * @brief 执行一次终止清理。
+     * @details 首次调用取出回调并在互斥锁外执行，后续调用不再执行回调。
+     */
     void run(){
         std::function<void()> cleanup;
         {
@@ -56,7 +71,8 @@ public:
  *
  * 该类与具体来源(Qt/std)解耦：只持有一个共享 channel 与一个不透明的
  * 生命周期守卫 guard_。工厂层通过 setOnClose 注入清理逻辑(如断开信号)，
- * 首次关闭或最终析构时自动执行，从而实现及时取消订阅。
+ * 首次关闭或最终析构时自动执行，从而实现及时取消订阅。关闭后消费者只能观察到
+ * 首次记录的终止错误。
  *
  * move-only，按值传递；内部 channel 为 shared_ptr，生产者只捕获 channel()
  * 而不持有整个 Awaitable，避免引用环。
@@ -98,7 +114,8 @@ public:
     /**
      * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子。
      *
-     * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。
+     * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。替换旧回调时，旧回调会在
+     * 锁外立即执行；若 Awaitable 已关闭，传入回调也会在锁外立即执行。
      * @param fn 清理回调（如断开信号连接）
      */
     void setOnClose(std::function<void()> fn){
@@ -165,6 +182,7 @@ public:
     }
     /**
      * @brief 关闭内部队列并记录终止原因，唤醒并收敛所有等待者
+     * @details 只有首次关闭记录的终止原因可被消费者观察，后续关闭不会覆盖该错误。
      * @param error 终止原因
      */
     void close(std::error_code error){
@@ -179,6 +197,8 @@ public:
  * @brief 异步等待器 void 特化。
  *
  * 无数据负载，仅表达"事件发生一次"；内部用 FiberChannel<int> 承载信号。
+ * 关闭后消费者只能观察到首次记录的终止错误，生命周期清理在首次关闭或最后一个
+ * 共享守卫析构时执行一次。
  */
 template<>
 class Awaitable<void>{
@@ -214,6 +234,8 @@ public:
 
     /**
      * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子
+     * @details 替换旧回调时，旧回调会在锁外立即执行；若 Awaitable 已关闭，传入回调
+     *          也会在锁外立即执行。
      * @param fn 清理回调
      */
     void setOnClose(std::function<void()> fn){
@@ -282,6 +304,7 @@ public:
     }
     /**
      * @brief 关闭内部队列并记录终止原因，唤醒并收敛所有等待者
+     * @details 只有首次关闭记录的终止原因可被消费者观察，后续关闭不会覆盖该错误。
      * @param error 终止原因
      */
     void close(std::error_code error){
