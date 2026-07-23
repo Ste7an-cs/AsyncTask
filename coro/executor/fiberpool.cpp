@@ -22,11 +22,21 @@ Coro::FibersPool &Coro::FibersPool::instance()
 }
 
 /**
- * @brief 关闭线程池：唤醒各工作线程使其退出
+ * @brief 关闭线程池：唤醒各工作线程并 join 至其真正退出。
+ *
+ * 必须在此 join：worker() 返回前，工作线程的调度器仍会在 pick_next() 中访问
+ * FiberGlobalQueue 单例。若不 join 就返回，主线程会继续跑到 main() 结束、触发
+ * 静态析构——而 FiberGlobalQueue 比 FibersPool 后构造、先析构，于是尚未退出的
+ * 工作线程会访问已销毁的队列 → SIGSEGV。join 保证所有工作线程在返回前彻底停下。
  */
 void Coro::FibersPool::close()
 {
     block.close();
+    for(auto& td:tds){
+        if(td.joinable()){
+            td.join();
+        }
+    }
 }
 
 /**
