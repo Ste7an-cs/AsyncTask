@@ -50,14 +50,21 @@ int Coro::FiberApplication::exec()
 }
 
 /**
- * @brief 安全退出：广播 aboutToQuit → 排空 → 停线程池 → 退出
+ * @brief 安全退出：广播 aboutToQuit → 排空 → 停 pump → 关并 join 线程池 → 退出
  */
 void Coro::FiberApplication::quit()
 {
+    // 先广播真实 aboutToQuit：关闭所有绑定的 awaitable，唤醒 parked 协程。
     QMetaObject::invokeMethod(QCoreApplication::instance(), "aboutToQuit", Qt::DirectConnection);
-    QtFiberScheduler::signalExit();
+    // 在各线程 pump 仍存活时排空：被 aboutToQuit 唤醒的 worker 协程需要其所在线程的
+    // pump 继续泵事件并驱动调度，才能跑到终止。
     drainUntilIdle();
+    // 协程已排空，再停 pump、唤醒主线程与 worker 的 block。
+    QtFiberScheduler::signalExit();
     block.close();
+    // FibersPool::close() 会 join 所有工作线程：必须在返回前确保它们彻底退出，
+    // 否则主线程跑到 main() 结束触发静态析构时，尚未退出的工作线程会在 pick_next()
+    // 里访问已销毁的 FiberGlobalQueue 单例而 SIGSEGV（队列比线程池后构造、先析构）。
     Coro::FibersPool::instance().close();
     QCoreApplication::exit();
 }
