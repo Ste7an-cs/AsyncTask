@@ -41,7 +41,7 @@ gcc g++ qmake boost Qt
 3. 使用库时，可在工程配置文件中添加`include($$PWD/../AsyncTask.pri)`，将`AsyncTask.pri`加入工程中（`include(xxx/AsyncTask.pri)`需根据实际路径修改）
 
 AsyncTask会根据项目配置自动使能部分功能，例如在Qt项目中才会启动Qt相关的协程接口和支持Qt时间循环的调度器。在使能Qt network时，才会启用network相关的协程接口。
-更完整的说明见 `doc/需求文档.md` 与 `doc/架构设计.md`，示例见 `example/`。
+更完整的说明见 `doc/需求规格说明.md`（SRS）与 `doc/软件设计说明.md`（SDD，含各 SVG 图），示例见 `example/`。
 
 ## 3 使用说明
 
@@ -178,6 +178,6 @@ Qt 对象保持 Qt 的线程亲和规则：**所有 QObject 方法都在该对�
 | 链接报 `Your application is linked against incompatible ASan runtimes` | 测试 `.pro` 里 `-static-libasan` 与 `LIBS += -lasan` 冲突，去掉 `-lasan`（保留 `-static-libasan`）。 |
 | 程序结束不退出 / 退出崩溃 | 确保调用 `Coro::quit()` 收尾：它会广播 `aboutToQuit` 唤醒挂起协程、排空在途任务、停泵，并**关闭并 join 工作线程池**后再退出（join 保证工作线程不晚于全局单例存活，避免退出期访问已销毁的就绪队列而崩溃）。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
 | 把 Qt socket/server 等对象放到 `Affinity::shared()` 任务后偶发退出崩溃 | 带 parent 的 Qt 对象不能放在共享亲和任务上。共享协程可能在任意工作线程运行，而 Qt 对象（及其 socket notifier/timer 等）必须在所属线程访问。须操作 Qt 对象的协程请用 `Affinity::fixed(...)` / `sticky()` 绑定到确定线程（主线程或 `QtFiberThread`）。 |
-| `deleteLater` 迟迟不生效 | 调度期 Qt 不派发 `DeferredDelete`（见 `doc/需求文档.md` LIM-2），通常到 `quit()` 才处理；需要即时释放可显式 `delete`。 |
-| 运行中改线程亲和后未迁移到目标线程 | 不受支持（LIM-1）。线程归属请在协程创建时用 `Affinity` 指定，勿运行中反复 `setAffinity` 迁移。 |
+| `deleteLater` 迟迟不生效 | 调度期 Qt 不派发 `DeferredDelete`（见 `doc/需求规格说明.md` RX_OTHER_DELETELATER），通常到 `quit()` 才处理；需要即时释放可显式 `delete`。 |
+| 运行中改线程亲和后未迁移到目标线程 | 不受支持（见 `doc/需求规格说明.md` RX_OTHER_AFFINITY）。线程归属请在协程创建时用 `Affinity` 指定，勿运行中反复 `setAffinity` 迁移。 |
 | qmake 报找不到 boost | 未按 2.2 安装 boost 到 `/usr/local`，或未在 `.pro` 中 `include(AsyncTask.pri)`。 |

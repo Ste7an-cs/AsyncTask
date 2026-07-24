@@ -1,0 +1,5 @@
+flowchart LR
+    Sig["obj 发射信号"] -->|"参数"| Slot["工厂注入的槽<br/>[ch]{ ch->push(打包参数) }"]
+    Slot -->|"打包为 T"| CH[("FiberChannel(Awaitable)")]
+    CH -->|"pop 唤醒协程"| Await["await(a)"]
+    Await -->|"Result<T>"| U["用户协程"]

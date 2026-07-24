@@ -1,0 +1,17 @@
+sequenceDiagram
+    autonumber
+    participant M as 主线程(阻塞于 exec)
+    participant S1 as 主线程调度器 CSC_SCHEDULER
+    participant GQ as FiberGlobalQueue D1
+    participant S2 as 工作线程调度器 CSC_SCHEDULER
+    participant W as 工作线程 CSC_EXECUTOR
+
+    M->>S1: launch_properties(fn, Shared)
+    S1->>S1: awakened(ctx)：非 pinned → ctx.detach()
+    S1->>GQ: emplace_back(props) 入 Shared 桶（按优先级）
+    Note over M: 主线程无法调度该协程（正阻塞）
+    W->>S2: 调度循环 pick_next()
+    S2->>GQ: 取“本线程 Fixed→Sticky→未分配 Sticky→Shared”
+    GQ-->>S2: 取出 ctx（持 global_mtx）
+    S2->>W: attach(ctx) 并 resume
+    W->>W: 运行 fn；await/sleep 让出 → 可继续取其它协程

@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户协程
+    participant W as CoroAbstractSocket CSC_AWAIT
+    participant A as Awaitable CSC_AWAIT
+    participant CH as FiberChannel CSC_DETAIL
+    participant Sk as QAbstractSocket
+
+    U->>W: coro(sock).readAll()
+    W->>A: 建 Awaitable，取 channel()
+    W->>Sk: connect(readyRead → ch.push(sock.readAll()))
+    W->>Sk: connect(disconnected/destroyed → ch.close())
+    alt 建连时已有缓冲数据
+        W->>CH: 立即 push（规避 check-then-wait 竞态）
+    end
+    W-->>U: 返回 shared_ptr<Awaitable>
+    U->>A: generate(shared_ptr) → 建 Generator（强持有 Awaitable）
+    loop 每轮迭代
+        U->>A: next() → CH.pop()（无数据则让出）
+        Sk-->>CH: readyRead → push(数据块)
+        CH-->>U: yield QByteArray
+    end
+    Sk-->>CH: disconnected → close()
+    CH-->>U: pop 得关闭 → 迭代结束
+    U->>A: close 或最终析构 → guard exactly-once disconnect

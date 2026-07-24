@@ -1,0 +1,7 @@
+stateDiagram-v2
+    [*] --> 登记: add_nodes 在途计数加一
+    登记 --> 运行: 前驱完成且可运行
+    登记 --> 中断: 已 cancel 或前驱出错
+    运行 --> 完成: set_value 结果值
+    中断 --> 完成: set_value 中断错误
+    完成 --> [*]: done_nodes 在途计数减一
