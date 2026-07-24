@@ -1,6 +1,6 @@
 ---
 name: using-asynctask
-description: 当编写、生成或修改使用 AsyncTask 协程框架（命名空间 `Coro`，基于 boost.fiber）的 C++ 代码时使用 —— 涉及 makeTask/then/get 任务链、用 coro()/await()/generate() 等待 Qt 信号/socket/QIODevice/future、Awaitable/Generator/Result，或 installFiberApplication/exec/quit 生命周期。遇到 AsyncTask 常见问题（主线程协程不执行、进程无法退出、deleteLater 延迟、运行时改线程亲和无效）时也适用。
+description: 当编写、生成或修改使用 AsyncTask 协程框架（命名空间 `Coro`，基于 boost.fiber）的 C++ 代码时使用 —— 涉及 makeTask/then/get 任务链、用 coro()/await()/generate() 等待 Qt 信号/socket/QIODevice/future、Awaitable/Generator/Result，或 installFiberApplication/exec/quit 生命周期。遇到 AsyncTask 常见问题（主线程协程不执行、进程无法退出、退出崩溃、deleteLater 延迟、运行时改线程亲和无效、把 Qt 对象放进共享亲和任务导致崩溃）时也适用。
 ---
 
 # AsyncTask（Coro）使用指南
@@ -12,7 +12,7 @@ AsyncTask 是基于 boost.fiber 的**有栈协程**框架，面向 Qt/C++17。�
 三条核心规则（违反其一是绝大多数 bug 的根源）：
 
 1. **用 `Coro::exec()` 驱动主循环，不要用 `QCoreApplication::exec()`。** 协程调度器即主循环，Qt 事件由每个安装 `QtFiberScheduler` 的线程上的**常驻泵协程**（首次空闲时懒启动、在 worker 上下文持续 `processEvents`）分发；二者在同一线程互斥。
-2. **用 `Coro::quit()` 退出** —— 设置全局退出标志 → 各线程泵协程自行终止 → 唤醒挂起协程 → 排空在途任务 → 退出。**`block.wait()` 返回后会自动停止本线程的泵协程**，因此 `QtFiberThread` 等单独退出也安全。不调用 `quit()` 会导致退出时卡死或崩溃。
+2. **用 `Coro::quit()` 退出** —— 广播 `aboutToQuit` 唤醒挂起协程 → 在泵仍存活时排空在途任务 → 置全局退出标志停泵 → 关闭并 **join** 工作线程池 → 退出。顺序有两处不可换：排空先于停泵（被唤醒的工作线程协程要靠泵跑到终止），停池要 join 到工作线程真正退出（否则静态析构先销毁 `FiberGlobalQueue`，未退出的工作线程仍在 `pick_next()` 访问它 → 崩溃）。**`block.wait()` 返回后会自动停止本线程的泵协程**，因此 `QtFiberThread` 等单独退出也安全。不调用 `quit()` 会导致退出时卡死或崩溃。
 3. **所有 API 都在命名空间 `Coro` 下。** 先 `using namespace Coro;`。
 
 ## 何时使用
@@ -211,7 +211,8 @@ worker->quit(); delete worker;
 ## 调度与退出机制（简要）
 
 - **工作原理**：`QtFiberScheduler` 重写 `suspend_until`（无就绪协程时调用）：首次进入用 `std::call_once` 创建一个常驻泵协程（固定当前线程、worker 上下文、detach），它循环 `processEvents(AllEvents)` 分发 Qt 事件；`suspend_until` 自身委托基类 `FiberScheduler` 做真正的 cv 阻塞——因此空闲时线程真正睡眠、不满核空转。
-- **退出**：`Coro::quit()` 设全局退出标志 `FiberScheduler::s_exit_` → 各线程泵协程醒来看到标志、自行退出；`FiberThreadBlock::wait()` 返回前自动调 `FiberScheduler::stopCurrentThreadPump()` 设 `thread_local` 退出标志并短暂让出，确保 `~scheduler` 不挂死。`QtFiberThread::quit/析构 → block.close() → block.wait() 返回 → 自动停泵 → ~scheduler 干净` —— 无额外调用。
+- **退出**：`Coro::quit()` 先广播 `aboutToQuit` 并 `drainUntilIdle()` 排空（此时泵仍活，被唤醒协程能跑到终止）→ 再 `signalExit()` 置全局退出标志 `FiberScheduler::s_exit_`，各线程泵协程醒来看到标志自行退出 → 最后 `FibersPool::close()` 唤醒并 **join** 全部工作线程。`FiberThreadBlock::wait()` 返回前自动调 `FiberScheduler::stopCurrentThreadPump()` 设 `thread_local` 退出标志并短暂让出，确保 `~scheduler` 不挂死。`QtFiberThread::quit/析构 → block.close() → block.wait() 返回 → 自动停泵 → ~scheduler 干净` —— 无额外调用。
+- **为何 close() 要 join**：`FibersPool` 与 `FiberGlobalQueue` 都是 Meyers 单例，前者先构造、后者后构造，进程退出按逆序析构会先销毁 `FiberGlobalQueue`；工作线程 `worker()` 返回前其调度器仍会 `pick_next()` 访问该队列。`close()` 若只唤醒不 join，`quit()` 立即返回、`main()` 结束触发静态析构，未退出的工作线程访问已销毁队列 → use-after-free 崩溃。故 `close()` join 到工作线程全部退出。
 - **泵在 worker 上下文**：泵协程不是调度器 dispatcher，Qt 回调跑在 worker 协程上 → 回调里**可以安全做协程阻塞**(`await`/`msleep`/`get`)；不会在 dispatcher 上下文 yield 而崩溃。
 - **QTimer / socket 在 worker 上可用**：`QtFiberScheduler` 构造时创建 `QEventLoop` 成员，为本线程创建 Qt 事件派发器 → QTimer/socket 等 Qt 对象在工作线程上也能工作（泵协程负责分发）。
 
@@ -223,6 +224,7 @@ worker->quit(); delete worker;
 | 进程无法退出 / 退出崩溃 | 没调用 `Coro::quit()`。它会唤醒挂起协程、排空在途任务再退出。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
 | 运行中 `deleteLater` 迟迟不生效 | 协程调度期间 Qt 不派发 `DeferredDelete`，通常到 `quit()` 才处理。需要即时释放请用普通 `delete`。 |
 | 运行中改 `Affinity` 但协程未迁移线程 | 不受支持。请在创建协程时用 `Affinity` 指定线程归属，勿运行中反复 `setAffinity` 迁移。 |
+| 把 Qt socket/server 放进 `Affinity::shared()` 任务后偶发退出崩溃 | 带 parent 的 Qt 对象不能放共享亲和任务。共享协程会在任意工作线程运行，而 Qt 对象（含 socket notifier/timer）必须在所属线程访问。改用 `Affinity::fixed(...)` / `sticky()` 把操作 Qt 对象的协程绑定到确定线程（主线程或 `QtFiberThread`）。 |
 | 找不到 `coro(socket)` / `coro(server)` | 缺 `QT += network`，或未引入对应头（`await/corosocket.hpp` 等）或伞头 `await/coro.hpp`。 |
 | 链接报 ASan 运行时不兼容 | 测试 `.pro` 中保留 `-static-libasan`，去掉 `LIBS += -lasan`。 |
 | qmake 找不到 boost | 未按 ReadMe §2.2 将 boost 安装到 `/usr/local`，或未 `include(AsyncTask.pri)`。 |
@@ -235,6 +237,9 @@ worker->quit(); delete worker;
 - 在生产者 lambda 中捕获整个 `Awaitable` —— 应捕获 `a.channel()`（一个 `shared_ptr`），以避免引用环。
 - 按值拷贝通用 `Awaitable` —— 它是 move-only；请移动它。socket 方法返回的是
   `shared_ptr<Awaitable<T>>`，可直接交给 `await`/`await_for`/`generate`。
+- 把带 parent 的 Qt 对象（`QTcpSocket`/`QTcpServer` 等）放进 `Affinity::shared()`
+  任务 —— 违反 Qt 线程亲和、退出期会崩。操作 Qt 对象的协程用 `fixed(...)`/`sticky()`
+  绑定到确定线程。
 
 ## 参考
 

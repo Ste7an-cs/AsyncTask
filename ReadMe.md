@@ -176,7 +176,8 @@ Qt 对象保持 Qt 的线程亲和规则：**所有 QObject 方法都在该对�
 |---|---|
 | 主线程协程不执行 | 用 `QCoreApplication::exec()` 驱动了主循环。应改用 `Coro::exec()`（本框架用 fiber 调度器作主循环，Qt 事件由调度器泵；二者同线程互斥）。 |
 | 链接报 `Your application is linked against incompatible ASan runtimes` | 测试 `.pro` 里 `-static-libasan` 与 `LIBS += -lasan` 冲突，去掉 `-lasan`（保留 `-static-libasan`）。 |
-| 程序结束不退出 / 退出崩溃 | 确保调用 `Coro::quit()` 收尾（会唤醒挂起协程、排空在途任务再退出）。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
+| 程序结束不退出 / 退出崩溃 | 确保调用 `Coro::quit()` 收尾：它会广播 `aboutToQuit` 唤醒挂起协程、排空在途任务、停泵，并**关闭并 join 工作线程池**后再退出（join 保证工作线程不晚于全局单例存活，避免退出期访问已销毁的就绪队列而崩溃）。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
+| 把 Qt socket/server 等对象放到 `Affinity::shared()` 任务后偶发退出崩溃 | 带 parent 的 Qt 对象不能放在共享亲和任务上。共享协程可能在任意工作线程运行，而 Qt 对象（及其 socket notifier/timer 等）必须在所属线程访问。须操作 Qt 对象的协程请用 `Affinity::fixed(...)` / `sticky()` 绑定到确定线程（主线程或 `QtFiberThread`）。 |
 | `deleteLater` 迟迟不生效 | 调度期 Qt 不派发 `DeferredDelete`（见 `doc/需求文档.md` LIM-2），通常到 `quit()` 才处理；需要即时释放可显式 `delete`。 |
 | 运行中改线程亲和后未迁移到目标线程 | 不受支持（LIM-1）。线程归属请在协程创建时用 `Affinity` 指定，勿运行中反复 `setAffinity` 迁移。 |
 | qmake 报找不到 boost | 未按 2.2 安装 boost 到 `/usr/local`，或未在 `.pro` 中 `include(AsyncTask.pri)`。 |
