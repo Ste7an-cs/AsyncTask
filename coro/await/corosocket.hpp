@@ -15,9 +15,12 @@
 #include <QHostAddress>
 #include <QThread>
 
+#include <QCoreApplication>
+
 #include "awaitable.hpp"
 #include "detail/socketawait.hpp"
 #include "detail/socketerror.hpp"
+#include "detail/autodisconnect.hpp"
 
 namespace Coro {
 
@@ -158,75 +161,71 @@ public:
      * @note await_for() 超时不停止读取流，也不取消 Qt 信号订阅。
      */
     std::shared_ptr<Awaitable<QByteArray>> readAll(){
-        auto connections = detail::socket_connections();
-        auto awaitable = detail::socket_awaitable<QByteArray>(connections);
+        auto awaitable = std::make_shared<Awaitable<QByteArray>>();
+        auto channel = awaitable->channel();
+        auto scope = detail::make_auto_disconnect();
         QPointer<QAbstractSocket> socket = sock_;
 
-        auto drain = [awaitable](QAbstractSocket* current){
-            if(awaitable->channel()->is_closed()) return;
+        // 业务槽只捕获 channel（+scope 用于终止时整组断开），绝不捕获 awaitable。
+        auto drain = [channel](QAbstractSocket* current){
             if(current->bytesAvailable() > 0){
                 const QByteArray bytes = current->readAll();
-                if(!bytes.isEmpty()) awaitable->resolve(bytes);
+                if(!bytes.isEmpty()) channel->push(bytes);   // push 锁内自判 closed
             }
         };
+        auto closeStop = [channel, scope]{
+            channel->close();
+            scope->disconnectAll();
+        };
         if(socket){
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), &QIODevice::readyRead,
-                                 [awaitable, socket]{
-                    if(!awaitable->channel()->is_closed() && socket &&
-                       socket->bytesAvailable() > 0){
-                        const QByteArray bytes = socket->readAll();
-                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
-                    }
-                }));
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), &QAbstractSocket::disconnected,
-                                 [awaitable, connections, socket]{
-                    if(awaitable->channel()->is_closed()) return;
-                    if(socket && socket->bytesAvailable() > 0){
-                        const QByteArray bytes = socket->readAll();
-                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
-                    }
-                    awaitable->close();
-                    detail::cleanup_socket_connections(connections);
-                }));
-            detail::register_socket_connection(
-                connections,
-                detail::connect_socket_error(
-                    socket.data(), [awaitable, connections, socket](
-                                     QAbstractSocket::SocketError error){
-                    if(awaitable->channel()->is_closed()) return;
-                    if(socket && socket->bytesAvailable() > 0){
-                        const QByteArray bytes = socket->readAll();
-                        if(!bytes.isEmpty()) awaitable->resolve(bytes);
-                    }
-                    if(error == QAbstractSocket::RemoteHostClosedError){
-                        awaitable->close();
-                    }else{
-                        awaitable->close(detail::socket_error_code(error));
-                    }
-                    detail::cleanup_socket_connections(connections);
-                }));
+            scope->on(socket.data(), &QIODevice::readyRead, [channel, socket]{
+                if(socket && !channel->is_closed() && socket->bytesAvailable() > 0){
+                    const QByteArray bytes = socket->readAll();
+                    if(!bytes.isEmpty()) channel->push(bytes);
+                }
+            });
+            scope->on(socket.data(), &QAbstractSocket::disconnected,
+                      [channel, socket, scope, drain]{
+                if(channel->is_closed()) return;
+                if(socket) drain(socket.data());
+                channel->close();
+                scope->disconnectAll();
+            });
+            scope->add(detail::connect_socket_error(
+                socket.data(), [channel, socket, scope, drain](
+                                 QAbstractSocket::SocketError error){
+                if(channel->is_closed()) return;
+                if(socket) drain(socket.data());
+                if(error == QAbstractSocket::RemoteHostClosedError){
+                    channel->close();
+                }else{
+                    channel->close(detail::socket_error_code(error));
+                }
+                scope->disconnectAll();
+            }));
+            scope->on(socket.data(), &QObject::destroyed, closeStop);
+            if(auto app = QCoreApplication::instance()){
+                scope->on(app, &QObject::destroyed, closeStop);
+                scope->on(app, &QCoreApplication::aboutToQuit, closeStop);
+            }
         }
-        detail::bind_socket_lifecycle(socket, awaitable, connections);
-        if(!onSocketThread(socket, [awaitable, connections, drain](QAbstractSocket* current){
-            if(awaitable->channel()->is_closed()) return;
+        scope->untilExpired(awaitable);   // 句柄 close/析构 → 整组断开（修复核心）
+        if(!onSocketThread(socket, [channel, scope, drain](QAbstractSocket* current){
+            if(channel->is_closed()) return;
             drain(current);
             if(current->state() == QAbstractSocket::UnconnectedState){
                 const auto error = current->error();
                 if(error != QAbstractSocket::UnknownSocketError &&
                    error != QAbstractSocket::RemoteHostClosedError){
-                    awaitable->close(detail::socket_error_code(error));
+                    channel->close(detail::socket_error_code(error));
                 }else{
-                    awaitable->close();
+                    channel->close();
                 }
-                detail::cleanup_socket_connections(connections);
+                scope->disconnectAll();
             }
         })){
-            awaitable->close();
-            detail::cleanup_socket_connections(connections);
+            channel->close();
+            scope->disconnectAll();
         }
         return awaitable;
     }

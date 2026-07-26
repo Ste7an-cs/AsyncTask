@@ -15,9 +15,12 @@
 #include <QThread>
 #include <QTimer>
 
+#include <QCoreApplication>
+
 #include "awaitable.hpp"
 #include "detail/socketawait.hpp"
 #include "detail/socketerror.hpp"
+#include "detail/autodisconnect.hpp"
 
 namespace Coro {
 
@@ -78,52 +81,51 @@ public:
      *          连接超时；server 析构时会丢弃尚未消费的 queued 原始指针。
      */
     std::shared_ptr<Awaitable<QTcpSocket*>> nextConnection(){
-        auto connections = detail::socket_connections();
-        auto awaitable = detail::socket_awaitable<QTcpSocket*>(connections);
+        auto awaitable = std::make_shared<Awaitable<QTcpSocket*>>();
+        auto channel = awaitable->channel();
+        auto scope = detail::make_auto_disconnect();
         QPointer<QTcpServer> server = srv_;
 
-        auto drain = [awaitable](QTcpServer* current){
-            while(!awaitable->channel()->is_closed() &&
-                  current->hasPendingConnections()){
-                awaitable->resolve(current->nextPendingConnection());
+        auto drain = [channel](QTcpServer* current){
+            while(!channel->is_closed() && current->hasPendingConnections()){
+                channel->push(current->nextPendingConnection());
             }
         };
+        auto closeStop = [channel, scope]{
+            channel->close();
+            scope->disconnectAll();
+        };
         if(server){
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(server.data(), &QTcpServer::newConnection,
-                                 [awaitable, server]{
-                    while(!awaitable->channel()->is_closed() && server &&
-                          server->hasPendingConnections()){
-                        awaitable->resolve(server->nextPendingConnection());
-                    }
-                }));
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(server.data(), &QTcpServer::acceptError,
-                                 [awaitable, connections](
-                                     QAbstractSocket::SocketError error){
-                    awaitable->close(detail::socket_error_code(error));
-                    detail::cleanup_socket_connections(connections);
-                }));
-        }
-        auto channel = awaitable->channel();
-        if(server){
+            // 独立 raw 连接(不入 scope)：server 析构时丢弃悬空的排队指针。必须独立于
+            // scope，因为消费者可能先 close() 掉 awaitable(触发整组断开)再 delete server，
+            // 此时仍需清掉已排队但即将悬空的 QTcpSocket*。随 server 析构自动移除、只捕 channel。
             QObject::connect(server.data(), &QObject::destroyed, [channel]{
                 channel->discard_pending();
             });
-        }
-        detail::bind_socket_lifecycle(server, awaitable, connections);
-        if(!onServerThread(server, [awaitable, connections, drain, server](
-                                   QTcpServer* current){
-            if(awaitable->channel()->is_closed()){
-                detail::cleanup_socket_connections(connections);
-                return;
+            scope->on(server.data(), &QTcpServer::newConnection,
+                      [channel, server, drain]{
+                if(server) drain(server.data());
+            });
+            scope->on(server.data(), &QTcpServer::acceptError,
+                      [channel, scope](QAbstractSocket::SocketError error){
+                if(channel->is_closed()) return;
+                channel->close(detail::socket_error_code(error));
+                scope->disconnectAll();
+            });
+            scope->on(server.data(), &QObject::destroyed, closeStop);
+            if(auto app = QCoreApplication::instance()){
+                scope->on(app, &QObject::destroyed, closeStop);
+                scope->on(app, &QCoreApplication::aboutToQuit, closeStop);
             }
+        }
+        scope->untilExpired(awaitable);
+        if(!onServerThread(server, [channel, scope, drain, server](QTcpServer* current){
+            if(channel->is_closed()) return;
+            // 10 ms 定时器仅用于检测未发停止信号的 close()，不是连接超时。
             auto timer = new QTimer(current);
             timer->setInterval(10);
             QPointer<QTimer> timerGuard(timer);
-            detail::register_socket_cleanup(connections, [timerGuard]{
+            scope->addCleanup([timerGuard]{
                 if(!timerGuard) return;
                 if(timerGuard->thread() == QThread::currentThread()){
                     timerGuard->stop();
@@ -137,28 +139,22 @@ public:
                     }
                 }, Qt::QueuedConnection);
             });
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(timer, &QTimer::timeout,
-                                 [awaitable, connections, server, timerGuard]{
-                    if(awaitable->channel()->is_closed()){
-                        detail::cleanup_socket_connections(connections);
-                        return;
-                    }
-                    if(!server || !server->isListening()){
-                        awaitable->close();
-                        detail::cleanup_socket_connections(connections);
-                    }
-                }));
+            scope->on(timer, &QTimer::timeout, [channel, scope, server]{
+                if(channel->is_closed()) return;
+                if(!server || !server->isListening()){
+                    channel->close();
+                    scope->disconnectAll();
+                }
+            });
             timer->start();
             drain(current);
             if(!current->isListening()){
-                awaitable->close();
-                detail::cleanup_socket_connections(connections);
+                channel->close();
+                scope->disconnectAll();
             }
         })){
-            awaitable->close();
-            detail::cleanup_socket_connections(connections);
+            channel->close();
+            scope->disconnectAll();
         }
         return awaitable;
     }

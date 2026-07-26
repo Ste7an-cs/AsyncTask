@@ -14,9 +14,12 @@
 #include <QThread>
 #include <QUdpSocket>
 
+#include <QCoreApplication>
+
 #include "awaitable.hpp"
 #include "detail/socketawait.hpp"
 #include "detail/socketerror.hpp"
+#include "detail/autodisconnect.hpp"
 
 namespace Coro {
 
@@ -71,63 +74,53 @@ public:
      *         socket 销毁时也正常关闭；传输错误使用 qt.socket category 终止流。
      */
     std::shared_ptr<Awaitable<QNetworkDatagram>> receiveDatagram(){
-        auto connections = detail::socket_connections();
-        auto awaitable = detail::socket_awaitable<QNetworkDatagram>(connections);
+        auto awaitable = std::make_shared<Awaitable<QNetworkDatagram>>();
+        auto channel = awaitable->channel();
+        auto scope = detail::make_auto_disconnect();
         QPointer<QUdpSocket> socket = socket_;
 
-        auto drain = [awaitable](QUdpSocket* current){
-            while(!awaitable->channel()->is_closed() &&
-                  current->hasPendingDatagrams()){
+        auto drain = [channel](QUdpSocket* current){
+            while(!channel->is_closed() && current->hasPendingDatagrams()){
                 QNetworkDatagram datagram = current->receiveDatagram();
-                if(datagram.isValid()) awaitable->resolve(datagram);
+                if(datagram.isValid()) channel->push(datagram);
             }
         };
+        auto closeStop = [channel, scope]{
+            channel->close();
+            scope->disconnectAll();
+        };
         if(socket){
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), &QIODevice::readyRead,
-                                 [awaitable, socket]{
-                    while(!awaitable->channel()->is_closed() && socket &&
-                          socket->hasPendingDatagrams()){
-                        QNetworkDatagram datagram = socket->receiveDatagram();
-                        if(datagram.isValid()) awaitable->resolve(datagram);
-                    }
-                }));
-            detail::register_socket_connection(
-                connections,
-                detail::connect_socket_error(
-                    socket.data(), [awaitable, connections](
-                                     QAbstractSocket::SocketError error){
-                    awaitable->close(detail::socket_error_code(error));
-                    detail::cleanup_socket_connections(connections);
-                }));
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), &QAbstractSocket::stateChanged,
-                                 [awaitable, connections](
-                                     QAbstractSocket::SocketState state){
-                    if(state == QAbstractSocket::UnconnectedState){
-                        awaitable->close();
-                        detail::cleanup_socket_connections(connections);
-                    }
-                }));
-        }
-        detail::bind_socket_lifecycle(socket, awaitable, connections);
-        if(!onSocketThread(socket, [awaitable, connections, drain = std::move(drain)](
-                                  QUdpSocket* current){
-            if(awaitable->channel()->is_closed()){
-                detail::cleanup_socket_connections(connections);
-                return;
+            scope->on(socket.data(), &QIODevice::readyRead, [channel, socket, drain]{
+                if(socket) drain(socket.data());
+            });
+            scope->add(detail::connect_socket_error(
+                socket.data(), [channel, scope](QAbstractSocket::SocketError error){
+                if(channel->is_closed()) return;
+                channel->close(detail::socket_error_code(error));
+                scope->disconnectAll();
+            }));
+            scope->on(socket.data(), &QAbstractSocket::stateChanged,
+                      [scope, closeStop](QAbstractSocket::SocketState state){
+                if(state == QAbstractSocket::UnconnectedState) closeStop();
+            });
+            scope->on(socket.data(), &QObject::destroyed, closeStop);
+            if(auto app = QCoreApplication::instance()){
+                scope->on(app, &QObject::destroyed, closeStop);
+                scope->on(app, &QCoreApplication::aboutToQuit, closeStop);
             }
+        }
+        scope->untilExpired(awaitable);
+        if(!onSocketThread(socket, [channel, scope, drain](QUdpSocket* current){
+            if(channel->is_closed()) return;
             if(current->state() == QAbstractSocket::UnconnectedState){
-                awaitable->close();
-                detail::cleanup_socket_connections(connections);
+                channel->close();
+                scope->disconnectAll();
                 return;
             }
             drain(current);
         })){
-            awaitable->close();
-            detail::cleanup_socket_connections(connections);
+            channel->close();
+            scope->disconnectAll();
         }
         return awaitable;
     }
