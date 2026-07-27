@@ -80,56 +80,59 @@ class CoroAbstractSocket{
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
                                                    Action action,
                                                    bool peerCloseCompletes = false){
-        auto connections = detail::socket_connections();
-        auto awaitable = detail::socket_awaitable<void>(connections);
+        auto awaitable = std::make_shared<Awaitable<void>>();
+        auto channel = awaitable->channel();
+        auto scope = detail::make_auto_disconnect();
         QPointer<QAbstractSocket> socket = sock_;
 
+        auto succeed = [channel, scope]{
+            channel->push(1);          // resolve void
+            channel->close();
+            scope->disconnectAll();
+        };
+        auto closeStop = [channel, scope]{
+            channel->close();
+            scope->disconnectAll();
+        };
         if(socket){
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), signal,
-                                 [awaitable, connections](auto...){
-                    awaitable->resolve();
-                    awaitable->close();
-                    detail::cleanup_socket_connections(connections);
-                }));
-            detail::register_socket_connection(
-                connections,
-                detail::connect_socket_error(
-                    socket.data(), [awaitable, connections, socket,
-                                    peerCloseCompletes](QAbstractSocket::SocketError error){
-                    if(awaitable->channel()->is_closed()) return;
-                    if(peerCloseCompletes &&
-                       error == QAbstractSocket::RemoteHostClosedError){
-                        if(socket && socket->state() == QAbstractSocket::UnconnectedState){
-                            awaitable->resolve();
-                            awaitable->close();
-                        }
-                        return;
+            scope->on(socket.data(), signal, [succeed](auto...){ succeed(); });
+            scope->add(detail::connect_socket_error(
+                socket.data(), [channel, scope, socket, peerCloseCompletes, succeed](
+                                 QAbstractSocket::SocketError error){
+                if(channel->is_closed()) return;
+                if(peerCloseCompletes &&
+                   error == QAbstractSocket::RemoteHostClosedError){
+                    if(socket && socket->state() == QAbstractSocket::UnconnectedState){
+                        succeed();
                     }
-                    awaitable->close(detail::socket_error_code(error));
-                    detail::cleanup_socket_connections(connections);
-                }));
+                    return;
+                }
+                channel->close(detail::socket_error_code(error));
+                scope->disconnectAll();
+            }));
+            scope->on(socket.data(), &QObject::destroyed, closeStop);
+            if(auto app = QCoreApplication::instance()){
+                scope->on(app, &QObject::destroyed, closeStop);
+                scope->on(app, &QCoreApplication::aboutToQuit, closeStop);
+            }
         }
-        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        scope->untilExpired(awaitable);
         if(!onSocketThread(socket,
-                       [awaitable, connections, check = std::move(check),
+                       [channel, scope, succeed, check = std::move(check),
                         action = std::move(action)](
                            QAbstractSocket* current) mutable {
-            if(awaitable->channel()->is_closed()) return;
+            if(channel->is_closed()) return;
             action(current);
             if(check(current)){
-                awaitable->resolve();
-                awaitable->close();
-                detail::cleanup_socket_connections(connections);
+                succeed();
             }else if(current->state() == QAbstractSocket::UnconnectedState &&
                      current->error() != QAbstractSocket::UnknownSocketError){
-                awaitable->close(detail::socket_error_code(current->error()));
-                detail::cleanup_socket_connections(connections);
+                channel->close(detail::socket_error_code(current->error()));
+                scope->disconnectAll();
             }
         })){
-            awaitable->close();
-            detail::cleanup_socket_connections(connections);
+            channel->close();
+            scope->disconnectAll();
         }
         return awaitable;
     }

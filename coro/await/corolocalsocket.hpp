@@ -81,63 +81,65 @@ class CoroLocalSocket{
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
                                                    Action action,
                                                    bool peerCloseCompletes = false){
-        auto connections = detail::socket_connections();
-        auto awaitable = detail::socket_awaitable<void>(connections);
+        auto awaitable = std::make_shared<Awaitable<void>>();
+        auto channel = awaitable->channel();
+        auto scope = detail::make_auto_disconnect();
         QPointer<QLocalSocket> socket = local_;
 
+        auto succeed = [channel, scope]{
+            channel->push(1);          // resolve void
+            channel->close();
+            scope->disconnectAll();
+        };
+        auto closeStop = [channel, scope]{
+            channel->close();
+            scope->disconnectAll();
+        };
         if(socket){
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), signal,
-                                 [awaitable, connections](auto...){
-                    awaitable->resolve();
-                    awaitable->close();
-                    detail::cleanup_socket_connections(connections);
-                }));
-            detail::register_socket_connection(
-                connections,
-                detail::connect_local_socket_error(
-                    socket.data(), [awaitable, connections, socket,
-                                    peerCloseCompletes](
-                                     QLocalSocket::LocalSocketError error){
-                    if(awaitable->channel()->is_closed()) return;
-                    if(peerCloseCompletes && error == QLocalSocket::PeerClosedError){
-                        if(socket && socket->state() == QLocalSocket::UnconnectedState){
-                            awaitable->resolve();
-                            awaitable->close();
-                        }
-                        return;
-                    }else if(error == QLocalSocket::PeerClosedError){
-                        awaitable->close();
-                    }else{
-                        awaitable->close(detail::local_socket_error_code(error));
+            scope->on(socket.data(), signal, [succeed](auto...){ succeed(); });
+            scope->add(detail::connect_local_socket_error(
+                socket.data(), [channel, scope, socket, peerCloseCompletes, succeed](
+                                 QLocalSocket::LocalSocketError error){
+                if(channel->is_closed()) return;
+                if(peerCloseCompletes && error == QLocalSocket::PeerClosedError){
+                    if(socket && socket->state() == QLocalSocket::UnconnectedState){
+                        succeed();
                     }
-                    detail::cleanup_socket_connections(connections);
-                }));
+                    return;
+                }else if(error == QLocalSocket::PeerClosedError){
+                    channel->close();
+                }else{
+                    channel->close(detail::local_socket_error_code(error));
+                }
+                scope->disconnectAll();
+            }));
+            scope->on(socket.data(), &QObject::destroyed, closeStop);
+            if(auto app = QCoreApplication::instance()){
+                scope->on(app, &QObject::destroyed, closeStop);
+                scope->on(app, &QCoreApplication::aboutToQuit, closeStop);
+            }
         }
-        detail::bind_socket_lifecycle(socket, awaitable, connections);
+        scope->untilExpired(awaitable);
         if(!onSocketThread(socket,
-                       [awaitable, connections, check = std::move(check),
+                       [channel, scope, succeed, check = std::move(check),
                         action = std::move(action)](QLocalSocket* current) mutable {
-            if(awaitable->channel()->is_closed()) return;
+            if(channel->is_closed()) return;
             action(current);
             if(check(current)){
-                awaitable->resolve();
-                awaitable->close();
-                detail::cleanup_socket_connections(connections);
+                succeed();
             }else if(current->state() == QLocalSocket::UnconnectedState &&
                      current->error() != QLocalSocket::UnknownSocketError){
                 const auto error = current->error();
                 if(error == QLocalSocket::PeerClosedError){
-                    awaitable->close();
+                    channel->close();
                 }else{
-                    awaitable->close(detail::local_socket_error_code(error));
+                    channel->close(detail::local_socket_error_code(error));
                 }
-                detail::cleanup_socket_connections(connections);
+                scope->disconnectAll();
             }
         })){
-            awaitable->close();
-            detail::cleanup_socket_connections(connections);
+            channel->close();
+            scope->disconnectAll();
         }
         return awaitable;
     }

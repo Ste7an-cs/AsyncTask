@@ -10,6 +10,7 @@
 #include "detail/result.hpp"
 #include "await/coro.hpp"
 #include "await/detail/socketawait.hpp"
+#include "await/detail/autodisconnect.hpp"
 #include "await/detail/socketerror.hpp"
 #include <QBuffer>
 #include <QAbstractSocket>
@@ -44,6 +45,7 @@ class SigObject : public QObject
 public:
     SigObject():QObject(nullptr){}
     void fire(){ emit sig1(); }
+    void fire2(int v){ emit sig2(v, QString()); }
     void run(){
         QTimer::singleShot(500, this, [this](){
             emit this->sig1();
@@ -173,9 +175,9 @@ private slots:
     void test_case_shared_generator_terminal_timeout();
     void test_case_shared_awaitable_void();
     void test_case_socket_error_conversion();
-    void test_case_socket_awaitable_lifetime();
-    void test_case_socket_connection_cleanup();
-    void test_case_application_lifetime_cleanup();
+    void test_case_autodisconnect_until_expired();
+    void test_case_autodisconnect_idempotent_late();
+    void test_case_autodisconnect_until_signal();
     void test_case_generator();
     void test_case_signalawait();
     void test_case_signal_generate();
@@ -471,120 +473,93 @@ void TestFiberAwait::test_case_ssl_error_conversion()
     QVERIFY(!QString::fromStdString(sslError.message()).isEmpty());
 }
 
-/// @brief 验证 socket 对象销毁会关闭 awaitable、断开连接并释放引用。
-void TestFiberAwait::test_case_socket_awaitable_lifetime()
+/// @brief 验证 untilExpired：返回句柄一旦析构即整组断开，且句柄不被连接钉住（无引用环）。
+void TestFiberAwait::test_case_autodisconnect_until_expired()
 {
     QPointer<SigObject> sender = new SigObject;
-    auto connections = Coro::detail::socket_connections();
-    auto awaitable = Coro::detail::socket_awaitable<int>(connections);
-    auto channel = awaitable->channel();
+    auto awaitable = std::make_shared<Coro::Awaitable<int>>();
     std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
+    auto scope = Coro::detail::make_auto_disconnect();
+    int calls = 0;
 
-    Coro::detail::register_socket_connection(
-        connections,
-        QObject::connect(sender, &SigObject::sig1,
-                         [awaitable]{ awaitable->resolve(1); }));
-    Coro::detail::bind_socket_lifecycle(sender, awaitable, connections);
-    awaitable.reset();
+    // 业务槽只捕 channel/计数，绝不捕 awaitable。
+    scope->on(sender.data(), &SigObject::sig1, [&calls]{ ++calls; });
+    scope->untilExpired(awaitable);
 
-    QVERIFY(!observed.expired());
-    delete sender.data();
-    QVERIFY(sender.isNull());
-    QVERIFY(channel->is_closed());
-    QCOMPARE(channel->close_error(), std::make_error_code(std::errc::no_message));
-    QVERIFY(observed.expired());
-}
-
-/// @brief 验证 socket 连接和清理回调幂等，且清理后不会再保留 awaitable。
-/// @details 已清理的注册表会立即 disconnect 晚注册的 connection，并立即执行
-/// 晚注册的 cleanup，从而防止延迟信号访问已释放状态。
-void TestFiberAwait::test_case_socket_connection_cleanup()
-{
-    QPointer<SigObject> sender = new SigObject;
-    auto connections = Coro::detail::socket_connections();
-    auto awaitable = Coro::detail::socket_awaitable<int>(connections);
-    std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
-    int firstCalls = 0;
-    int secondCalls = 0;
-    int firstCleanupCalls = 0;
-    int secondCleanupCalls = 0;
-
-    Coro::detail::register_socket_cleanup(
-        connections, [&firstCleanupCalls]{ ++firstCleanupCalls; });
-    Coro::detail::register_socket_cleanup(
-        connections, [&secondCleanupCalls]{ ++secondCleanupCalls; });
-
-    Coro::detail::register_socket_connection(
-        connections,
-        QObject::connect(sender, &SigObject::sig1,
-                         [awaitable, &firstCalls]{
-        ++firstCalls;
-        awaitable->resolve(1);
-    }));
-    Coro::detail::register_socket_connection(
-        connections,
-        QObject::connect(sender, &SigObject::sig1,
-                         [awaitable, &secondCalls]{
-        ++secondCalls;
-        awaitable->resolve(2);
-    }));
-
-    Coro::detail::cleanup_socket_connections(connections);
-    Coro::detail::cleanup_socket_connections(connections);
-    QCOMPARE(firstCleanupCalls, 1);
-    QCOMPARE(secondCleanupCalls, 1);
-    awaitable.reset();
-    QVERIFY(observed.expired());
     sender->fire();
-    QCOMPARE(firstCalls, 0);
-    QCOMPARE(secondCalls, 0);
+    QCOMPARE(calls, 1);                 // 连接生效
 
-    auto lateAwaitable = Coro::detail::socket_awaitable<int>(connections);
-    std::weak_ptr<Coro::Awaitable<int>> lateObserved = lateAwaitable;
-    int lateCalls = 0;
-    Coro::detail::register_socket_connection(
-        connections,
-        QObject::connect(sender, &SigObject::sig1,
-                         [lateAwaitable, &lateCalls]{
-        ++lateCalls;
-        lateAwaitable->resolve(3);
-    }));
-    lateAwaitable.reset();
-    QVERIFY(lateObserved.expired());
-    int lateCleanupCalls = 0;
-    Coro::detail::register_socket_cleanup(
-        connections, [&lateCleanupCalls]{ ++lateCleanupCalls; });
-    QCOMPARE(lateCleanupCalls, 1);
+    awaitable.reset();                  // 丢弃返回句柄
+    QVERIFY(observed.expired());        // 立即释放：连接未持有 awaitable，无引用环
     sender->fire();
-    QCOMPARE(lateCalls, 0);
+    QCOMPARE(calls, 1);                 // untilExpired 已整组断开，不再触发
     delete sender.data();
 }
 
-/// @brief 验证应用生命周期结束也会关闭 socket awaitable 并释放资源。
-void TestFiberAwait::test_case_application_lifetime_cleanup()
+/// @brief 验证 disconnectAll 幂等；清理后晚注册的连接立即断开、晚注册的 cleanup 立即执行。
+void TestFiberAwait::test_case_autodisconnect_idempotent_late()
 {
     QPointer<SigObject> sender = new SigObject;
-    QPointer<QObject> applicationLifetime = new QObject;
-    auto connections = Coro::detail::socket_connections();
-    auto awaitable = Coro::detail::socket_awaitable<int>(connections);
-    auto channel = awaitable->channel();
-    std::weak_ptr<Coro::Awaitable<int>> observed = awaitable;
+    auto scope = Coro::detail::make_auto_disconnect();
+    int calls = 0, cleanup1 = 0, cleanup2 = 0;
 
-    Coro::detail::register_socket_connection(
-        connections,
-        QObject::connect(sender, &SigObject::sig1,
-                         [awaitable]{ awaitable->resolve(1); }));
-    Coro::detail::bind_socket_lifecycle(sender, awaitable, connections,
-                                        applicationLifetime);
-    awaitable.reset();
+    scope->addCleanup([&cleanup1]{ ++cleanup1; });
+    scope->addCleanup([&cleanup2]{ ++cleanup2; });
+    scope->on(sender.data(), &SigObject::sig1, [&calls]{ ++calls; });
 
-    QVERIFY(!observed.expired());
-    delete applicationLifetime.data();
-    QVERIFY(applicationLifetime.isNull());
-    QVERIFY(channel->is_closed());
-    QCOMPARE(channel->close_error(), std::make_error_code(std::errc::no_message));
-    QVERIFY(observed.expired());
+    scope->disconnectAll();
+    scope->disconnectAll();             // 幂等
+    QCOMPARE(cleanup1, 1);
+    QCOMPARE(cleanup2, 1);
+    sender->fire();
+    QCOMPARE(calls, 0);                 // 已断开
+
+    int lateCalls = 0, lateCleanup = 0;
+    scope->on(sender.data(), &SigObject::sig1, [&lateCalls]{ ++lateCalls; });
+    scope->addCleanup([&lateCleanup]{ ++lateCleanup; });
+    QCOMPARE(lateCleanup, 1);           // 清理后 addCleanup 立即执行
+    sender->fire();
+    QCOMPARE(lateCalls, 0);             // 清理后 on 的连接立即断开
     delete sender.data();
+}
+
+/// @brief 验证 untilSignal（信号 / 信号+判断函数）触发时整组断开。
+void TestFiberAwait::test_case_autodisconnect_until_signal()
+{
+    // 纯信号触发断开
+    {
+        QPointer<SigObject> data = new SigObject;
+        QPointer<SigObject> trigger = new SigObject;
+        auto scope = Coro::detail::make_auto_disconnect();
+        int calls = 0;
+        scope->on(data.data(), &SigObject::sig1, [&calls]{ ++calls; });
+        scope->untilSignal(trigger.data(), &SigObject::sig1);
+        data->fire();
+        QCOMPARE(calls, 1);
+        trigger->fire();                // 触发整组断开
+        data->fire();
+        QCOMPARE(calls, 1);
+        delete data.data();
+        delete trigger.data();
+    }
+    // 信号 + 判断函数：仅当谓词成立才断开
+    {
+        QPointer<SigObject> data = new SigObject;
+        QPointer<SigObject> trigger = new SigObject;
+        auto scope = Coro::detail::make_auto_disconnect();
+        int calls = 0;
+        scope->on(data.data(), &SigObject::sig1, [&calls]{ ++calls; });
+        scope->untilSignal(trigger.data(), &SigObject::sig2,
+                           [](int v, const QString&){ return v >= 10; });
+        trigger->fire2(1);              // 谓词不成立，不断开
+        data->fire();
+        QCOMPARE(calls, 1);
+        trigger->fire2(10);             // 谓词成立，整组断开
+        data->fire();
+        QCOMPARE(calls, 1);
+        delete data.data();
+        delete trigger.data();
+    }
 }
 
 void TestFiberAwait::test_case_generator()

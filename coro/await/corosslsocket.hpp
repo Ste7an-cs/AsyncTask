@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <utility>
+#include <QCoreApplication>
 #include <QObject>
 #include <QPointer>
 #include <QSslSocket>
@@ -16,6 +17,7 @@
 #include "corosocket.hpp"
 #include "detail/socketawait.hpp"
 #include "detail/socketerror.hpp"
+#include "detail/autodisconnect.hpp"
 
 namespace Coro {
 
@@ -70,65 +72,65 @@ class CoroSslSocket : public CoroAbstractSocket {
      */
     template<typename Action>
     std::shared_ptr<Awaitable<void>> waitForEncrypted(Action action){
-        auto connections = detail::socket_connections();
-        auto awaitable = detail::socket_awaitable<void>(connections);
+        auto awaitable = std::make_shared<Awaitable<void>>();
+        auto channel = awaitable->channel();
+        auto scope = detail::make_auto_disconnect();
         QPointer<QSslSocket> socket = socket_;
 
+        auto succeed = [channel, scope]{
+            channel->push(1);          // resolve void
+            channel->close();
+            scope->disconnectAll();
+        };
+        auto closeStop = [channel, scope]{
+            channel->close();
+            scope->disconnectAll();
+        };
         if(socket){
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), &QSslSocket::encrypted,
-                                 [awaitable, connections]{
-                    awaitable->resolve();
-                    awaitable->close();
-                    detail::cleanup_socket_connections(connections);
-                }));
-            detail::register_socket_connection(
-                connections,
-                detail::connect_socket_error(
-                    socket.data(), [awaitable, connections](
-                                     QAbstractSocket::SocketError error){
-                    awaitable->close(detail::socket_error_code(error));
-                    detail::cleanup_socket_connections(connections);
-                }));
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(
-                    socket.data(),
-                    static_cast<void (QSslSocket::*)(const QList<QSslError>&)>(
-                        &QSslSocket::sslErrors),
-                                 [awaitable, connections](
-                                     const QList<QSslError>& errors){
-                    if(!errors.isEmpty()){
-                        awaitable->close(detail::ssl_error_code(errors.first().error()));
-                        detail::cleanup_socket_connections(connections);
-                    }
-                }));
-            detail::register_socket_connection(
-                connections,
-                QObject::connect(socket.data(), &QSslSocket::peerVerifyError,
-                                 [awaitable, connections](const QSslError& error){
-                    awaitable->close(detail::ssl_error_code(error.error()));
-                    detail::cleanup_socket_connections(connections);
-                }));
+            scope->on(socket.data(), &QSslSocket::encrypted, [succeed]{ succeed(); });
+            scope->add(detail::connect_socket_error(
+                socket.data(), [channel, scope](QAbstractSocket::SocketError error){
+                if(channel->is_closed()) return;
+                channel->close(detail::socket_error_code(error));
+                scope->disconnectAll();
+            }));
+            scope->on(socket.data(),
+                      static_cast<void (QSslSocket::*)(const QList<QSslError>&)>(
+                          &QSslSocket::sslErrors),
+                      [channel, scope](const QList<QSslError>& errors){
+                if(channel->is_closed()) return;
+                if(!errors.isEmpty()){
+                    channel->close(detail::ssl_error_code(errors.first().error()));
+                    scope->disconnectAll();
+                }
+            });
+            scope->on(socket.data(), &QSslSocket::peerVerifyError,
+                      [channel, scope](const QSslError& error){
+                if(channel->is_closed()) return;
+                channel->close(detail::ssl_error_code(error.error()));
+                scope->disconnectAll();
+            });
+            scope->on(socket.data(), &QObject::destroyed, closeStop);
+            if(auto app = QCoreApplication::instance()){
+                scope->on(app, &QObject::destroyed, closeStop);
+                scope->on(app, &QCoreApplication::aboutToQuit, closeStop);
+            }
         }
-        detail::bind_socket_lifecycle(socket, awaitable, connections);
-        if(!onSocketThread(socket, [awaitable, connections, action = std::move(action)](
+        scope->untilExpired(awaitable);
+        if(!onSocketThread(socket, [channel, scope, succeed, action = std::move(action)](
                                    QSslSocket* current) mutable {
-            if(awaitable->channel()->is_closed()) return;
+            if(channel->is_closed()) return;
             action(current);
             if(current->isEncrypted()){
-                awaitable->resolve();
-                awaitable->close();
-                detail::cleanup_socket_connections(connections);
+                succeed();
             }else if(current->state() == QAbstractSocket::UnconnectedState &&
                      current->error() != QAbstractSocket::UnknownSocketError){
-                awaitable->close(detail::socket_error_code(current->error()));
-                detail::cleanup_socket_connections(connections);
+                channel->close(detail::socket_error_code(current->error()));
+                scope->disconnectAll();
             }
         })){
-            awaitable->close();
-            detail::cleanup_socket_connections(connections);
+            channel->close();
+            scope->disconnectAll();
         }
         return awaitable;
     }
