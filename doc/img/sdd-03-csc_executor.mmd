@@ -1,0 +1,23 @@
+classDiagram
+    class FibersPool {
+        +instance() FibersPool&$
+        +close()
+        -tds_ vector~thread~
+        -block_ FiberThreadBlock
+        -worker()
+    }
+    class FiberThreadBlock {
+        +wait()
+        +close()
+        +isClosed() bool
+    }
+    class QtFiberThread {
+        +run()
+        +quit()
+        -block FiberThreadBlock
+    }
+    QThread <|-- QtFiberThread
+    FibersPool *-- FiberThreadBlock
+    QtFiberThread *-- FiberThreadBlock
+    FibersPool ..> QtFiberScheduler : 每线程安装
+    QtFiberThread ..> QtLocalFiberScheduler : 安装

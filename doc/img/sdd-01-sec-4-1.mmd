@@ -1,0 +1,40 @@
+flowchart TB
+    subgraph AWAIT["CSC_AWAIT await 层"]
+        Awaitable["Awaitable&lt;T&gt;"]
+        Generator["Generator&lt;T&gt;"]
+        coro["coro() 工厂 + Coro* 包装器"]
+    end
+    subgraph TASK["CSC_TASK task 层"]
+        FiberTask["FiberTask&lt;T&gt;"]
+        FiberApplication
+    end
+    subgraph EXECUTOR["CSC_EXECUTOR executor 层"]
+        FibersPool
+        QtFiberThread
+        FiberThreadBlock
+    end
+    subgraph SCHEDULER["CSC_SCHEDULER scheduler 层"]
+        FiberScheduler
+        QtFiberScheduler
+        FiberGlobalQueue
+        MetaContext
+    end
+    subgraph DETAIL["CSC_DETAIL detail 层"]
+        Result["Result&lt;T,E&gt;"]
+        FiberChannel["FiberChannel&lt;T&gt;"]
+        launch["launch_properties()"]
+    end
+
+    coro --> Awaitable
+    Generator --> Awaitable
+    Awaitable --> FiberChannel
+    coro -.退出广播.-> FiberApplication
+    FiberTask --> Result
+    FiberTask --> launch
+    FiberApplication --> FibersPool
+    launch --> FiberScheduler
+    FibersPool --> QtFiberScheduler
+    QtFiberScheduler --> FiberScheduler
+    FiberScheduler --> FiberGlobalQueue
+    FiberScheduler --> MetaContext
+    SCHEDULER -.-> boost["boost::fiber 有栈协程"]

@@ -1,0 +1,12 @@
+flowchart LR
+    User["用户代码 / 业务协程"]
+    Src["Qt 异步来源<br/>信号 / socket / QIODevice / future"]
+    Rt["boost::fiber 运行时"]
+    Core(("AsyncTask<br/>协程异步框架"))
+
+    User -->|"fn + Priority + Affinity"| Core
+    Core -->|"FiberTask / Result / Awaitable"| User
+    Src -->|"信号 / 到达数据 / 就绪事件"| Core
+    Core -->|"connect / read / write"| Src
+    Core -->|"创建 / 让出 / 恢复 fiber"| Rt
+    Rt -->|"上下文切换 / 运行协程"| Core

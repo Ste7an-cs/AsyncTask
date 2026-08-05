@@ -1,0 +1,68 @@
+classDiagram
+    class Priority {
+        <<enum>>
+        Low
+        Normal
+        High
+    }
+    class AffinityMode {
+        <<enum>>
+        Shared
+        Sticky
+        FixedId
+    }
+    class Affinity {
+        +AffinityMode mode
+        +optional~thread_id~ fixed_id
+        +shared() Affinity$
+        +sticky() Affinity$
+        +fixed(id) Affinity$
+    }
+    class MetaContext {
+        -Priority priority_
+        -Affinity affinity_
+        -string name_
+        +setPriority(p)
+        +setAffinity(a)
+        +priority() Priority
+        +affinity() Affinity
+    }
+    class FiberScheduler {
+        +awakened(ctx, props)
+        +pick_next() context*
+        +has_ready_fibers() bool
+        +suspend_until(tp)
+        +property_change(ctx, props)
+        +signalExit()$
+        +stopCurrentThreadPump()$
+        #global_mtx$ mutex
+        -main_queue_
+        -s_exit_$ atomic_bool
+        -t_stop_$ thread_local atomic_bool
+    }
+    class QtFiberScheduler {
+        +suspend_until(tp)
+        -eventloop QEventLoop
+        -pump_once_ once_flag
+    }
+    class QtLocalFiberScheduler {
+        +pick_next() context*
+    }
+    class FiberGlobalQueue {
+        +instance() FiberGlobalQueue*$
+        +emplace_back(meta)
+        +pop_front_affinity(affine) optional~MetaContext~
+        +remove(ctx)
+        -buckets_
+        -index_
+    }
+
+    fiber_properties <|-- MetaContext
+    MetaContext o-- Priority
+    MetaContext o-- Affinity
+    Affinity o-- AffinityMode
+    algorithm_with_properties <|-- FiberScheduler
+    FiberScheduler <|-- QtFiberScheduler
+    QtFiberScheduler <|-- QtLocalFiberScheduler
+    FiberScheduler ..> FiberGlobalQueue : 使用
+    FiberGlobalQueue *-- MetaContext : 按 Affinity 分桶

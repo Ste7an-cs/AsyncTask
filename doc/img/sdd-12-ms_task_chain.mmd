@@ -1,0 +1,20 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant T0 as makeTask 协程
+    participant T1 as then 协程
+    participant SS as SharedState D3
+
+    U->>T0: makeTask(fn0) → add_nodes(pending_cnt++)
+    U->>T1: .then(fn1) → add_nodes(pending_cnt++)
+    U->>SS: .on_finally(cb) 登记到 finally_cbs
+    T0->>T0: 运行 fn0，set_value(Result)
+    T0->>SS: done_nodes(pending_cnt--)
+    T1->>SS: 启动前查 is_runnable
+    alt 未取消且前驱有值
+        T1->>T1: 以 fn0 结果为入参运行 fn1，set_value
+    else 已 cancel() 或前驱错误
+        T1->>T1: 短路，set_value(interrupted)
+    end
+    T1->>SS: done_nodes → pending_cnt 归零 → 触发 finally_cbs
+    U->>T1: get()（让出式等待）→ 返回 Result

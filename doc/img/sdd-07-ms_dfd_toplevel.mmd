@@ -1,0 +1,29 @@
+flowchart TB
+    User["用户代码"]
+    Src["Qt 异步来源"]
+
+    P1["P1 协程创建<br/>makeTask / launch_properties"]
+    P2["P2 调度<br/>FiberScheduler / pick_next"]
+    P3["P3 等待与数据传递<br/>coro / await / generate"]
+    P4["P4 任务编排<br/>then / on_finally / cancel"]
+    P5["P5 应用与退出<br/>exec / quit"]
+
+    D1[("D1 FiberGlobalQueue<br/>就绪协程 按亲和/优先级")]
+    D2[("D2 FiberChannel<br/>Awaitable 数据队列")]
+    D3[("D3 SharedState<br/>任务链计数/取消/回调")]
+
+    User -->|"fn+属性"| P1
+    P1 -->|"就绪协程(detach)"| D1
+    P2 -->|"pick_next 取出/attach"| D1
+    P2 -->|"resume 恢复"| P3
+    P2 -->|"resume 恢复"| P4
+    Src -->|"信号/数据"| P3
+    P3 -->|"push"| D2
+    D2 -->|"pop(让出后唤醒)"| P3
+    P3 -->|"Result / Generator"| User
+    P4 -->|"add/done_nodes, is_runnable, finally_cbs"| D3
+    D3 -->|"计数归零→回调, 取消→短路"| P4
+    P4 -->|"Result"| User
+    User -->|"quit"| P5
+    P5 -->|"close 广播"| D2
+    P5 -->|"停线程池/退出"| P2

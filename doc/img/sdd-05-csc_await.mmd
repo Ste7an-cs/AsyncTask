@@ -1,0 +1,82 @@
+classDiagram
+    class Awaitable~T~ {
+        -ch_ shared_ptr~FiberChannel~
+        -guard_ shared_ptr~AwaitableCloseGuard~
+        +channel() shared_ptr
+        +setOnClose(fn)
+        +await() Result~T~
+        +await_for(timeout) Result~T~
+        +resolve(v) bool
+        +close()
+        +close(error_code)
+    }
+    class AwaitableCloseGuard {
+        +set(fn)
+        +run()
+    }
+    class AutoDisconnect {
+        +on(sender, sig, slot)
+        +add(connection)
+        +addCleanup(fn)
+        +untilExpired(awaitable)
+        +untilSignal(obj, sig)
+        +untilSignal(obj, sig, pred)
+        +disconnectAll()
+    }
+    class Generator~T~ {
+        +begin() Iterator
+        +end() Iterator
+        +next() Result~T~
+        +close()
+    }
+    class FiberChannel~T~ {
+        +push(v) bool
+        +pop() Result~T~
+        +pop_wait_for(t) Result~T~
+        +close()
+        -q_ deque
+        -mtx_ / cv_ / closed_
+    }
+    class Result~T,E~ {
+        +has_value() bool
+        +value() T
+        +error() E
+        +value_or(d) T
+    }
+    class CoroAbstractSocket {
+        +readAll() shared_ptr~Awaitable<QByteArray>~
+        +waitForReadyRead() shared_ptr~Awaitable<void>~
+        +waitForBytesWritten() shared_ptr~Awaitable<void>~
+        +waitForConnected() shared_ptr~Awaitable<void>~
+        +waitForDisconnected() shared_ptr~Awaitable<void>~
+        +connectToHost(...) shared_ptr~Awaitable<void>~
+        +disconnectFromHost() shared_ptr~Awaitable<void>~
+    }
+    class CoroTcpServer {
+        +nextConnection() shared_ptr~Awaitable<QTcpSocket*>~
+    }
+    class CoroLocalSocket {
+        +readAll()/waitForReadyRead()/waitForBytesWritten()
+        +waitForConnected()/waitForDisconnected()
+        +connectToServer()/disconnectFromServer()
+    }
+    class CoroLocalServer {
+        +nextConnection() shared_ptr~Awaitable<QLocalSocket*>~
+    }
+    class CoroUdpSocket {
+        +receiveDatagram() shared_ptr~Awaitable<QNetworkDatagram>~
+    }
+    class CoroSslSocket {
+        +waitForEncrypted() shared_ptr~Awaitable<void>~
+        +connectToHostEncrypted(...) shared_ptr~Awaitable<void>~
+    }
+
+    Awaitable *-- FiberChannel
+    Awaitable *-- AwaitableCloseGuard
+    Awaitable ..> Result : await 返回
+    Generator o-- Awaitable : generate 接管
+    CoroAbstractSocket ..> Awaitable : 方法返回
+    CoroAbstractSocket ..> AutoDisconnect : 管理订阅
+    CoroTcpServer ..> Awaitable
+    CoroTcpServer ..> AutoDisconnect
+    AutoDisconnect ..> Awaitable : untilExpired 挂钩

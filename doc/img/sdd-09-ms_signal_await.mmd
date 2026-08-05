@@ -1,0 +1,21 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户协程
+    participant F as coro()工厂 CSC_AWAIT
+    participant A as Awaitable CSC_AWAIT
+    participant CH as FiberChannel CSC_DETAIL
+    participant Q as Qt 信号/槽
+    participant S as 调度器 CSC_SCHEDULER
+
+    U->>F: coro(obj, &sig)
+    F->>A: 建 Awaitable，取 channel()
+    F->>Q: connect(obj,sig,[ch]{ ch->push(打包参数) })
+    F->>A: setOnClose(bind_close: 断连 + aboutToQuit 关闭)
+    F-->>U: 返回 Awaitable（按值）
+    U->>A: await(a) → A 调 CH.pop()
+    CH->>S: 队列空：挂起当前协程（让出线程）
+    Note over S: 线程转去执行其它就绪协程
+    Q-->>CH: 信号触发 → 槽 push(打包参数)
+    CH->>S: 有数据：置该协程就绪
+    S-->>U: pop 返回 Result<T>
+    U->>A: close 或析构 → guard exactly-once disconnect

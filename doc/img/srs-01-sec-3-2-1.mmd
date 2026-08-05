@@ -1,0 +1,17 @@
+flowchart LR
+    Host["使用方代码<br/>（宿主工程）"]
+    Src["外部异步来源<br/>Qt 信号 / IO・socket・服务器对象 / future"]
+
+    subgraph SW["AsyncTask 软件"]
+        IF1["任务与应用接口<br/>RX_TASK_APP_INTERFACE"]
+        IF2["等待接口<br/>RX_AWAIT_INTERFACE"]
+        IF3["基础接口<br/>RX_BASE_INTERFACE"]
+    end
+
+    Host -->|"提交可调用体与调度属性<br/>编排/取消/查询任务"| IF1
+    IF1 -->|"任务句柄 / 结果"| Host
+    Host -->|"提交待等待的来源<br/>取一次 / 带超时 / 流式消费"| IF2
+    IF2 -->|"结果 / 数据流"| Host
+    IF2 <-->|"封装与事件通知"| Src
+    Host -->|"使用结果载体与协程原语"| IF3
+    IF3 -->|"值或错误"| Host

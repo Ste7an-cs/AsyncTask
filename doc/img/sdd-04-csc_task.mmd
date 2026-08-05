@@ -1,0 +1,29 @@
+classDiagram
+    class FiberTask~T~ {
+        -future_ptr_
+        -state_ SharedState
+        -Priority pri_
+        -Affinity affine_
+        +then(fn) FiberTask
+        +then(fn, pri, affine) FiberTask
+        +on_finally(cb) FiberTask
+        +cancel()
+        +get() Result~T~
+    }
+    class SharedState {
+        +atomic_int pending_cnt
+        +atomic_bool is_runnable
+        +vector~function~ finally_cbs
+        +add_nodes()
+        +done_nodes()
+    }
+    class FiberApplication {
+        +instance() FiberApplication*$
+        +exec() int
+        +quit()
+    }
+    QObject <|-- FiberApplication
+    FiberTask *-- SharedState : 任务链共享
+    FiberTask ..> Result : 返回
+    FiberApplication ..> FibersPool : 管理
+    FiberTask ..> launch_properties : 启动协程
