@@ -25,6 +25,15 @@ namespace Coro {
  * @tparam T future 的结果类型
  * @param fu 待等待的 std::future（右值，接管所有权）
  * @return 对应的 Awaitable
+ * @code
+ * // 把阻塞的 future.get() 变成让出式等待：协程挂起而线程不被占用
+ * std::future<int> fu = std::async(std::launch::async, []{ return compute(); });
+ * Coro::makeTask([f = std::move(fu)]() mutable {
+ *     auto r = Coro::await(Coro::coro(std::move(f)));
+ *     if(r) qDebug() << r.value();
+ *     return 0;
+ * });
+ * @endcode
  */
 template<class T>
 Awaitable<T> coro(std::future<T>&& fu){
@@ -41,6 +50,15 @@ Awaitable<T> coro(std::future<T>&& fu){
  * @tparam T QFuture 的结果类型
  * @param f 待等待的 QFuture
  * @return 对应的 Awaitable
+ * @code
+ * // 等待 QtConcurrent 任务，期间不阻塞线程
+ * QFuture<int> f = QtConcurrent::run([]{ return heavyWork(); });
+ * Coro::makeTask([f]{
+ *     auto r = Coro::await(Coro::coro(f));
+ *     if(r) qDebug() << r.value();
+ *     return 0;
+ * });
+ * @endcode
  */
 template<class T>
 Awaitable<T> coro(const QFuture<T>& f){

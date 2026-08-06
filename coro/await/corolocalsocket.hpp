@@ -36,6 +36,16 @@ namespace Coro {
  * 使用 qt.local_socket category。readAll() 遇到 PeerClosedError 正常结束；
  * waitForDisconnected() 和 disconnectFromServer() 把对端关闭作为断开成功，
  * 其他等待或连接操作则正常关闭而不产生成功事件。
+ * @code
+ * using namespace std::chrono_literals;
+ * QLocalSocket sock;
+ * // 与 TCP 版用法一致，仅错误 category 为 qt.local_socket
+ * if(Coro::await_for(Coro::coro(&sock).connectToServer(QStringLiteral("my-service")), 2s)){
+ *     auto reply = Coro::coro(&sock).readAll();
+ *     sock.write("ping");
+ *     auto data = Coro::await_for(reply, 2s);
+ * }
+ * @endcode
  */
 class CoroLocalSocket{
     QPointer<QLocalSocket> local_;
@@ -46,6 +56,12 @@ class CoroLocalSocket{
      * @param socket 非拥有的 socket 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；socket 已销毁或投递失败时为 false。
+     * @code
+     * // 内部使用：保证 QLocalSocket 操作都在其所属线程执行
+     * onSocketThread(socket, [name](QLocalSocket* s){
+     *     if(s->state() != QLocalSocket::ConnectedState) s->connectToServer(name);
+     * });
+     * @endcode
      */
     template<typename Function>
     static bool onSocketThread(QPointer<QLocalSocket> socket, Function function){
@@ -76,6 +92,13 @@ class CoroLocalSocket{
      * @param action 在 socket 所属线程执行一次的动作。
      * @param peerCloseCompletes 对端关闭是否应作为成功完成处理。
      * @return 目标信号或同步 fast path 完成时成功，否则携带终止原因的共享 awaitable。
+     * @code
+     * // 内部使用：一次性等待的统一实现。connectToServer 即由它组合而成
+     * return waitForSignal(
+     *     &QLocalSocket::connected,
+     *     [](QLocalSocket* s){ return s->state() == QLocalSocket::ConnectedState; },
+     *     [name](QLocalSocket* s){ s->connectToServer(name); });
+     * @endcode
      */
     template<typename Signal, typename Check, typename Action>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check,
@@ -151,6 +174,11 @@ class CoroLocalSocket{
      * @param signal 到达时直接完成等待的目标信号。
      * @param check 空动作执行后用于同步 fast path 的完成状态检查函数。
      * @return 目标信号或同步 fast path 完成时成功，否则携带终止原因的共享 awaitable。
+     * @code
+     * // 内部使用：无需发起动作、只等信号的场景
+     * return waitForSignal(&QIODevice::readyRead,
+     *                      [](QLocalSocket* s){ return s->bytesAvailable() > 0; });
+     * @endcode
      */
     template<typename Signal, typename Check>
     std::shared_ptr<Awaitable<void>> waitForSignal(Signal signal, Check check){
@@ -161,6 +189,12 @@ public:
     /**
      * @brief 用现有 QLocalSocket 创建非拥有包装器。
      * @param socket 源对象，可为空；包装器不会删除它。
+     * @code
+     * // 一般用工厂 coro(sock)；包装器不取得所有权
+     * QLocalSocket sock;
+     * Coro::CoroLocalSocket w(&sock);
+     * Coro::await(w.connectToServer(QStringLiteral("my-service")));
+     * @endcode
      */
     explicit CoroLocalSocket(QLocalSocket* socket): local_(socket){}
 
@@ -169,6 +203,15 @@ public:
      * @return 每个值都是非空的当前可读字节块，直到 socket 关闭；PeerClosedError 正常
      *         结束流，其他本地 socket 错误以 qt.local_socket category 结束。
      * @note await_for() 超时不停止读取流，也不取消 Qt 信号订阅。
+     * @code
+     * using namespace std::chrono_literals;
+     * // 建一次、反复取（订阅随句柄析构自动取消）
+     * auto stream = Coro::coro(&sock).readAll();
+     * while(auto chunk = Coro::await_for(stream, 2s)) append(chunk.value());
+     *
+     * // 或流式遍历
+     * for(const QByteArray& c : Coro::generate(Coro::coro(&sock).readAll())) append(c);
+     * @endcode
      */
     std::shared_ptr<Awaitable<QByteArray>> readAll(){
         auto awaitable = std::make_shared<Awaitable<QByteArray>>();
@@ -243,6 +286,11 @@ public:
      * @brief 等待至少一个可读字节。
      * @return bytesAvailable() 大于零时成功；PeerClosedError 正常关闭等待，其他本地
      *         socket 错误以 qt.local_socket category 结束。
+     * @code
+     * if(Coro::await(Coro::coro(&sock).waitForReadyRead())){
+     *     QByteArray head = sock.read(4);
+     * }
+     * @endcode
      */
     std::shared_ptr<Awaitable<void>> waitForReadyRead(){
         return waitForSignal(&QIODevice::readyRead, [](QLocalSocket* socket){
@@ -254,6 +302,13 @@ public:
      * @brief 等待 Qt 发出 bytesWritten 信号。
      * @return 写入信号发生时成功；PeerClosedError 正常关闭等待，其他本地 socket 错误
      *         以 qt.local_socket category 结束。
+     * @code
+     * using namespace std::chrono_literals;
+     * // 先建等待器再 write，避免漏掉快速到达的 bytesWritten
+     * auto written = Coro::coro(&sock).waitForBytesWritten();
+     * sock.write(payload);
+     * Coro::await_for(written, 2s);
+     * @endcode
      */
     std::shared_ptr<Awaitable<void>> waitForBytesWritten(){
         return waitForSignal(&QIODevice::bytesWritten, [](QLocalSocket*){
@@ -265,6 +320,12 @@ public:
      * @brief 等待本地 socket 进入 ConnectedState。
      * @return 已连接时成功；PeerClosedError 正常关闭等待，其他连接错误以
      *         qt.local_socket category 结束。
+     * @code
+     * using namespace std::chrono_literals;
+     * // 连接由外部发起，这里只等待其完成
+     * sock.connectToServer(QStringLiteral("my-service"));
+     * Coro::await_for(Coro::coro(&sock).waitForConnected(), 2s);
+     * @endcode
      */
     std::shared_ptr<Awaitable<void>> waitForConnected(){
         return waitForSignal(&QLocalSocket::connected, [](QLocalSocket* socket){
@@ -276,6 +337,10 @@ public:
      * @brief 等待本地 socket 进入 UnconnectedState。
      * @return 已断开或 PeerClosedError 表示对端正常关闭时成功；其他错误以
      *         qt.local_socket category 结束。
+     * @code
+     * // 等待对端主动断开
+     * Coro::await(Coro::coro(&sock).waitForDisconnected());
+     * @endcode
      */
     std::shared_ptr<Awaitable<void>> waitForDisconnected(){
         return waitForSignal(
@@ -292,6 +357,13 @@ public:
      * @param mode 打开模式。
      * @return ConnectedState 时成功；PeerClosedError 正常关闭等待，其他连接错误以
      *         qt.local_socket category 结束。
+     * @code
+     * using namespace std::chrono_literals;
+     * // 发起连接并等待完成（已连接则立即成功）
+     * auto ok = Coro::await_for(
+     *     Coro::coro(&sock).connectToServer(QStringLiteral("my-service")), 2s);
+     * if(!ok) qWarning() << ok.error().message().c_str();
+     * @endcode
      */
     std::shared_ptr<Awaitable<void>> connectToServer(
         const QString& name,
@@ -312,6 +384,11 @@ public:
      * @brief 在对象线程请求从本地 server 断开并等待 UnconnectedState。
      * @return 已断开或 PeerClosedError 表示对端正常关闭时成功；其他错误以
      *         qt.local_socket category 结束。
+     * @code
+     * using namespace std::chrono_literals;
+     * // 主动断开并等待完成后再释放 socket
+     * Coro::await_for(Coro::coro(&sock).disconnectFromServer(), 2s);
+     * @endcode
      */
     std::shared_ptr<Awaitable<void>> disconnectFromServer(){
         return waitForSignal(
@@ -332,6 +409,11 @@ public:
  * @param socket 源对象，可为空。
  * @return 不取得对象所有权的 wrapper；socket 为空时，之后调用操作会返回
  *         立即以默认 no_message 正常关闭的 Awaitable。
+ * @code
+ * using namespace std::chrono_literals;
+ * QLocalSocket sock;
+ * Coro::await_for(Coro::coro(&sock).connectToServer(QStringLiteral("my-service")), 2s);
+ * @endcode
  */
 inline CoroLocalSocket coro(QLocalSocket* socket){
     return CoroLocalSocket(socket);

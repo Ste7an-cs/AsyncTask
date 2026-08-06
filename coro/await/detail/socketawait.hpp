@@ -25,6 +25,14 @@ namespace detail {
  * @param socket 错误信号来源。
  * @param function 接收 SocketError 的回调。
  * @return 建立的 Qt 信号连接。
+ * @code
+ * // 屏蔽 Qt 5.15 前后 error()/errorOccurred() 的差异；配合 AutoDisconnect 登记
+ * scope->add(Coro::detail::connect_socket_error(
+ *     sock, [channel, scope](QAbstractSocket::SocketError e){
+ *         channel->close(Coro::detail::socket_error_code(e));
+ *         scope->disconnectAll();
+ *     }));
+ * @endcode
  */
 template<typename Function>
 QMetaObject::Connection connect_socket_error(QAbstractSocket* socket,
@@ -47,6 +55,15 @@ QMetaObject::Connection connect_socket_error(QAbstractSocket* socket,
  * @param socket 错误信号来源。
  * @param function 接收 LocalSocketError 的回调。
  * @return 建立的 Qt 信号连接。
+ * @code
+ * // 本地 socket 版本；PeerClosedError 通常按正常结束处理
+ * scope->add(Coro::detail::connect_local_socket_error(
+ *     sock, [channel, scope](QLocalSocket::LocalSocketError e){
+ *         if(e == QLocalSocket::PeerClosedError) channel->close();
+ *         else channel->close(Coro::detail::local_socket_error_code(e));
+ *         scope->disconnectAll();
+ *     }));
+ * @endcode
  */
 template<typename Function>
 QMetaObject::Connection connect_local_socket_error(QLocalSocket* socket,

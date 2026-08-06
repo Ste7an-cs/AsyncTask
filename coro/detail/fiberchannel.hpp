@@ -17,6 +17,20 @@ namespace Coro {
  * 非协程线程上 pop 时会 crash。内部用 fiber 版 mutex/condition_variable，
  * 等待时让出协程而非阻塞线程。
  * @tparam T 队列元素类型
+ * @code
+ * // 通常不直接使用，而是通过 Awaitable::channel() 取得（生产者只捕获 channel）
+ * Coro::Awaitable<int> a;
+ * auto ch = a.channel();
+ * auto prod = Coro::makeTask([ch]{
+ *     for(int i = 0; i < 3; i++) ch->push(i);
+ *     ch->close();                                // 结束流，消费者自然收敛
+ *     return 0;
+ * });
+ * auto cons = Coro::makeTask([&a]{
+ *     while(auto v = a.await()) qDebug() << v.value();
+ *     return 0;
+ * });
+ * @endcode
  */
 template<class T>
 class FiberChannel{
@@ -32,6 +46,12 @@ public:
      * @brief 添加一个元素 value 至队列
      * @param value 待入队的元素
      * @return 成功返回 success；如果 channel 已关闭返回 closed
+     * @code
+     * // push 在锁内自行判断关闭状态，与 close 并发安全，调用方无需先查 is_closed()
+     * if(ch->push(42) != boost::fibers::channel_op_status::success){
+     *     // channel 已关闭，值被丢弃
+     * }
+     * @endcode
      */
     channel_status push(T value){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
@@ -46,6 +66,11 @@ public:
      * @brief 获取一个元素至引用参数，如果 channel 中无可用值则阻塞/协程等待
      * @param out 输出参数，取到的元素
      * @return 成功返回 success；如果 channel 已关闭返回 closed
+     * @code
+     * int v{};
+     * // 队列空时让出当前协程（不阻塞线程），有值或关闭时被唤醒
+     * if(ch->pop(v) == boost::fibers::channel_op_status::success) use(v);
+     * @endcode
      */
     channel_status pop(T& out){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
@@ -67,6 +92,13 @@ public:
      * @param out 输出参数，取到的元素
      * @param timeout_duration 超时时间
      * @return 成功返回 success；超时返回 timeout；channel 已关闭返回 closed
+     * @code
+     * int v{};
+     * auto st = ch->pop_wait_for(v, std::chrono::milliseconds(100));
+     * if(st == boost::fibers::channel_op_status::timeout){
+     *     // 仅本次等待到期，channel 仍开放，可继续等
+     * }
+     * @endcode
      */
     template< typename Rep, typename Period >
     channel_status pop_wait_for( T & out,
@@ -88,6 +120,16 @@ public:
      * @brief 阻塞等待可用的值，如果 channel 关闭则抛异常
      * @return 可用的值
      * @throws boost::fibers::fiber_error channel 已关闭
+     * @code
+     * // 框架内部一般用 pop()/pop_wait_for() 以错误码表达失败；
+     * // 仅在确定 channel 不会关闭时使用本接口
+     * try {
+     *     int v = ch->value_pop();
+     *     use(v);
+     * } catch(const boost::fibers::fiber_error&) {
+     *     // channel 已关闭
+     * }
+     * @endcode
      */
     T value_pop(){
         for(;;){
@@ -109,12 +151,21 @@ public:
     /**
      * @brief 查询 channel 是否已关闭
      * @return 已关闭返回 true
+     * @code
+     * // 作为流式 drain 循环的终止守卫
+     * while(!ch->is_closed() && socket->bytesAvailable() > 0){
+     *     ch->push(socket->readAll());
+     * }
+     * @endcode
      */
     bool is_closed() const noexcept {
         return closed_.load( std::memory_order_acquire);
     }
     /**
      * @brief 关闭 channel，唤醒并收敛所有等待者
+     * @code
+     * ch->close();     // 正常终止：消费者取完余量后观察到 no_message
+     * @endcode
      */
     void close() noexcept {
         close(std::make_error_code(std::errc::no_message));
@@ -123,6 +174,10 @@ public:
      * @brief 关闭 channel 并记录终止原因，唤醒并收敛所有等待者
      * @details 仅首次关闭会记录终止原因，后续 close() 调用不会覆盖已保留的错误。
      * @param error 终止原因
+     * @code
+     * // 来源出错时带错误码关闭，消费者可据此区分正常结束与异常终止
+     * ch->close(Coro::detail::socket_error_code(socket->error()));
+     * @endcode
      */
     void close(std::error_code error) noexcept {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
@@ -139,6 +194,12 @@ public:
      * @brief 返回首次关闭 channel 时记录的终止原因。
      * @details channel 尚未关闭时返回预置的默认 no_message；关闭后返回首次
      *          记录的错误。重复关闭不会改变该错误。
+     * @code
+     * int v{};
+     * if(ch->pop(v) == boost::fibers::channel_op_status::closed){
+     *     qDebug() << ch->close_error().message().c_str();   // 终止原因
+     * }
+     * @endcode
      */
     std::error_code close_error() const {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
@@ -147,6 +208,10 @@ public:
     /**
      * @brief 丢弃尚未被消费的值。
      * @details 该操作不改变 channel 的关闭状态，也不修改首次关闭时保留的终止错误。
+     * @code
+     * // server 析构时清掉队列中即将悬空的 QTcpSocket*，防止消费者拿到野指针
+     * QObject::connect(server, &QObject::destroyed, [ch]{ ch->discard_pending(); });
+     * @endcode
      */
     void discard_pending(){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};

@@ -10,6 +10,23 @@
  * 也可按需单独引入下列各头，
  * 只拉入用到的部分。Qt 相关能力（协程线程、应用集成、coro() 等待工厂）在宿主
  * 工程启用 Qt（定义 ASYNC_HAS_QTCORE）时才引入。
+ *
+ * @code
+ * #include <QCoreApplication>
+ * #include "all.hpp"               // 一次性引入全部公开 API
+ * using namespace Coro;
+ *
+ * int main(int argc, char* argv[]) {
+ *     QCoreApplication app(argc, argv);
+ *     installFiberApplication();   // 安装调度器 + 工作线程池
+ *     makeTask([]{
+ *         await(coro(&timer, &QTimer::timeout));   // 顺序书写异步逻辑
+ *         quit();                                  // 安全退出
+ *         return 0;
+ *     });
+ *     return exec();               // 用 Coro::exec() 驱动，不是 app.exec()
+ * }
+ * @endcode
  */
 
 // —— 基础层 ——

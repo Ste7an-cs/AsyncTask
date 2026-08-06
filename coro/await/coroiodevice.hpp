@@ -18,6 +18,12 @@ namespace Coro {
 
 /**
  * @brief QIODevice 的协程包装器（方法名镜像原 Qt API）
+ * @code
+ * // 由 coro(dev) 产生；方法名与 Qt 同名，无需记新名字
+ * QFile file("data.bin");
+ * file.open(QIODevice::ReadOnly);
+ * QByteArray data = Coro::await(Coro::coro(&file).readAll()).value_or(QByteArray());
+ * @endcode
  */
 class CoroIODevice{
     QPointer<QIODevice> dev_;///< 被包装的设备（弱引用）
@@ -25,12 +31,24 @@ public:
     /**
      * @brief 构造
      * @param dev 被包装的 QIODevice
+     * @code
+     * // 一般用工厂函数 coro(dev) 而非直接构造
+     * Coro::CoroIODevice w(&file);
+     * auto data = Coro::await(w.readAll());
+     * @endcode
      */
     explicit CoroIODevice(QIODevice* dev): dev_(dev){}
 
     /**
      * @brief 等待可读并返回读取的全部数据；可 generate 流式读取
      * @return 产出 QByteArray 的 Awaitable
+     * @code
+     * // 取一次当前可读数据
+     * auto chunk = Coro::await(Coro::coro(dev).readAll());
+     *
+     * // 流式：设备关闭前持续产出数据块
+     * for(const QByteArray& c : Coro::generate(Coro::coro(dev).readAll())) append(c);
+     * @endcode
      */
     Awaitable<QByteArray> readAll(){
         Awaitable<QByteArray> a;
@@ -49,6 +67,12 @@ public:
     /**
      * @brief 等待可读（不取数据）
      * @return 就绪时触发一次的 Awaitable<void>
+     * @code
+     * // 等到有数据可读后自行决定怎么读
+     * if(Coro::await(Coro::coro(dev).waitForReadyRead())){
+     *     QByteArray head = dev->read(4);
+     * }
+     * @endcode
      */
     Awaitable<void> waitForReadyRead(){
         Awaitable<void> a;
@@ -61,6 +85,12 @@ public:
     /**
      * @brief 等待数据写出
      * @return 写出时触发一次的 Awaitable<void>
+     * @code
+     * // 先建等待器再 write，避免 bytesWritten 早于建立而被漏掉
+     * auto written = Coro::coro(dev).waitForBytesWritten();
+     * dev->write("ping");
+     * Coro::await(written);
+     * @endcode
      */
     Awaitable<void> waitForBytesWritten(){
         Awaitable<void> a;
@@ -76,6 +106,12 @@ public:
  * @brief 构造 QIODevice 的协程包装器
  * @param dev 被包装的 QIODevice
  * @return CoroIODevice 包装器
+ * @code
+ * // 适用于任何 QIODevice：QFile、QBuffer、QSerialPort 等
+ * QBuffer buf(&bytes);
+ * buf.open(QIODevice::ReadWrite);
+ * auto data = Coro::await(Coro::coro(&buf).readAll());
+ * @endcode
  */
 inline CoroIODevice coro(QIODevice* dev){ return CoroIODevice(dev); }
 

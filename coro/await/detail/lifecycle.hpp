@@ -20,6 +20,16 @@ namespace detail {
  * @param ch 目标 channel 的 shared_ptr
  * @param conns 已建立的主连接列表
  * @return 断开所有连接的清理函数
+ * @code
+ * // 轻量来源（signal/future/QIODevice）的收尾范式：
+ * // 来源析构或 aboutToQuit 时关闭 channel，并把断连汇总交给 setOnClose
+ * Coro::Awaitable<QByteArray> a;
+ * auto ch   = a.channel();
+ * auto conn = std::make_shared<QMetaObject::Connection>();
+ * *conn = QObject::connect(dev, &QIODevice::readyRead,
+ *                          [ch, dev]{ ch->push(dev->readAll()); });
+ * a.setOnClose(Coro::detail::bind_close(dev, ch, {conn}));
+ * @endcode
  */
 template<class ChPtr>
 std::function<void()> bind_close(QObject* sender, ChPtr ch,

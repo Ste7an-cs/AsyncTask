@@ -39,6 +39,17 @@ namespace Coro {
  * close(error) 时，
  * 已排队指针仍先消费，随后返回首次终止错误；注册的 Qt 信号连接和 cleanup
  * 仅清理一次。acceptError 使用 qt.socket category 终止流。
+ * @code
+ * QTcpServer server;
+ * server.listen(QHostAddress::LocalHost, 0);
+ * Coro::makeTask([&server]{
+ *     // 像遍历容器一样接受连接；server 停止监听或销毁时迭代自然结束
+ *     for(QTcpSocket* peer : Coro::generate(Coro::coro(&server).nextConnection())){
+ *         handle(peer);      // peer 仍归 server 所有，勿超出其生命周期使用
+ *     }
+ *     return 0;
+ * });
+ * @endcode
  */
 class CoroTcpServer{
     QPointer<QTcpServer> srv_;
@@ -49,6 +60,12 @@ class CoroTcpServer{
      * @param server 非拥有的 server 守卫指针。
      * @param function 要在对象线程运行的函数。
      * @return 已执行或成功投递时为 true；server 已销毁或投递失败时为 false。
+     * @code
+     * // 内部使用：保证 QTcpServer 操作都在其所属线程执行
+     * onServerThread(server, [](QTcpServer* s){
+     *     while(s->hasPendingConnections()) accept(s->nextPendingConnection());
+     * });
+     * @endcode
      */
     template<typename Function>
     static bool onServerThread(QPointer<QTcpServer> server, Function function){
@@ -69,6 +86,13 @@ public:
     /**
      * @brief 用现有 QTcpServer 创建非拥有包装器。
      * @param server 源 server，可为空；包装器不会删除它。
+     * @code
+     * // 一般用工厂 coro(server)；包装器不取得所有权
+     * QTcpServer server;
+     * server.listen(QHostAddress::LocalHost, 0);
+     * Coro::CoroTcpServer w(&server);
+     * for(QTcpSocket* peer : Coro::generate(w.nextConnection())) handle(peer);
+     * @endcode
      */
     explicit CoroTcpServer(QTcpServer* server): srv_(server){}
 
@@ -79,6 +103,18 @@ public:
      * @details 每个 QTcpSocket* 仍由 Qt server 管理，消费者不得让它超过 server 生命周期，
      *          并必须遵守其线程亲和性。10 ms 定时器仅检测未发停止信号的 close()，不是
      *          连接超时；server 析构时会丢弃尚未消费的 queued 原始指针。
+     * @code
+     * using namespace std::chrono_literals;
+     * // 流式接受连接（推荐）
+     * for(QTcpSocket* peer : Coro::generate(Coro::coro(&server).nextConnection())){
+     *     Coro::makeTask([peer]{ serve(peer); return 0; });
+     * }
+     *
+     * // 或只接受一个连接
+     * auto incoming = Coro::coro(&server).nextConnection();
+     * auto first = Coro::await_for(incoming, 5s);
+     * if(first) serve(first.value());
+     * @endcode
      */
     std::shared_ptr<Awaitable<QTcpSocket*>> nextConnection(){
         auto awaitable = std::make_shared<Awaitable<QTcpSocket*>>();
@@ -165,6 +201,13 @@ public:
  * @param server 源 server，可为空。
  * @return 不取得对象所有权的 wrapper；server 为空时，之后调用 nextConnection()
  *         会返回立即以默认 no_message 正常关闭的 Awaitable。
+ * @code
+ * QTcpServer server;
+ * server.listen(QHostAddress::LocalHost, 0);
+ * for(QTcpSocket* peer : Coro::generate(Coro::coro(&server).nextConnection())){
+ *     handle(peer);
+ * }
+ * @endcode
  */
 inline CoroTcpServer coro(QTcpServer* server){
     return CoroTcpServer(server);

@@ -13,6 +13,11 @@ namespace Coro {
  *
  * 首次使用时创建 N 个工作线程，各安装调度器并挂起待命（线程不退出但可调度
  * 协程）；close() 唤醒各线程使其退出。
+ * @code
+ * // 一般由 installFiberApplication() 间接创建，无需手动管理；
+ * // Shared 亲和的协程即由该池中的线程取用执行
+ * Coro::FibersPool::instance();                 // 首次调用即启动线程池
+ * @endcode
  */
 class FibersPool{
     using TaskType = std::function<void(void)>;
@@ -20,11 +25,18 @@ public:
     /**
      * @brief 获取全局单例
      * @return 单例引用
+     * @code
+     * Coro::FibersPool& pool = Coro::FibersPool::instance();
+     * @endcode
      */
     static FibersPool& instance(void);
     /**
      * @brief 关闭线程池，唤醒并结束各工作线程。
      * @note main Thread 结束前需手动 close，避免堆栈损坏。
+     * @code
+     * // Coro::quit() 内部会调用；一般无需手动调用
+     * Coro::FibersPool::instance().close();
+     * @endcode
      */
     void close(void);
     /** @brief 禁止移动构造 */

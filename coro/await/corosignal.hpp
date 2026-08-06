@@ -30,6 +30,12 @@ namespace detail {
  * @param obj 发送者对象
  * @param sig 信号
  * @return 对应的 Awaitable
+ * @code
+ * // 内部实现，使用方请用 coro(obj, sig)；此处示意其等价效果：
+ * auto a = Coro::detail::coro_signal_impl(
+ *     obj, &Obj::valueChanged,
+ *     static_cast<std::tuple<int>*>(nullptr));   // 得到 Awaitable<int>
+ * @endcode
  */
 template<class Obj, class Sig, class... A>
 auto coro_signal_impl(Obj* obj, Sig sig, std::tuple<A...>*){
@@ -59,6 +65,14 @@ auto coro_signal_impl(Obj* obj, Sig sig, std::tuple<A...>*){
  * @param obj 发送者对象
  * @param sig 信号
  * @return 对应的 Awaitable
+ * @code
+ * // 内部实现，使用方请用 coro<Types...>(obj, sig)；
+ * // 例如信号 sig2(int, QString) 只取首个 int：
+ * auto a = Coro::detail::coro_signal_typed_impl(
+ *     obj, &Obj::sig2,
+ *     static_cast<std::tuple<int>*>(nullptr),
+ *     static_cast<std::tuple<int, QString>*>(nullptr));   // Awaitable<int>
+ * @endcode
  */
 template<class Obj, class Sig, class... Want, class... A>
 auto coro_signal_typed_impl(Obj* obj, Sig sig, std::tuple<Want...>*, std::tuple<A...>*){
@@ -93,6 +107,21 @@ auto coro_signal_typed_impl(Obj* obj, Sig sig, std::tuple<Want...>*, std::tuple<
  * @param obj 发送者对象
  * @param sig 信号
  * @return 对应的 Awaitable
+ * @code
+ * // 无参信号 -> Awaitable<void>：可当 bool 用，也可忽略返回值
+ * Coro::await(Coro::coro(&timer, &QTimer::timeout));
+ *
+ * // 单参信号 -> Awaitable<Value>
+ * auto r = Coro::await(Coro::coro(obj, &Obj::valueChanged));
+ * if(r) use(r.value());
+ *
+ * // 多参信号 -> Awaitable<tuple<...>>
+ * auto t = Coro::await(Coro::coro(obj, &Obj::sig2));
+ * if(t) qDebug() << std::get<0>(t.value());
+ *
+ * // 流式消费：像遍历容器一样处理连续信号
+ * for(auto v : Coro::generate(Coro::coro(obj, &Obj::valueChanged))) use(v);
+ * @endcode
  */
 template<class Obj, class Sig>
 auto coro(Obj* obj, Sig sig){
@@ -109,6 +138,13 @@ auto coro(Obj* obj, Sig sig){
  * @param obj 发送者对象
  * @param sig 信号
  * @return 对应的 Awaitable
+ * @code
+ * // 信号为 sig2(int, QString)，只关心首个 int：
+ * auto r = Coro::await(Coro::coro<int>(obj, &Obj::sig2));   // Result<int>
+ *
+ * // 取前两个参数并打包为 tuple：
+ * auto t = Coro::await(Coro::coro<int, QString>(obj, &Obj::sig2));
+ * @endcode
  */
 template<class W0, class... Wr, class Obj, class Sig>
 auto coro(Obj* obj, Sig sig){

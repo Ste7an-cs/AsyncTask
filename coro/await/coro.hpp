@@ -18,6 +18,18 @@
  *
  * 消费统一用自由函数 await(a)/await_for(a,timeout)（awaitable.hpp）与 generate(a)（generator.hpp）。
  * 全部 Qt 依赖集中在这些 coro* 头文件中；Awaitable 本体与 Qt 解耦。
+ *
+ * @code
+ * #include "await/coro.hpp"        // 一次性引入全部来源的 coro()
+ * using namespace Coro;
+ *
+ * // 同一个 coro() 入口适配不同来源，消费方式统一
+ * await(coro(obj, &Obj::valueChanged));                  // Qt 信号
+ * await(coro(std::move(fut)));                           // future
+ * await(coro(dev).readAll());                            // QIODevice
+ * await_for(coro(sock).connectToHost(host, port), 2s);   // socket
+ * for(auto* p : generate(coro(server).nextConnection())) handle(p);   // server
+ * @endcode
  */
 
 #include "awaitable.hpp"   // 消费: await(a) / await_for(a, timeout)
