@@ -154,6 +154,8 @@ public:
      * 返回的是普通 Awaitable，因此 Coro::await / await_for / generate 均原样可用。
      * 订阅者之间互为广播（各得全量），与直接 await 本对象的抢占式消费者也不竞争。
      * 不做 replay：本次调用之前已产生的值对订阅者不可见。订阅句柄析构即自动退订。
+     * 源关闭时经由 FiberChannel::close 直接扇出到镜像，不经过订阅句柄自身的 close()，
+     * 因此订阅句柄上的 setOnClose 钩子在这种情况下不会触发，仍要等该句柄自身析构。
      * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
      * @code
      * auto src = Coro::coro(sock).readAll();
@@ -343,6 +345,8 @@ public:
      *
      * 语义与 Awaitable<T>::shared() 相同：订阅者之间互为广播，与直接 await
      * 本对象的抢占式消费者不竞争，不做 replay，句柄析构即自动退订。
+     * 源关闭时经由 FiberChannel::close 直接扇出到镜像，不经过订阅句柄自身的 close()，
+     * 因此订阅句柄上的 setOnClose 钩子在这种情况下不会触发，仍要等该句柄自身析构。
      * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
      * @code
      * Coro::Awaitable<void> done;

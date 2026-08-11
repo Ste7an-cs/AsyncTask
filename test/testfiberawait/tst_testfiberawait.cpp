@@ -204,6 +204,7 @@ private slots:
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
     void test_case_broadcast_source_destroyed_converges_mirror();
+    void test_case_broadcast_generate();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -650,7 +651,7 @@ void TestFiberAwait::test_case_broadcast_prune_preserves_later_mirror()
     QCOMPARE(live->await().value(), 12);
 }
 
-/// @brief 验证已关闭但句柄仍存活的镜像会被剔除，此后不再为它付出拷贝代价。
+/// @brief 验证已关闭但句柄仍存活的镜像不再产生投递拷贝，同时仍留在扇出列表里。
 /// @details resolve() 经由 push(T value) 传参，每次调用都有一次固有拷贝，与镜像无关；
 ///          因此断言的是「相对基线的增量」而非绝对值。
 void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
@@ -666,13 +667,13 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
     auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
     mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
 
-    // 第一次投递仍可能拷给这条待剔除的镜像，因此不低于基线；
-    // 若实现改为先判 is_closed() 再拷贝并提前剔除，则会等于基线，同样合法
+    // 第一次投递仍可能拷给这条待剔除的镜像，因此不低于基线；这一句在任何合理实现下
+    // 都成立，不具区分力——真正有区分力的断言是下面第二段的 QCOMPARE(..., baseline * 2)
     CopyCounted::copies = 0;
     QVERIFY(source.resolve(CopyCounted(1)));
     QVERIFY(CopyCounted::copies >= baseline);
 
-    // 剔除之后，每次 resolve 只剩固有代价
+    // 已关闭的镜像此后不再产生投递拷贝，每次 resolve 只剩固有代价
     CopyCounted::copies = 0;
     QVERIFY(source.resolve(CopyCounted(2)));
     QVERIFY(source.resolve(CopyCounted(3)));
@@ -704,6 +705,22 @@ void TestFiberAwait::test_case_broadcast_source_destroyed_converges_mirror()
     auto terminal = Coro::await_for(subscriber, 100ms);
     QVERIFY(!terminal);
     QCOMPARE(terminal.error(), std::make_error_code(std::errc::connection_aborted));
+}
+
+/// @brief 验证 Coro::generate() 可直接迭代 shared() 订阅句柄，源关闭后循环自然结束。
+void TestFiberAwait::test_case_broadcast_generate()
+{
+    Coro::Awaitable<int> source;
+    auto audit = source.shared();
+
+    QVERIFY(source.resolve(1));
+    QVERIFY(source.resolve(2));
+    QVERIFY(source.resolve(3));
+    source.close();
+
+    int total = 0;
+    for(int v : Coro::generate(audit)) total += v;
+    QCOMPARE(total, 6);
 }
 
 /// @brief 验证 void 特化的广播：每个订阅者各自收到全部事件与终止原因。

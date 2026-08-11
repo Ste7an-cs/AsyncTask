@@ -63,6 +63,7 @@ sub2   : A B C D  ←  独立一份，一条不漏
 - **订阅句柄单独 `close()`**：只终止自己这一路，源与其他订阅者不受影响。
 - **订阅句柄的 `guard_`**：订阅句柄由默认构造产生，从未 `setOnClose`，因此其关闭或析构不会断开上游 Qt 连接。
 - **失效槽位的剔除时机**：订阅句柄析构后，其 `weak_ptr` 要等下一次 `push`（或 `close`）才被剔除。若源之后不再 `push`，槽位会一直挂着——无害（`lock()` 恒失败），不为此增加额外机制。
+- **源句柄未 `close()` 就析构**：`FiberChannel` 析构时以 `connection_aborted` 关闭所有仍存活的镜像，使订阅者收敛而非永久挂起；与正常结束的 `no_message` 用错误码区分，便于定位"忘了 close() 就丢了源句柄"这类问题。
 
 ## 4. 接口
 
@@ -127,7 +128,7 @@ void addMirror(const std::shared_ptr<FiberChannel<T>>& mirror){
 }
 ```
 
-`push()` 增加扇出（swap-and-pop 剔除失效项，O(1)，无 memmove）：
+`push()` 增加扇出：`weak_ptr` 已过期（订阅句柄已析构）的槽位仍用 swap-and-pop 剔除（O(1)，无 memmove）；但**已关闭的镜像不剔除，只跳过投递**——`close()` 不清空 `mirrors_`，`discard_pending()` 靠这份列表在源销毁时把镜像队列里即将悬空的值一并丢弃，erase 会让这条路径永久失效（详见下面 `close`/`discard_pending` 的说明）：
 
 ```cpp
 channel_status push(T value){
@@ -138,13 +139,19 @@ channel_status push(T value){
     if(mirrors_){
         auto& list = *mirrors_;
         for(std::size_t i = 0; i < list.size(); ){
-            if(auto mirror = list[i].lock()){
-                mirror->push(value);
-                ++i;
-            }else{
+            auto mirror = list[i].lock();
+            if(!mirror){
+                // 句柄已析构：weak_ptr 失效，swap-and-pop 剔除
                 list[i] = std::move(list.back());
                 list.pop_back();
+                continue;
             }
+            // 已关闭的镜像跳过投递（省掉一次加锁与一次 T 拷贝），但保留在列表中，
+            // 以便 discard_pending() 仍能清掉它队列里即将悬空的值
+            if(!mirror->is_closed()){
+                mirror->push(value);
+            }
+            ++i;
         }
     }
     queue_.push_back(std::move(value));
@@ -153,7 +160,7 @@ channel_status push(T value){
 }
 ```
 
-`close(std::error_code)` 增加扇出——**终止必须传播，否则订阅者永久挂起**：
+`close(std::error_code)` 增加扇出——**终止必须传播，否则订阅者永久挂起**。`mirrors_` 本身**不清空**：`discard_pending()` 在 `close()` 之后仍需经由它触达镜像（见 `corotcpserver.hpp:135-137` 的用例：消费者先 `close()` 再 `delete server`）：
 
 ```cpp
 void close(std::error_code error) noexcept {
@@ -170,24 +177,47 @@ void close(std::error_code error) noexcept {
         for(auto& weak : *mirrors_){
             if(auto mirror = weak.lock()) mirror->close(close_error_);
         }
-        mirrors_.reset();
     }
 }
 ```
 
-`discard_pending()` 增加扇出——它用于源销毁时清掉即将悬空的指针（如 `QTcpSocket*`），不扇出会在镜像里留下野指针：
+`discard_pending()` 增加扇出——它用于源销毁时清掉即将悬空的指针（如 `QTcpSocket*`），不扇出会在镜像里留下野指针。`push()` 关闭后即早返回、不再遍历镜像，`close()` 也不剔除失效槽位，因此这里是唯一还会遍历一个已关闭 channel 的镜像列表的扇出点，顺带用同样的 swap-and-pop 剔除失效槽位：
 
 ```cpp
 void discard_pending(){
     std::unique_lock<boost::fibers::mutex> lck{mtx_};
     queue_.clear();
     if(mirrors_){
-        for(auto& weak : *mirrors_){
-            if(auto mirror = weak.lock()) mirror->discard_pending();
+        auto& list = *mirrors_;
+        for(std::size_t i = 0; i < list.size(); ){
+            auto mirror = list[i].lock();
+            if(!mirror){
+                list[i] = std::move(list.back());
+                list.pop_back();
+                continue;
+            }
+            mirror->discard_pending();
+            ++i;
         }
     }
 }
 ```
+
+析构函数——源 channel 未 `close()` 就消亡时，令镜像收敛而非永久挂起消费者；用 `connection_aborted` 与正常结束的 `no_message` 区分。此时引用计数已归零，不存在其他持有者，无需加锁：
+
+```cpp
+~FiberChannel(){
+    if(mirrors_){
+        for(auto& weak : *mirrors_){
+            if(auto mirror = weak.lock()){
+                mirror->close(std::make_error_code(std::errc::connection_aborted));
+            }
+        }
+    }
+}
+```
+
+`FiberChannel` 已经因为显式删除拷贝构造/拷贝赋值而不再隐式生成移动构造/赋值（用户声明拷贝特殊成员函数会抑制移动特殊成员函数的隐式生成，与本次新增析构函数无关）；`FiberChannel` 全程只以 `shared_ptr` 持有，代码库里也没有依赖它可移动的用法，因此新增析构函数不改变既有行为。
 
 ### 5.2 `coro/await/awaitable.hpp`
 
