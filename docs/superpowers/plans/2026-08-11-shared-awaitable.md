@@ -61,15 +61,16 @@ cd test/testfiberawait/build && ./testfiberawait
 
 - [ ] **Step 1: 写失败的测试**
 
-在 `tst_testfiberawait.cpp` 的 `private slots:` 列表中，`void test_case_shared_awaitable_void();` 之后加入三行：
+在 `tst_testfiberawait.cpp` 的 `private slots:` 列表中，`void test_case_shared_awaitable_void();` 之后加入四行：
 
 ```cpp
     void test_case_broadcast_basic();
     void test_case_broadcast_no_replay();
     void test_case_broadcast_raii_unsubscribe();
+    void test_case_broadcast_subscribe_after_close();
 ```
 
-在 `void TestFiberAwait::test_case_socket_error_conversion()` 函数定义之前插入三个测试函数：
+在 `void TestFiberAwait::test_case_socket_error_conversion()` 函数定义之前插入四个测试函数：
 
 ```cpp
 /// @brief 验证每个 shared() 订阅者各自收到完整序列，且源队列保留全量。
@@ -106,11 +107,11 @@ void TestFiberAwait::test_case_broadcast_no_replay()
 
     auto late = source.shared();
     QVERIFY(source.resolve(3));
-    source.close();
 
+    // 首次 await 直接取到 3，即证明订阅之前的 1、2 未被投递
     QCOMPARE(late->await().value(), 3);
-    QCOMPARE(late->await().error(), std::make_error_code(std::errc::no_message));
 
+    // 源侧不受影响，仍能取到全部三条
     QCOMPARE(source.await().value(), 1);
     QCOMPARE(source.await().value(), 2);
     QCOMPARE(source.await().value(), 3);
@@ -132,11 +133,23 @@ void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
 
     // 失效槽位在下一次 push 时被剔除，存活订阅者不受影响
     QVERIFY(source.resolve(2));
-    source.close();
 
     QCOMPARE(keep->await().value(), 1);
     QCOMPARE(keep->await().value(), 2);
-    QCOMPARE(keep->await().error(), std::make_error_code(std::errc::no_message));
+}
+
+/// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
+/// @details 该分支唯一的职责就是防止订阅者永久等待。
+void TestFiberAwait::test_case_broadcast_subscribe_after_close()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> source;
+    source.close(std::make_error_code(std::errc::connection_refused));
+
+    auto late = source.shared();
+    auto result = Coro::await_for(late, 50ms);
+    QVERIFY(!result);
+    QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
 }
 ```
 
@@ -269,10 +282,10 @@ template<typename T> class Awaitable;
 - [ ] **Step 7: 运行测试，确认通过**
 
 ```bash
-cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_basic test_case_broadcast_no_replay test_case_broadcast_raii_unsubscribe
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_basic test_case_broadcast_no_replay test_case_broadcast_raii_unsubscribe test_case_broadcast_subscribe_after_close
 ```
 
-Expected: `Totals: 5 passed, 0 failed`（3 个新用例 + `initTestCase` + `cleanupTestCase`）
+Expected: `Totals: 6 passed, 0 failed`（4 个新用例 + `initTestCase` + `cleanupTestCase`）
 
 - [ ] **Step 8: 提交**
 
@@ -301,9 +314,10 @@ git commit -m "feat(await): add shared() broadcast subscription via channel mirr
 
 ```cpp
     void test_case_broadcast_terminal_error();
-    void test_case_broadcast_subscribe_after_close();
     void test_case_broadcast_mirror_close_isolated();
 ```
+
+（`test_case_broadcast_subscribe_after_close` 已在 Task 1 完成——它覆盖的 `addMirror` 已关闭分支属于 Task 1 的代码，不要在这里重复添加。）
 
 在 `void TestFiberAwait::test_case_socket_error_conversion()` 之前插入：
 
@@ -323,19 +337,6 @@ void TestFiberAwait::test_case_broadcast_terminal_error()
     QCOMPARE(first->await().error(), std::make_error_code(std::errc::connection_reset));
     QCOMPARE(second->await().value(), 7);
     QCOMPARE(second->await().error(), std::make_error_code(std::errc::connection_reset));
-}
-
-/// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
-void TestFiberAwait::test_case_broadcast_subscribe_after_close()
-{
-    using namespace std::chrono_literals;
-    Coro::Awaitable<int> source;
-    source.close(std::make_error_code(std::errc::connection_refused));
-
-    auto late = source.shared();
-    auto result = Coro::await_for(late, 50ms);
-    QVERIFY(!result);
-    QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
 }
 
 /// @brief 验证单个订阅者关闭只终止自己，源与其他订阅者不受影响。
@@ -359,7 +360,7 @@ void TestFiberAwait::test_case_broadcast_mirror_close_isolated()
 - [ ] **Step 2: 运行测试，确认失败**
 
 ```bash
-cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error test_case_broadcast_subscribe_after_close
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error
 ```
 
 Expected: `test_case_broadcast_terminal_error` 失败——`first->await()` 取完 7 之后不会返回 `connection_reset`，而是卡住直到测试超时（close 尚未扇出）。
@@ -384,18 +385,19 @@ Expected: `test_case_broadcast_terminal_error` 失败——`first->await()` 取�
             for(auto& weak : *mirrors_){
                 if(auto mirror = weak.lock()) mirror->close(close_error_);
             }
-            mirrors_.reset();
         }
     }
 ```
 
+**不要在这里 `mirrors_.reset()`。** 关闭之后 `discard_pending()` 仍然需要能触达镜像——消费者先 `close()` 流、随后才 `delete server` 是 `corotcpserver.hpp:135-137` 明确设计并注释说明的时序，此时镜像队列里还排着即将悬空的 `QTcpSocket*`。清空列表会让那条清理路径静默失效，造成 use-after-free。保留列表是安全的：`mirrors_` 存的是 `weak_ptr`（无所有权环）、`push()` 在触碰 `mirrors_` 之前就已因 `is_closed()` 提前返回、`close()` 重复调用会提前返回、`addMirror()` 对已关闭的源不再登记。
+
 - [ ] **Step 4: 运行测试，确认通过**
 
 ```bash
-cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error test_case_broadcast_subscribe_after_close test_case_broadcast_mirror_close_isolated
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error test_case_broadcast_mirror_close_isolated
 ```
 
-Expected: `Totals: 5 passed, 0 failed`
+Expected: `Totals: 4 passed, 0 failed`
 
 - [ ] **Step 5: 提交**
 
@@ -410,13 +412,15 @@ git commit -m "feat(await): propagate channel close to mirrors"
 
 `nextConnection()` 推送的 `QTcpSocket*` 是 `QTcpServer` 的子对象。server 析构时 Qt 连带删除它们，`discard_pending()` 负责清掉队列里即将悬空的指针。不扇出的话，镜像队列里会留下野指针——一个只在「server 先于消费者析构」时序下触发的 use-after-free。
 
+本任务还顺带解决一个 Task 2 review 提出、经确认并入此处的问题：`push()` 丢弃了 `mirror->push(value)` 的返回值，导致「已 `close()` 但句柄仍存活」的镜像永不被剔除——此后每条消息都要为它白付一次 mutex 加一次 `T` 拷贝，而且是在持有源锁期间，会拖慢其他所有消费者。两件事改的是同一个扇出循环，放在一起做。
+
 **Files:**
-- Modify: `coro/detail/fiberchannel.hpp`（`discard_pending()` 第 216-219 行）
+- Modify: `coro/detail/fiberchannel.hpp`（`discard_pending()` 与 `push()` 的扇出循环；行号已因 Task 1/2 变动，按函数名定位）
 - Test: `test/testfiberawait/tst_testfiberawait.cpp`
 
 **Interfaces:**
 - Consumes: Task 1、Task 2 的成果；`Coro::coro(server).nextConnection()`（现有工厂，`corotcpserver.hpp:119`）
-- Produces: 无新签名；`FiberChannel<T>::discard_pending()` 改为同时清空全部镜像队列
+- Produces: 无新签名；`FiberChannel<T>::discard_pending()` 改为同时清空全部镜像队列；`FiberChannel<T>::push()` 改为在镜像返回 `closed` 时一并剔除该镜像
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -497,6 +501,112 @@ Expected: `Totals: 3 passed, 0 failed`，且无 AddressSanitizer 报告
 ```bash
 git add coro/detail/fiberchannel.hpp test/testfiberawait/tst_testfiberawait.cpp
 git commit -m "fix(await): purge mirror queues on discard_pending"
+```
+
+- [ ] **Step 6: 写失败的测试（已关闭镜像的剔除）**
+
+这一半需要一个能观察到「拷贝确实不再发生」的元素类型。在 `TestFiberAwait` 类定义之前、其他测试辅助类（`SigObject` 等）旁边加入：
+
+```cpp
+/// @brief 记录拷贝次数的测试用元素类型，用于观察扇出是否仍在向已关闭镜像投递。
+struct CopyCounted
+{
+    static int copies;
+    int value{0};
+    CopyCounted() = default;
+    explicit CopyCounted(int v):value(v){}
+    CopyCounted(const CopyCounted& other):value(other.value){ ++copies; }
+    CopyCounted& operator=(const CopyCounted& other){ value = other.value; ++copies; return *this; }
+    CopyCounted(CopyCounted&&) noexcept = default;
+    CopyCounted& operator=(CopyCounted&&) noexcept = default;
+};
+int CopyCounted::copies = 0;
+```
+
+在 `private slots:` 列表中 `void test_case_broadcast_server_destroy_purges_mirror();` 之后加入：
+
+```cpp
+    void test_case_broadcast_closed_mirror_pruned();
+```
+
+在 `void TestFiberAwait::test_case_socket_error_conversion()` 之前插入：
+
+```cpp
+/// @brief 验证已关闭但句柄仍存活的镜像会被剔除，此后不再为它付出拷贝代价。
+/// @details resolve() 经由 push(T value) 传参，每次调用都有一次固有拷贝，与镜像无关；
+///          因此断言的是「相对基线的增量」而非绝对值。
+void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
+{
+    // 先标定：无镜像时每次 resolve 的固有拷贝代价
+    Coro::Awaitable<CopyCounted> plain;
+    CopyCounted::copies = 0;
+    QVERIFY(plain.resolve(CopyCounted(1)));
+    const int baseline = CopyCounted::copies;
+    QVERIFY(baseline > 0);
+
+    Coro::Awaitable<CopyCounted> source;
+    auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
+    mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
+
+    // 第一次投递仍会拷给这条待剔除的镜像，因此高于基线
+    CopyCounted::copies = 0;
+    QVERIFY(source.resolve(CopyCounted(1)));
+    QVERIFY(CopyCounted::copies > baseline);
+
+    // 剔除之后，每次 resolve 只剩固有代价
+    CopyCounted::copies = 0;
+    QVERIFY(source.resolve(CopyCounted(2)));
+    QVERIFY(source.resolve(CopyCounted(3)));
+    QCOMPARE(CopyCounted::copies, baseline * 2);
+
+    // 源侧照常收到全部三条
+    QCOMPARE(source.await().value().value, 1);
+    QCOMPARE(source.await().value().value, 2);
+    QCOMPARE(source.await().value().value, 3);
+}
+```
+
+- [ ] **Step 7: 运行测试，确认失败**
+
+```bash
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_closed_mirror_pruned
+```
+
+Expected: 失败于 `QCOMPARE(CopyCounted::copies, baseline * 2)`。未剔除时，第 2、3 次 `resolve` 每次除固有拷贝外还要额外拷给已关闭的镜像，实际值约为 `baseline * 2` 的两倍。
+
+- [ ] **Step 8: 在 `push()` 的扇出循环中剔除已关闭镜像**
+
+把 `push()` 扇出循环里的存活分支改为检查返回值：
+
+```cpp
+        if(mirrors_){
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                auto mirror = list[i].lock();
+                // 句柄已析构，或镜像已关闭——两种情况都不再需要这条镜像
+                if(!mirror || mirror->push(value) == channel_status::closed){
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                    continue;
+                }
+                ++i;
+            }
+        }
+```
+
+- [ ] **Step 9: 运行测试，确认通过**
+
+```bash
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_closed_mirror_pruned && ./testfiberawait
+```
+
+Expected: 焦点用例 `Totals: 3 passed, 0 failed`；全量套件 `0 failed`，无 AddressSanitizer 报告，进程自行退出。
+
+- [ ] **Step 10: 提交**
+
+```bash
+git add coro/detail/fiberchannel.hpp test/testfiberawait/tst_testfiberawait.cpp
+git commit -m "perf(await): prune mirrors that closed while their handle lives"
 ```
 
 ---

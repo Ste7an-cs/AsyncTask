@@ -6,9 +6,13 @@
 #include <boost/fiber/channel_op_status.hpp>
 #include <boost/fiber/exceptions.hpp>
 #include <deque>
+#include <memory>
 #include <system_error>
+#include <vector>
 
 namespace Coro {
+
+template<typename T> class Awaitable;
 
 /**
  * @brief 跨线程/跨协程安全的队列，可用于两个线程/协程间数据传递。
@@ -43,6 +47,23 @@ public:
     /** @brief 禁止拷贝赋值 */
     FiberChannel& operator=(const FiberChannel&) = delete ;
     /**
+     * @brief 析构：源 channel 消亡而未 close 时，令镜像收敛。
+     * @details 不这样做的话，订阅者的 await 会永久阻塞——镜像仍开着却再无生产者。
+     *          用 connection_aborted 与正常结束的 no_message 区分，便于定位误丢源句柄。
+     *          此时引用计数已归零，不存在其他持有者，自身状态无需加锁；但仍会经由
+     *          mirror->close(...) 取得每个存活镜像自己的锁，因此整体并非无锁操作——
+     *          释放最后一个 shared_ptr<FiberChannel> 可能因此阻塞或让出协程。
+     */
+    ~FiberChannel(){
+        if(mirrors_){
+            for(auto& weak : *mirrors_){
+                if(auto mirror = weak.lock()){
+                    mirror->close(std::make_error_code(std::errc::connection_aborted));
+                }
+            }
+        }
+    }
+    /**
      * @brief 添加一个元素 value 至队列
      * @param value 待入队的元素
      * @return 成功返回 success；如果 channel 已关闭返回 closed
@@ -57,6 +78,24 @@ public:
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         if ( BOOST_UNLIKELY( is_closed() ) ) {
             return channel_status::closed;
+        }
+        if(mirrors_){
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                auto mirror = list[i].lock();
+                if(!mirror){
+                    // 句柄已析构：weak_ptr 失效，swap-and-pop 剔除
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                    continue;
+                }
+                // 已关闭的镜像跳过投递（省掉一次加锁与一次 T 拷贝），但保留在列表中，
+                // 以便 discard_pending() 仍能清掉它队列里即将悬空的值
+                if(!mirror->is_closed()){
+                    mirror->push(value);
+                }
+                ++i;
+            }
         }
         queue_.push_back(std::move(value));
         cv_consumer_.notify_one();
@@ -173,6 +212,9 @@ public:
     /**
      * @brief 关闭 channel 并记录终止原因，唤醒并收敛所有等待者
      * @details 仅首次关闭会记录终止原因，后续 close() 调用不会覆盖已保留的错误。
+     *          同时以规范化后的终止原因（空错误码替换为 no_message）递归关闭所有
+     *          仍存活的镜像，否则镜像的消费者会永久挂在 await 上。镜像列表本身不清空，
+     *          discard_pending() 仍需经由它触达镜像以丢弃即将悬空的排队值。
      * @param error 终止原因
      * @code
      * // 来源出错时带错误码关闭，消费者可据此区分正常结束与异常终止
@@ -189,6 +231,14 @@ public:
                 : error;
         closed_.store(true);
         cv_consumer_.notify_all();
+        // 终止必须传播，否则镜像的消费者会永久挂在 await 上；镜像列表本身不清空——
+        // discard_pending() 之后仍可能通过它触达镜像（见 corotcpserver.hpp 的用例：
+        // 消费者先 close() 再 delete server，此时仍需清掉镜像队列里即将悬空的指针）。
+        if(mirrors_){
+            for(auto& weak : *mirrors_){
+                if(auto mirror = weak.lock()) mirror->close(close_error_);
+            }
+        }
     }
     /**
      * @brief 返回首次关闭 channel 时记录的终止原因。
@@ -216,6 +266,21 @@ public:
     void discard_pending(){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         queue_.clear();
+        // 镜像里存的是同一批即将悬空的值，必须一并丢弃；push() 关闭后即早返回，
+        // 因此这里是唯一还会遍历已关闭 channel 镜像列表的扇出点，顺便剔除失效槽位
+        if(mirrors_){
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                auto mirror = list[i].lock();
+                if(!mirror){
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                    continue;
+                }
+                mirror->discard_pending();
+                ++i;
+            }
+        }
     }
 private:
     mutable boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量
@@ -223,8 +288,33 @@ private:
     std::deque<T> queue_{};///< 底层元素队列
     std::atomic_bool closed_{false};///< 关闭标志
     std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
+    std::unique_ptr<std::vector<std::weak_ptr<FiberChannel<T>>>> mirrors_;///< 镜像通道列表；无人调用 shared() 时保持空指针，不产生堆分配
 
+    template<typename U> friend class Awaitable;
 
+    /**
+     * @brief 注册一条镜像通道，此后每次 push 都会同步投递一份副本。
+     * @details 源已关闭时不注册，直接以源首次关闭时记录的终止原因关闭该镜像，
+     *          避免订阅者永久挂起。仅由 Awaitable::shared() 调用；保持内部可见，
+     *          公开会让调用方构造出互为镜像的环从而死锁。
+     * @param mirror 接收副本的镜像通道
+     */
+    void addMirror(const std::shared_ptr<FiberChannel<T>>& mirror){
+        if(!mirror){
+            return;
+        }
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        if(closed_.load()){
+            const std::error_code error = close_error_;
+            lck.unlock();
+            mirror->close(error);
+            return;
+        }
+        if(!mirrors_){
+            mirrors_ = std::make_unique<std::vector<std::weak_ptr<FiberChannel<T>>>>();
+        }
+        mirrors_->push_back(mirror);
+    }
 };
 
 }

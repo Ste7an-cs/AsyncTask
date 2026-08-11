@@ -149,6 +149,31 @@ public:
     std::shared_ptr<FiberChannel<T>> channel() const { return ch_; }
 
     /**
+     * @brief 注册一个共享订阅者，此后源产生的每个值都会同步复制一份投递给它。
+     *
+     * 返回的是普通 Awaitable，因此 Coro::await / await_for / generate 均原样可用。
+     * 订阅者之间互为广播（各得全量），与直接 await 本对象的抢占式消费者也不竞争。
+     * 不做 replay：本次调用之前已产生的值对订阅者不可见。订阅句柄析构即自动退订。
+     * 源关闭时经由 FiberChannel::close 直接扇出到镜像，不经过订阅句柄自身的 close()，
+     * 因此订阅句柄上的 setOnClose 钩子在这种情况下不会触发，仍要等该句柄自身析构。
+     * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
+     * @code
+     * auto src = Coro::coro(sock).readAll();
+     * auto sync = src->shared();      // 数据同步
+     * auto audit = src->shared();     // 日志分发
+     * Coro::makeTask([sync]{ while(auto c = Coro::await(sync)) apply(c.value()); return 0; });
+     * Coro::makeTask([audit]{ for(auto c : Coro::generate(audit)) log(c); return 0; });
+     * @endcode
+     */
+    std::shared_ptr<Awaitable<T>> shared(){
+        auto sub = std::make_shared<Awaitable<T>>();
+        if(ch_){
+            ch_->addMirror(sub->channel());
+        }
+        return sub;
+    }
+
+    /**
      * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子。
      *
      * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。替换旧回调时，旧回调会在
@@ -314,6 +339,27 @@ public:
      * @endcode
      */
     std::shared_ptr<FiberChannel<int>> channel() const { return ch_; }
+
+    /**
+     * @brief 注册一个共享订阅者，此后每次 resolve() 都会同步通知它一次。
+     *
+     * 语义与 Awaitable<T>::shared() 相同：订阅者之间互为广播，与直接 await
+     * 本对象的抢占式消费者不竞争，不做 replay，句柄析构即自动退订。
+     * 源关闭时经由 FiberChannel::close 直接扇出到镜像，不经过订阅句柄自身的 close()，
+     * 因此订阅句柄上的 setOnClose 钩子在这种情况下不会触发，仍要等该句柄自身析构。
+     * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
+     * @code
+     * Coro::Awaitable<void> done;
+     * auto watcher = done.shared();     // 与直接 await(done) 的消费者各得一份
+     * @endcode
+     */
+    std::shared_ptr<Awaitable<void>> shared(){
+        auto sub = std::make_shared<Awaitable<void>>();
+        if(ch_){
+            ch_->addMirror(sub->channel());
+        }
+        return sub;
+    }
 
     /**
      * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子
