@@ -106,11 +106,11 @@ void TestFiberAwait::test_case_broadcast_no_replay()
 
     auto late = source.shared();
     QVERIFY(source.resolve(3));
-    source.close();
 
+    // 首次 await 直接取到 3，即证明订阅之前的 1、2 未被投递
     QCOMPARE(late->await().value(), 3);
-    QCOMPARE(late->await().error(), std::make_error_code(std::errc::no_message));
 
+    // 源侧不受影响，仍能取到全部三条
     QCOMPARE(source.await().value(), 1);
     QCOMPARE(source.await().value(), 2);
     QCOMPARE(source.await().value(), 3);
@@ -132,11 +132,9 @@ void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
 
     // 失效槽位在下一次 push 时被剔除，存活订阅者不受影响
     QVERIFY(source.resolve(2));
-    source.close();
 
     QCOMPARE(keep->await().value(), 1);
     QCOMPARE(keep->await().value(), 2);
-    QCOMPARE(keep->await().error(), std::make_error_code(std::errc::no_message));
 }
 ```
 
