@@ -199,6 +199,7 @@ private slots:
     void test_case_broadcast_void();
     void test_case_broadcast_coexists_with_competing_consumers();
     void test_case_broadcast_cross_thread_consumers();
+    void test_case_broadcast_tcp_read_stream();
     void test_case_broadcast_closed_stream_purges_mirror_on_destroy();
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
@@ -828,6 +829,45 @@ void TestFiberAwait::test_case_broadcast_cross_thread_consumers()
 
     worker->quit();
     delete worker;
+}
+
+/// @brief 验证 socket 读取流的广播：两个订阅者各自收到完整字节流，远端关闭后一并收敛。
+void TestFiberAwait::test_case_broadcast_tcp_read_stream()
+{
+    using namespace std::chrono_literals;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(&server).nextConnection();
+
+    QTcpSocket client;
+    QVERIFY(Coro::await_for(Coro::coro(&client).connectToHost(
+        QHostAddress::LocalHost, server.serverPort()), 2s));
+    auto accepted = Coro::await_for(incoming, 2s);
+    QVERIFY(accepted);
+    QTcpSocket* peer = accepted.value();
+
+    auto stream = Coro::coro(&client).readAll();
+    auto parser = stream->shared();
+    auto audit  = stream->shared();
+
+    auto written = Coro::coro(peer).waitForBytesWritten();
+    QCOMPARE(peer->write("final-bytes"), qint64(11));
+    QVERIFY(Coro::await_for(written, 2s));
+    peer->disconnectFromHost();
+
+    // 两个订阅者各自收到完整字节流
+    QCOMPARE(Coro::await_for(parser, 2s).value(), QByteArray("final-bytes"));
+    QCOMPARE(Coro::await_for(audit, 2s).value(), QByteArray("final-bytes"));
+
+    // 远端关闭 → 源流关闭 → 两个订阅者都收敛，不再挂起
+    auto parserEnd = Coro::await_for(parser, 2s);
+    QVERIFY(!parserEnd);
+    QCOMPARE(parserEnd.error(), std::make_error_code(std::errc::no_message));
+    auto auditEnd = Coro::await_for(audit, 2s);
+    QVERIFY(!auditEnd);
+    QCOMPARE(auditEnd.error(), std::make_error_code(std::errc::no_message));
+
+    delete peer;
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
