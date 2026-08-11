@@ -532,22 +532,31 @@ int CopyCounted::copies = 0;
 
 ```cpp
 /// @brief 验证已关闭但句柄仍存活的镜像会被剔除，此后不再为它付出拷贝代价。
+/// @details resolve() 经由 push(T value) 传参，每次调用都有一次固有拷贝，与镜像无关；
+///          因此断言的是「相对基线的增量」而非绝对值。
 void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
 {
+    // 先标定：无镜像时每次 resolve 的固有拷贝代价
+    Coro::Awaitable<CopyCounted> plain;
+    CopyCounted::copies = 0;
+    QVERIFY(plain.resolve(CopyCounted(1)));
+    const int baseline = CopyCounted::copies;
+    QVERIFY(baseline > 0);
+
     Coro::Awaitable<CopyCounted> source;
     auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
-
     mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
 
+    // 第一次投递仍会拷给这条待剔除的镜像，因此高于基线
     CopyCounted::copies = 0;
     QVERIFY(source.resolve(CopyCounted(1)));
-    const int afterFirst = CopyCounted::copies;   // 这一次仍会拷贝给镜像，随后剔除
+    QVERIFY(CopyCounted::copies > baseline);
 
+    // 剔除之后，每次 resolve 只剩固有代价
+    CopyCounted::copies = 0;
     QVERIFY(source.resolve(CopyCounted(2)));
     QVERIFY(source.resolve(CopyCounted(3)));
-
-    // 剔除后不再为已关闭镜像产生任何额外拷贝
-    QCOMPARE(CopyCounted::copies, afterFirst);
+    QCOMPARE(CopyCounted::copies, baseline * 2);
 
     // 源侧照常收到全部三条
     QCOMPARE(source.await().value().value, 1);
@@ -562,7 +571,7 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
 cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_closed_mirror_pruned
 ```
 
-Expected: 失败。未剔除时每次 `resolve` 都会向已关闭镜像拷贝一次，`CopyCounted::copies` 持续增长，`QCOMPARE(CopyCounted::copies, afterFirst)` 因此不相等。
+Expected: 失败于 `QCOMPARE(CopyCounted::copies, baseline * 2)`。未剔除时，第 2、3 次 `resolve` 每次除固有拷贝外还要额外拷给已关闭的镜像，实际值约为 `baseline * 2` 的两倍。
 
 - [ ] **Step 8: 在 `push()` 的扇出循环中剔除已关闭镜像**
 
