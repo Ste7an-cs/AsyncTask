@@ -411,13 +411,15 @@ git commit -m "feat(await): propagate channel close to mirrors"
 
 `nextConnection()` 推送的 `QTcpSocket*` 是 `QTcpServer` 的子对象。server 析构时 Qt 连带删除它们，`discard_pending()` 负责清掉队列里即将悬空的指针。不扇出的话，镜像队列里会留下野指针——一个只在「server 先于消费者析构」时序下触发的 use-after-free。
 
+本任务还顺带解决一个 Task 2 review 提出、经确认并入此处的问题：`push()` 丢弃了 `mirror->push(value)` 的返回值，导致「已 `close()` 但句柄仍存活」的镜像永不被剔除——此后每条消息都要为它白付一次 mutex 加一次 `T` 拷贝，而且是在持有源锁期间，会拖慢其他所有消费者。两件事改的是同一个扇出循环，放在一起做。
+
 **Files:**
-- Modify: `coro/detail/fiberchannel.hpp`（`discard_pending()` 第 216-219 行）
+- Modify: `coro/detail/fiberchannel.hpp`（`discard_pending()` 与 `push()` 的扇出循环；行号已因 Task 1/2 变动，按函数名定位）
 - Test: `test/testfiberawait/tst_testfiberawait.cpp`
 
 **Interfaces:**
 - Consumes: Task 1、Task 2 的成果；`Coro::coro(server).nextConnection()`（现有工厂，`corotcpserver.hpp:119`）
-- Produces: 无新签名；`FiberChannel<T>::discard_pending()` 改为同时清空全部镜像队列
+- Produces: 无新签名；`FiberChannel<T>::discard_pending()` 改为同时清空全部镜像队列；`FiberChannel<T>::push()` 改为在镜像返回 `closed` 时一并剔除该镜像
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -498,6 +500,103 @@ Expected: `Totals: 3 passed, 0 failed`，且无 AddressSanitizer 报告
 ```bash
 git add coro/detail/fiberchannel.hpp test/testfiberawait/tst_testfiberawait.cpp
 git commit -m "fix(await): purge mirror queues on discard_pending"
+```
+
+- [ ] **Step 6: 写失败的测试（已关闭镜像的剔除）**
+
+这一半需要一个能观察到「拷贝确实不再发生」的元素类型。在 `TestFiberAwait` 类定义之前、其他测试辅助类（`SigObject` 等）旁边加入：
+
+```cpp
+/// @brief 记录拷贝次数的测试用元素类型，用于观察扇出是否仍在向已关闭镜像投递。
+struct CopyCounted
+{
+    static int copies;
+    int value{0};
+    CopyCounted() = default;
+    explicit CopyCounted(int v):value(v){}
+    CopyCounted(const CopyCounted& other):value(other.value){ ++copies; }
+    CopyCounted& operator=(const CopyCounted& other){ value = other.value; ++copies; return *this; }
+    CopyCounted(CopyCounted&&) noexcept = default;
+    CopyCounted& operator=(CopyCounted&&) noexcept = default;
+};
+int CopyCounted::copies = 0;
+```
+
+在 `private slots:` 列表中 `void test_case_broadcast_server_destroy_purges_mirror();` 之后加入：
+
+```cpp
+    void test_case_broadcast_closed_mirror_pruned();
+```
+
+在 `void TestFiberAwait::test_case_socket_error_conversion()` 之前插入：
+
+```cpp
+/// @brief 验证已关闭但句柄仍存活的镜像会被剔除，此后不再为它付出拷贝代价。
+void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
+{
+    Coro::Awaitable<CopyCounted> source;
+    auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
+
+    mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
+
+    CopyCounted::copies = 0;
+    QVERIFY(source.resolve(CopyCounted(1)));
+    const int afterFirst = CopyCounted::copies;   // 这一次仍会拷贝给镜像，随后剔除
+
+    QVERIFY(source.resolve(CopyCounted(2)));
+    QVERIFY(source.resolve(CopyCounted(3)));
+
+    // 剔除后不再为已关闭镜像产生任何额外拷贝
+    QCOMPARE(CopyCounted::copies, afterFirst);
+
+    // 源侧照常收到全部三条
+    QCOMPARE(source.await().value().value, 1);
+    QCOMPARE(source.await().value().value, 2);
+    QCOMPARE(source.await().value().value, 3);
+}
+```
+
+- [ ] **Step 7: 运行测试，确认失败**
+
+```bash
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_closed_mirror_pruned
+```
+
+Expected: 失败。未剔除时每次 `resolve` 都会向已关闭镜像拷贝一次，`CopyCounted::copies` 持续增长，`QCOMPARE(CopyCounted::copies, afterFirst)` 因此不相等。
+
+- [ ] **Step 8: 在 `push()` 的扇出循环中剔除已关闭镜像**
+
+把 `push()` 扇出循环里的存活分支改为检查返回值：
+
+```cpp
+        if(mirrors_){
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                auto mirror = list[i].lock();
+                // 句柄已析构，或镜像已关闭——两种情况都不再需要这条镜像
+                if(!mirror || mirror->push(value) == channel_status::closed){
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                    continue;
+                }
+                ++i;
+            }
+        }
+```
+
+- [ ] **Step 9: 运行测试，确认通过**
+
+```bash
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_closed_mirror_pruned && ./testfiberawait
+```
+
+Expected: 焦点用例 `Totals: 3 passed, 0 failed`；全量套件 `0 failed`，无 AddressSanitizer 报告，进程自行退出。
+
+- [ ] **Step 10: 提交**
+
+```bash
+git add coro/detail/fiberchannel.hpp test/testfiberawait/tst_testfiberawait.cpp
+git commit -m "perf(await): prune mirrors that closed while their handle lives"
 ```
 
 ---
