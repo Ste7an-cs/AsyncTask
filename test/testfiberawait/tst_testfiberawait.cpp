@@ -203,6 +203,7 @@ private slots:
     void test_case_broadcast_closed_stream_purges_mirror_on_destroy();
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
+    void test_case_broadcast_source_destroyed_converges_mirror();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -681,6 +682,28 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
     QCOMPARE(source.await().value().value, 1);
     QCOMPARE(source.await().value().value, 2);
     QCOMPARE(source.await().value().value, 3);
+}
+
+/// @brief 验证源句柄未 close 就析构时，订阅者以 connection_aborted 收敛而非永久阻塞。
+void TestFiberAwait::test_case_broadcast_source_destroyed_converges_mirror()
+{
+    using namespace std::chrono_literals;
+    std::shared_ptr<Coro::Awaitable<int>> subscriber;
+    {
+        Coro::Awaitable<int> source;
+        subscriber = source.shared();
+        QVERIFY(source.resolve(5));
+    }   // 源析构，未调用 close()
+
+    // 排队值仍先被消费
+    auto queued = Coro::await_for(subscriber, 100ms);
+    QVERIFY(queued);
+    QCOMPARE(queued.value(), 5);
+
+    // 随后必须收敛，而不是挂住
+    auto terminal = Coro::await_for(subscriber, 100ms);
+    QVERIFY(!terminal);
+    QCOMPARE(terminal.error(), std::make_error_code(std::errc::connection_aborted));
 }
 
 /// @brief 验证 void 特化的广播：每个订阅者各自收到全部事件与终止原因。

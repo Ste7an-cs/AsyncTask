@@ -47,6 +47,21 @@ public:
     /** @brief 禁止拷贝赋值 */
     FiberChannel& operator=(const FiberChannel&) = delete ;
     /**
+     * @brief 析构：源 channel 消亡而未 close 时，令镜像收敛。
+     * @details 不这样做的话，订阅者的 await 会永久阻塞——镜像仍开着却再无生产者。
+     *          用 connection_aborted 与正常结束的 no_message 区分，便于定位误丢源句柄。
+     *          此时引用计数已归零，不存在其他持有者，无需加锁。
+     */
+    ~FiberChannel(){
+        if(mirrors_){
+            for(auto& weak : *mirrors_){
+                if(auto mirror = weak.lock()){
+                    mirror->close(std::make_error_code(std::errc::connection_aborted));
+                }
+            }
+        }
+    }
+    /**
      * @brief 添加一个元素 value 至队列
      * @param value 待入队的元素
      * @return 成功返回 success；如果 channel 已关闭返回 closed
