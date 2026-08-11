@@ -61,7 +61,7 @@ cd test/testfiberawait/build && ./testfiberawait
 
 - [ ] **Step 1: 写失败的测试**
 
-在 `tst_testfiberawait.cpp` 的 `private slots:` 列表中，`void test_case_shared_awaitable_void();` 之后加入三行：
+在 `tst_testfiberawait.cpp` 的 `private slots:` 列表中，`void test_case_shared_awaitable_void();` 之后加入四行：
 
 ```cpp
     void test_case_broadcast_basic();
@@ -70,7 +70,7 @@ cd test/testfiberawait/build && ./testfiberawait
     void test_case_broadcast_subscribe_after_close();
 ```
 
-在 `void TestFiberAwait::test_case_socket_error_conversion()` 函数定义之前插入三个测试函数：
+在 `void TestFiberAwait::test_case_socket_error_conversion()` 函数定义之前插入四个测试函数：
 
 ```cpp
 /// @brief 验证每个 shared() 订阅者各自收到完整序列，且源队列保留全量。
@@ -139,7 +139,7 @@ void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
 }
 
 /// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
-/// @details 该分支唯一的职责就是防止订阅者永久等待，必须与实现它的代码同任务覆盖。
+/// @details 该分支唯一的职责就是防止订阅者永久等待。
 void TestFiberAwait::test_case_broadcast_subscribe_after_close()
 {
     using namespace std::chrono_literals;

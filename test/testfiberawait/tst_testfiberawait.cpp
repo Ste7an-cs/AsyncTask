@@ -505,7 +505,7 @@ void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
 }
 
 /// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
-/// @details 该分支唯一的职责就是防止订阅者永久等待，必须与实现它的代码同任务覆盖。
+/// @details 该分支唯一的职责就是防止订阅者永久等待。
 void TestFiberAwait::test_case_broadcast_subscribe_after_close()
 {
     using namespace std::chrono_literals;
