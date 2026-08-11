@@ -621,9 +621,12 @@ void TestFiberAwait::test_case_broadcast_closed_stream_purges_mirror_on_destroy(
     incoming->close();   // 消费者先关闭流：镜像被关闭，但两侧队列仍留有排队指针
     delete server;       // 随后销毁服务器，子 QTcpSocket 被删除
 
-    // 镜像队列必须已被清空，否则此处取出已删除对象
+    // 镜像队列必须已被清空，否则此处取出已删除对象；
+    // 必须断言终止原因——只判 !mirrored 的话，等待超时同样为假，
+    // 「队列清空了但镜像仍开着」的回归会静默耗满 100ms 后照常通过。
     auto mirrored = Coro::await_for(audit, 100ms);
     QVERIFY(!mirrored);
+    QCOMPARE(mirrored.error(), std::make_error_code(std::errc::no_message));
 }
 
 /// @brief 验证已关闭的镜像排在存活镜像之前时，剔除不会连带跳过后者。
