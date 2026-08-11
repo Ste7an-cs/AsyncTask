@@ -242,6 +242,12 @@ public:
     void discard_pending(){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         queue_.clear();
+        // 镜像里存的是同一批即将悬空的值，必须一并丢弃
+        if(mirrors_){
+            for(auto& weak : *mirrors_){
+                if(auto mirror = weak.lock()) mirror->discard_pending();
+            }
+        }
     }
 private:
     mutable boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量

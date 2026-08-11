@@ -180,6 +180,7 @@ private slots:
     void test_case_broadcast_subscribe_after_close();
     void test_case_broadcast_terminal_error();
     void test_case_broadcast_mirror_close_isolated();
+    void test_case_broadcast_server_destroy_purges_mirror();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -552,6 +553,35 @@ void TestFiberAwait::test_case_broadcast_mirror_close_isolated()
     QCOMPARE(second->await().value(), 5);
     QCOMPARE(second->await().error(), std::make_error_code(std::errc::no_message));
     QCOMPARE(source.await().value(), 5);
+}
+
+/// @brief 验证服务器销毁时镜像队列中的悬空连接指针一并被丢弃。
+/// @details 排队的 QTcpSocket* 是 server 的子对象，server 析构会删除它们；
+///          若 discard_pending 不扇出，订阅者会取到已删除对象（ASan 报 use-after-free）。
+void TestFiberAwait::test_case_broadcast_server_destroy_purges_mirror()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+    auto audit = incoming->shared();
+    QSignalSpy connectionSignal(server, &QTcpServer::newConnection);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());
+
+    delete server;   // 子 QTcpSocket 一并删除，两侧队列中的指针全部悬空
+
+    auto mirrored = Coro::await_for(audit, 100ms);
+    QVERIFY(!mirrored);
+    QCOMPARE(mirrored.error(), std::make_error_code(std::errc::no_message));
+
+    auto finished = Coro::await_for(incoming, 100ms);
+    QVERIFY(!finished);
+    QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
