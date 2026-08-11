@@ -747,8 +747,9 @@ void TestFiberAwait::test_case_broadcast_coexists_with_competing_consumers()
     TQVERIFY(subscriberB.get().value() == 50);
 }
 
-/// @brief 验证订阅者被固定到探测得到的非主线程 id 后，扇出投递确实在该线程上完成
-///        （而非恰好落在预置的工作线程池或主线程上）。
+/// @brief 验证订阅者被固定到探测得到的非主线程 id 后，扇出投递确实在该线程上完成。
+/// @note  探测不区分新建的 QtFiberThread 与预置工作线程池，二者皆为合格的目标；
+///        本用例证明的是「确实跑在某个非主线程上」，不保证具体是哪一个。
 /// @details Affinity::sticky() 无法直接拿到目标 QtFiberThread 的 std::thread::id；
 ///          因此先用有限次数的粘连探测协程记录 std::this_thread::get_id()，收集到
 ///          一个非主线程 id 后，再用 Affinity::fixed(id) 显式固定两个订阅者，并让
