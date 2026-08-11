@@ -6,9 +6,13 @@
 #include <boost/fiber/channel_op_status.hpp>
 #include <boost/fiber/exceptions.hpp>
 #include <deque>
+#include <memory>
 #include <system_error>
+#include <vector>
 
 namespace Coro {
+
+template<typename T> class Awaitable;
 
 /**
  * @brief 跨线程/跨协程安全的队列，可用于两个线程/协程间数据传递。
@@ -57,6 +61,19 @@ public:
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         if ( BOOST_UNLIKELY( is_closed() ) ) {
             return channel_status::closed;
+        }
+        if(mirrors_){
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                if(auto mirror = list[i].lock()){
+                    mirror->push(value);
+                    ++i;
+                }else{
+                    // swap-and-pop：扇出顺序无关，剔除失效项 O(1)，不做 memmove
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                }
+            }
         }
         queue_.push_back(std::move(value));
         cv_consumer_.notify_one();
@@ -223,8 +240,34 @@ private:
     std::deque<T> queue_{};///< 底层元素队列
     std::atomic_bool closed_{false};///< 关闭标志
     std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
+    ///< 镜像通道列表；无人调用 shared() 时保持空指针，不产生堆分配
+    std::unique_ptr<std::vector<std::weak_ptr<FiberChannel<T>>>> mirrors_;
 
+    template<typename U> friend class Awaitable;
 
+    /**
+     * @brief 注册一条镜像通道，此后每次 push 都会同步投递一份副本。
+     * @details 源已关闭时不注册，直接以源首次关闭时记录的终止原因关闭该镜像，
+     *          避免订阅者永久挂起。仅由 Awaitable::shared() 调用；保持内部可见，
+     *          公开会让调用方构造出互为镜像的环从而死锁。
+     * @param mirror 接收副本的镜像通道
+     */
+    void addMirror(const std::shared_ptr<FiberChannel<T>>& mirror){
+        if(!mirror){
+            return;
+        }
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        if(closed_.load()){
+            const std::error_code error = close_error_;
+            lck.unlock();
+            mirror->close(error);
+            return;
+        }
+        if(!mirrors_){
+            mirrors_ = std::make_unique<std::vector<std::weak_ptr<FiberChannel<T>>>>();
+        }
+        mirrors_->push_back(mirror);
+    }
 };
 
 }

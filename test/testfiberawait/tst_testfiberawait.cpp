@@ -174,6 +174,9 @@ private slots:
     void test_case_shared_awaitable();
     void test_case_shared_generator_terminal_timeout();
     void test_case_shared_awaitable_void();
+    void test_case_broadcast_basic();
+    void test_case_broadcast_no_replay();
+    void test_case_broadcast_raii_unsubscribe();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -433,6 +436,71 @@ void TestFiberAwait::test_case_shared_awaitable_void()
         ++events;
     }
     QCOMPARE(events, 2);
+}
+
+/// @brief 验证每个 shared() 订阅者各自收到完整序列，且源队列保留全量。
+void TestFiberAwait::test_case_broadcast_basic()
+{
+    Coro::Awaitable<int> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    QVERIFY(source.resolve(1));
+    QVERIFY(source.resolve(2));
+    QVERIFY(source.resolve(3));
+
+    QCOMPARE(first->await().value(), 1);
+    QCOMPARE(first->await().value(), 2);
+    QCOMPARE(first->await().value(), 3);
+
+    QCOMPARE(second->await().value(), 1);
+    QCOMPARE(second->await().value(), 2);
+    QCOMPARE(second->await().value(), 3);
+
+    // 源队列不因订阅者消费而减少，直接消费者仍取得全量
+    QCOMPARE(source.await().value(), 1);
+    QCOMPARE(source.await().value(), 2);
+    QCOMPARE(source.await().value(), 3);
+}
+
+/// @brief 验证订阅之前产生的值对订阅者不可见，且不影响源队列。
+void TestFiberAwait::test_case_broadcast_no_replay()
+{
+    Coro::Awaitable<int> source;
+    QVERIFY(source.resolve(1));
+    QVERIFY(source.resolve(2));
+
+    auto late = source.shared();
+    QVERIFY(source.resolve(3));
+
+    // 首次 await 直接取到 3，即证明订阅之前的 1、2 未被投递
+    QCOMPARE(late->await().value(), 3);
+
+    // 源侧不受影响，仍能取到全部三条
+    QCOMPARE(source.await().value(), 1);
+    QCOMPARE(source.await().value(), 2);
+    QCOMPARE(source.await().value(), 3);
+}
+
+/// @brief 验证订阅句柄析构即自动退订，且不影响其他订阅者。
+void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
+{
+    Coro::Awaitable<int> source;
+    auto keep = source.shared();
+    std::weak_ptr<Coro::Awaitable<int>> observed;
+    {
+        auto temporary = source.shared();
+        observed = temporary;
+        QVERIFY(source.resolve(1));
+        QCOMPARE(temporary->await().value(), 1);
+    }
+    QVERIFY(observed.expired());
+
+    // 失效槽位在下一次 push 时被剔除，存活订阅者不受影响
+    QVERIFY(source.resolve(2));
+
+    QCOMPARE(keep->await().value(), 1);
+    QCOMPARE(keep->await().value(), 2);
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。

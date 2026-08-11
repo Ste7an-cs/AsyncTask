@@ -149,6 +149,29 @@ public:
     std::shared_ptr<FiberChannel<T>> channel() const { return ch_; }
 
     /**
+     * @brief 注册一个共享订阅者，此后源产生的每个值都会同步复制一份投递给它。
+     *
+     * 返回的是普通 Awaitable，因此 Coro::await / await_for / generate 均原样可用。
+     * 订阅者之间互为广播（各得全量），与直接 await 本对象的抢占式消费者也不竞争。
+     * 不做 replay：本次调用之前已产生的值对订阅者不可见。订阅句柄析构即自动退订。
+     * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
+     * @code
+     * auto src = Coro::coro(sock).readAll();
+     * auto sync = src->shared();      // 数据同步
+     * auto audit = src->shared();     // 日志分发
+     * Coro::makeTask([sync]{ while(auto c = Coro::await(sync)) apply(c.value()); return 0; });
+     * Coro::makeTask([audit]{ for(const auto& c : Coro::generate(audit)) log(c); return 0; });
+     * @endcode
+     */
+    std::shared_ptr<Awaitable<T>> shared(){
+        auto sub = std::make_shared<Awaitable<T>>();
+        if(ch_){
+            ch_->addMirror(sub->channel());
+        }
+        return sub;
+    }
+
+    /**
      * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子。
      *
      * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。替换旧回调时，旧回调会在
