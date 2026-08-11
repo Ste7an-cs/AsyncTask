@@ -50,7 +50,9 @@ public:
      * @brief 析构：源 channel 消亡而未 close 时，令镜像收敛。
      * @details 不这样做的话，订阅者的 await 会永久阻塞——镜像仍开着却再无生产者。
      *          用 connection_aborted 与正常结束的 no_message 区分，便于定位误丢源句柄。
-     *          此时引用计数已归零，不存在其他持有者，无需加锁。
+     *          此时引用计数已归零，不存在其他持有者，自身状态无需加锁；但仍会经由
+     *          mirror->close(...) 取得每个存活镜像自己的锁，因此整体并非无锁操作——
+     *          释放最后一个 shared_ptr<FiberChannel> 可能因此阻塞或让出协程。
      */
     ~FiberChannel(){
         if(mirrors_){

@@ -203,7 +203,9 @@ private slots:
     void test_case_broadcast_closed_stream_purges_mirror_on_destroy();
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
+    void test_case_broadcast_discard_prunes_without_skipping();
     void test_case_broadcast_source_destroyed_converges_mirror();
+    void test_case_broadcast_source_destroyed_converges_chain();
     void test_case_broadcast_generate();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -685,6 +687,32 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
     QCOMPARE(source.await().value().value, 3);
 }
 
+/// @brief 验证 discard_pending() 剔除失效镜像时不会跳过排在其后的存活镜像。
+/// @details 与 push() 的同名风险一致：剔除后若错误地推进下标，会漏掉被交换到该位置的元素。
+///          失效镜像须排在存活镜像之前，且期间不能有任何 push() 抢先把它剔除掉，
+///          否则本测试测的就是 push() 的剔除逻辑，而不是 discard_pending() 自己的。
+void TestFiberAwait::test_case_broadcast_discard_prunes_without_skipping()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> source;
+    std::shared_ptr<Coro::Awaitable<int>> live;
+    {
+        auto doomed = source.shared();          // 先注册，位于扇出列表前部
+        live = source.shared();                 // 后注册，位于扇出列表后部
+        QVERIFY(source.resolve(1));             // 两个镜像的队列里都留下一份 1
+        QCOMPARE(doomed->await().value(), 1);   // 消费掉 doomed 自己的那份，避免干扰判断
+    }   // doomed 析构 → 其槽位失效；此后未再发生任何 push()，
+        // 剔除只能发生在接下来的 discard_pending() 自身内部
+
+    // live 的队列里还留着上面那次 resolve(1) 的排队值
+    source.channel()->discard_pending();
+
+    // live 的队列必须被清空——若剔除时跳过了它，队列里仍会留着值
+    auto afterDiscard = Coro::await_for(live, 50ms);
+    QVERIFY(!afterDiscard);
+    QCOMPARE(afterDiscard.error(), std::make_error_code(std::errc::timed_out));
+}
+
 /// @brief 验证源句柄未 close 就析构时，订阅者以 connection_aborted 收敛而非永久阻塞。
 void TestFiberAwait::test_case_broadcast_source_destroyed_converges_mirror()
 {
@@ -705,6 +733,32 @@ void TestFiberAwait::test_case_broadcast_source_destroyed_converges_mirror()
     auto terminal = Coro::await_for(subscriber, 100ms);
     QVERIFY(!terminal);
     QCOMPARE(terminal.error(), std::make_error_code(std::errc::connection_aborted));
+}
+
+/// @brief 验证源析构时，链式订阅（source → mirror → 二级镜像）逐级收敛。
+void TestFiberAwait::test_case_broadcast_source_destroyed_converges_chain()
+{
+    using namespace std::chrono_literals;
+    std::shared_ptr<Coro::Awaitable<int>> mirror;
+    std::shared_ptr<Coro::Awaitable<int>> nested;
+    {
+        Coro::Awaitable<int> source;
+        mirror = source.shared();
+        nested = mirror->shared();
+        QVERIFY(source.resolve(7));
+    }   // 源析构，未 close()
+
+    // 两级都先取到排队值
+    QCOMPARE(Coro::await_for(mirror, 100ms).value(), 7);
+    QCOMPARE(Coro::await_for(nested, 100ms).value(), 7);
+
+    // 随后两级都必须收敛
+    auto mirrorEnd = Coro::await_for(mirror, 100ms);
+    QVERIFY(!mirrorEnd);
+    QCOMPARE(mirrorEnd.error(), std::make_error_code(std::errc::connection_aborted));
+    auto nestedEnd = Coro::await_for(nested, 100ms);
+    QVERIFY(!nestedEnd);
+    QCOMPARE(nestedEnd.error(), std::make_error_code(std::errc::connection_aborted));
 }
 
 /// @brief 验证 Coro::generate() 可直接迭代 shared() 订阅句柄，源关闭后循环自然结束。
