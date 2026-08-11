@@ -190,6 +190,8 @@ public:
     /**
      * @brief 关闭 channel 并记录终止原因，唤醒并收敛所有等待者
      * @details 仅首次关闭会记录终止原因，后续 close() 调用不会覆盖已保留的错误。
+     *          同时以规范化后的终止原因（空错误码替换为 no_message）递归关闭所有
+     *          仍存活的镜像并清空镜像列表，否则镜像的消费者会永久挂在 await 上。
      * @param error 终止原因
      * @code
      * // 来源出错时带错误码关闭，消费者可据此区分正常结束与异常终止
@@ -206,6 +208,13 @@ public:
                 : error;
         closed_.store(true);
         cv_consumer_.notify_all();
+        // 终止必须传播，否则镜像的消费者会永久挂在 await 上
+        if(mirrors_){
+            for(auto& weak : *mirrors_){
+                if(auto mirror = weak.lock()) mirror->close(close_error_);
+            }
+            mirrors_.reset();
+        }
     }
     /**
      * @brief 返回首次关闭 channel 时记录的终止原因。

@@ -178,6 +178,8 @@ private slots:
     void test_case_broadcast_no_replay();
     void test_case_broadcast_raii_unsubscribe();
     void test_case_broadcast_subscribe_after_close();
+    void test_case_broadcast_terminal_error();
+    void test_case_broadcast_mirror_close_isolated();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -516,6 +518,40 @@ void TestFiberAwait::test_case_broadcast_subscribe_after_close()
     auto result = Coro::await_for(late, 50ms);
     QVERIFY(!result);
     QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
+}
+
+/// @brief 验证源关闭时终止原因传播给每个订阅者，且排队余量先于终止错误被消费。
+void TestFiberAwait::test_case_broadcast_terminal_error()
+{
+    Coro::Awaitable<int> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    QVERIFY(source.resolve(7));
+    source.close(std::make_error_code(std::errc::connection_reset));
+    source.close(std::make_error_code(std::errc::timed_out));   // 首次错误不得被覆盖
+
+    QCOMPARE(first->await().value(), 7);
+    QCOMPARE(first->await().error(), std::make_error_code(std::errc::connection_reset));
+    QCOMPARE(second->await().value(), 7);
+    QCOMPARE(second->await().error(), std::make_error_code(std::errc::connection_reset));
+}
+
+/// @brief 验证单个订阅者关闭只终止自己，源与其他订阅者不受影响。
+void TestFiberAwait::test_case_broadcast_mirror_close_isolated()
+{
+    Coro::Awaitable<int> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    first->close(std::make_error_code(std::errc::operation_canceled));
+    QVERIFY(source.resolve(5));
+    source.close();
+
+    QCOMPARE(first->await().error(), std::make_error_code(std::errc::operation_canceled));
+    QCOMPARE(second->await().value(), 5);
+    QCOMPARE(second->await().error(), std::make_error_code(std::errc::no_message));
+    QCOMPARE(source.await().value(), 5);
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
