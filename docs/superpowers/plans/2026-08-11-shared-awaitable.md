@@ -67,6 +67,7 @@ cd test/testfiberawait/build && ./testfiberawait
     void test_case_broadcast_basic();
     void test_case_broadcast_no_replay();
     void test_case_broadcast_raii_unsubscribe();
+    void test_case_broadcast_subscribe_after_close();
 ```
 
 在 `void TestFiberAwait::test_case_socket_error_conversion()` 函数定义之前插入三个测试函数：
@@ -135,6 +136,20 @@ void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
 
     QCOMPARE(keep->await().value(), 1);
     QCOMPARE(keep->await().value(), 2);
+}
+
+/// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
+/// @details 该分支唯一的职责就是防止订阅者永久等待，必须与实现它的代码同任务覆盖。
+void TestFiberAwait::test_case_broadcast_subscribe_after_close()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> source;
+    source.close(std::make_error_code(std::errc::connection_refused));
+
+    auto late = source.shared();
+    auto result = Coro::await_for(late, 50ms);
+    QVERIFY(!result);
+    QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
 }
 ```
 
@@ -267,10 +282,10 @@ template<typename T> class Awaitable;
 - [ ] **Step 7: 运行测试，确认通过**
 
 ```bash
-cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_basic test_case_broadcast_no_replay test_case_broadcast_raii_unsubscribe
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_basic test_case_broadcast_no_replay test_case_broadcast_raii_unsubscribe test_case_broadcast_subscribe_after_close
 ```
 
-Expected: `Totals: 5 passed, 0 failed`（3 个新用例 + `initTestCase` + `cleanupTestCase`）
+Expected: `Totals: 6 passed, 0 failed`（4 个新用例 + `initTestCase` + `cleanupTestCase`）
 
 - [ ] **Step 8: 提交**
 
@@ -299,9 +314,10 @@ git commit -m "feat(await): add shared() broadcast subscription via channel mirr
 
 ```cpp
     void test_case_broadcast_terminal_error();
-    void test_case_broadcast_subscribe_after_close();
     void test_case_broadcast_mirror_close_isolated();
 ```
+
+（`test_case_broadcast_subscribe_after_close` 已在 Task 1 完成——它覆盖的 `addMirror` 已关闭分支属于 Task 1 的代码，不要在这里重复添加。）
 
 在 `void TestFiberAwait::test_case_socket_error_conversion()` 之前插入：
 
@@ -321,19 +337,6 @@ void TestFiberAwait::test_case_broadcast_terminal_error()
     QCOMPARE(first->await().error(), std::make_error_code(std::errc::connection_reset));
     QCOMPARE(second->await().value(), 7);
     QCOMPARE(second->await().error(), std::make_error_code(std::errc::connection_reset));
-}
-
-/// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
-void TestFiberAwait::test_case_broadcast_subscribe_after_close()
-{
-    using namespace std::chrono_literals;
-    Coro::Awaitable<int> source;
-    source.close(std::make_error_code(std::errc::connection_refused));
-
-    auto late = source.shared();
-    auto result = Coro::await_for(late, 50ms);
-    QVERIFY(!result);
-    QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
 }
 
 /// @brief 验证单个订阅者关闭只终止自己，源与其他订阅者不受影响。
@@ -357,7 +360,7 @@ void TestFiberAwait::test_case_broadcast_mirror_close_isolated()
 - [ ] **Step 2: 运行测试，确认失败**
 
 ```bash
-cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error test_case_broadcast_subscribe_after_close
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error
 ```
 
 Expected: `test_case_broadcast_terminal_error` 失败——`first->await()` 取完 7 之后不会返回 `connection_reset`，而是卡住直到测试超时（close 尚未扇出）。
@@ -390,10 +393,10 @@ Expected: `test_case_broadcast_terminal_error` 失败——`first->await()` 取�
 - [ ] **Step 4: 运行测试，确认通过**
 
 ```bash
-cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error test_case_broadcast_subscribe_after_close test_case_broadcast_mirror_close_isolated
+cd test/testfiberawait/build && make -j$(nproc) && ./testfiberawait test_case_broadcast_terminal_error test_case_broadcast_mirror_close_isolated
 ```
 
-Expected: `Totals: 5 passed, 0 failed`
+Expected: `Totals: 4 passed, 0 failed`
 
 - [ ] **Step 5: 提交**
 
