@@ -385,10 +385,11 @@ Expected: `test_case_broadcast_terminal_error` 失败——`first->await()` 取�
             for(auto& weak : *mirrors_){
                 if(auto mirror = weak.lock()) mirror->close(close_error_);
             }
-            mirrors_.reset();
         }
     }
 ```
+
+**不要在这里 `mirrors_.reset()`。** 关闭之后 `discard_pending()` 仍然需要能触达镜像——消费者先 `close()` 流、随后才 `delete server` 是 `corotcpserver.hpp:135-137` 明确设计并注释说明的时序，此时镜像队列里还排着即将悬空的 `QTcpSocket*`。清空列表会让那条清理路径静默失效，造成 use-after-free。保留列表是安全的：`mirrors_` 存的是 `weak_ptr`（无所有权环）、`push()` 在触碰 `mirrors_` 之前就已因 `is_closed()` 提前返回、`close()` 重复调用会提前返回、`addMirror()` 对已关闭的源不再登记。
 
 - [ ] **Step 4: 运行测试，确认通过**
 
