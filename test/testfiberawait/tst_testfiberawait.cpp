@@ -195,6 +195,7 @@ private slots:
     void test_case_broadcast_terminal_error();
     void test_case_broadcast_mirror_close_isolated();
     void test_case_broadcast_server_destroy_purges_mirror();
+    void test_case_broadcast_void();
     void test_case_broadcast_closed_stream_purges_mirror_on_destroy();
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
@@ -676,6 +677,26 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
     QCOMPARE(source.await().value().value, 1);
     QCOMPARE(source.await().value().value, 2);
     QCOMPARE(source.await().value().value, 3);
+}
+
+/// @brief 验证 void 特化的广播：每个订阅者各自收到全部事件与终止原因。
+void TestFiberAwait::test_case_broadcast_void()
+{
+    Coro::Awaitable<void> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    QVERIFY(source.resolve());
+    QVERIFY(source.resolve());
+    source.close(std::make_error_code(std::errc::connection_reset));
+
+    QVERIFY(first->await().has_value());
+    QVERIFY(first->await().has_value());
+    QCOMPARE(first->await().error(), std::make_error_code(std::errc::connection_reset));
+
+    QVERIFY(second->await().has_value());
+    QVERIFY(second->await().has_value());
+    QCOMPARE(second->await().error(), std::make_error_code(std::errc::connection_reset));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。

@@ -339,6 +339,25 @@ public:
     std::shared_ptr<FiberChannel<int>> channel() const { return ch_; }
 
     /**
+     * @brief 注册一个共享订阅者，此后每次 resolve() 都会同步通知它一次。
+     *
+     * 语义与 Awaitable<T>::shared() 相同：订阅者之间互为广播，与直接 await
+     * 本对象的抢占式消费者不竞争，不做 replay，句柄析构即自动退订。
+     * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
+     * @code
+     * Coro::Awaitable<void> done;
+     * auto watcher = done.shared();     // 与直接 await(done) 的消费者各得一份
+     * @endcode
+     */
+    std::shared_ptr<Awaitable<void>> shared(){
+        auto sub = std::make_shared<Awaitable<void>>();
+        if(ch_){
+            ch_->addMirror(sub->channel());
+        }
+        return sub;
+    }
+
+    /**
      * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子
      * @details 替换旧回调时，旧回调会在锁外立即执行；若 Awaitable 已关闭，传入回调
      *          也会在锁外立即执行。
