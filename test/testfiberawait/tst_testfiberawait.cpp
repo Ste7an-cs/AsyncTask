@@ -12,6 +12,7 @@
 #include "await/detail/socketawait.hpp"
 #include "await/detail/autodisconnect.hpp"
 #include "await/detail/socketerror.hpp"
+#include "executor/qtfiberthread.h"
 #include <QBuffer>
 #include <QAbstractSocket>
 #include <QCoreApplication>
@@ -196,6 +197,8 @@ private slots:
     void test_case_broadcast_mirror_close_isolated();
     void test_case_broadcast_server_destroy_purges_mirror();
     void test_case_broadcast_void();
+    void test_case_broadcast_coexists_with_competing_consumers();
+    void test_case_broadcast_cross_thread_consumers();
     void test_case_broadcast_closed_stream_purges_mirror_on_destroy();
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
@@ -697,6 +700,90 @@ void TestFiberAwait::test_case_broadcast_void()
     QVERIFY(second->await().has_value());
     QVERIFY(second->await().has_value());
     QCOMPARE(second->await().error(), std::make_error_code(std::errc::connection_reset));
+}
+
+/// @brief 验证广播组与抢占式消费者共存：直接消费者互抢且不重不漏，订阅者各得全量。
+void TestFiberAwait::test_case_broadcast_coexists_with_competing_consumers()
+{
+    Coro::Awaitable<int> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    auto producer = Coro::makeTask([&source](){
+        for(int i = 0; i < 50; i++){
+            Coro::msleep(1);
+            source.resolve(1);
+        }
+        source.close();
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    auto competingA = Coro::makeTask([&source](){
+        int total{};
+        while(auto value = source.await()) total += value.value();
+        return total;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    auto competingB = Coro::makeTask([&source](){
+        int total{};
+        while(auto value = source.await()) total += value.value();
+        return total;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    auto subscriberA = Coro::makeTask([first](){
+        int total{};
+        while(auto value = first->await()) total += value.value();
+        return total;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    auto subscriberB = Coro::makeTask([second](){
+        int total{};
+        while(auto value = second->await()) total += value.value();
+        return total;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    producer.get();
+    const int competing = competingA.get().value() + competingB.get().value();
+    TQVERIFY(competing == 50);                    // 两个直接消费者合起来不重不漏
+    TQVERIFY(subscriberA.get().value() == 50);    // 每个订阅者各得全量
+    TQVERIFY(subscriberB.get().value() == 50);
+}
+
+/// @brief 验证订阅者可被其他线程上的 fiber 消费，扇出跨线程投递正确。
+void TestFiberAwait::test_case_broadcast_cross_thread_consumers()
+{
+    auto worker = new Coro::QtFiberThread();
+    worker->start();
+    QThread::msleep(50);
+
+    Coro::Awaitable<int> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    auto subscriberA = Coro::makeTask([first](){
+        int total{};
+        while(auto value = first->await()) total += value.value();
+        return total;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    auto subscriberB = Coro::makeTask([second](){
+        int total{};
+        while(auto value = second->await()) total += value.value();
+        return total;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    auto producer = Coro::makeTask([&source](){
+        for(int i = 0; i < 30; i++){
+            Coro::msleep(1);
+            source.resolve(2);
+        }
+        source.close();
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    producer.get();
+    TQVERIFY(subscriberA.get().value() == 60);
+    TQVERIFY(subscriberB.get().value() == 60);
+
+    worker->quit();
+    delete worker;
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
