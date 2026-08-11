@@ -177,6 +177,7 @@ private slots:
     void test_case_broadcast_basic();
     void test_case_broadcast_no_replay();
     void test_case_broadcast_raii_unsubscribe();
+    void test_case_broadcast_subscribe_after_close();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -501,6 +502,20 @@ void TestFiberAwait::test_case_broadcast_raii_unsubscribe()
 
     QCOMPARE(keep->await().value(), 1);
     QCOMPARE(keep->await().value(), 2);
+}
+
+/// @brief 验证对已关闭的源调用 shared() 时，返回的句柄立即收敛而不挂起。
+/// @details 该分支唯一的职责就是防止订阅者永久等待，必须与实现它的代码同任务覆盖。
+void TestFiberAwait::test_case_broadcast_subscribe_after_close()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> source;
+    source.close(std::make_error_code(std::errc::connection_refused));
+
+    auto late = source.shared();
+    auto result = Coro::await_for(late, 50ms);
+    QVERIFY(!result);
+    QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。

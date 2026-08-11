@@ -240,8 +240,7 @@ private:
     std::deque<T> queue_{};///< 底层元素队列
     std::atomic_bool closed_{false};///< 关闭标志
     std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
-    ///< 镜像通道列表；无人调用 shared() 时保持空指针，不产生堆分配
-    std::unique_ptr<std::vector<std::weak_ptr<FiberChannel<T>>>> mirrors_;
+    std::unique_ptr<std::vector<std::weak_ptr<FiberChannel<T>>>> mirrors_;///< 镜像通道列表；无人调用 shared() 时保持空指针，不产生堆分配
 
     template<typename U> friend class Awaitable;
 

@@ -160,7 +160,7 @@ public:
      * auto sync = src->shared();      // 数据同步
      * auto audit = src->shared();     // 日志分发
      * Coro::makeTask([sync]{ while(auto c = Coro::await(sync)) apply(c.value()); return 0; });
-     * Coro::makeTask([audit]{ for(const auto& c : Coro::generate(audit)) log(c); return 0; });
+     * Coro::makeTask([audit]{ for(auto c : Coro::generate(audit)) log(c); return 0; });
      * @endcode
      */
     std::shared_ptr<Awaitable<T>> shared(){
