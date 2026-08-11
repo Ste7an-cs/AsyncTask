@@ -195,6 +195,8 @@ private slots:
     void test_case_broadcast_terminal_error();
     void test_case_broadcast_mirror_close_isolated();
     void test_case_broadcast_server_destroy_purges_mirror();
+    void test_case_broadcast_closed_stream_purges_mirror_on_destroy();
+    void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -599,6 +601,46 @@ void TestFiberAwait::test_case_broadcast_server_destroy_purges_mirror()
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
 }
 
+/// @brief 验证消费者先关闭流、随后销毁服务器时，镜像队列中的悬空连接指针一并被丢弃。
+/// @details close() 之后 discard_pending() 仍须能触达镜像，否则镜像消费者会取到已删除的 QTcpSocket*。
+void TestFiberAwait::test_case_broadcast_closed_stream_purges_mirror_on_destroy()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+    auto audit = incoming->shared();
+    QSignalSpy connectionSignal(server, &QTcpServer::newConnection);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());
+
+    incoming->close();   // 消费者先关闭流：镜像被关闭，但两侧队列仍留有排队指针
+    delete server;       // 随后销毁服务器，子 QTcpSocket 被删除
+
+    // 镜像队列必须已被清空，否则此处取出已删除对象
+    auto mirrored = Coro::await_for(audit, 100ms);
+    QVERIFY(!mirrored);
+}
+
+/// @brief 验证已关闭的镜像排在存活镜像之前时，剔除不会连带跳过后者。
+void TestFiberAwait::test_case_broadcast_prune_preserves_later_mirror()
+{
+    Coro::Awaitable<int> source;
+    auto closedFirst = source.shared();   // 先注册，位于扇出列表前部
+    auto live = source.shared();
+
+    closedFirst->close();
+    QVERIFY(source.resolve(11));
+    QVERIFY(source.resolve(12));
+
+    QCOMPARE(live->await().value(), 11);
+    QCOMPARE(live->await().value(), 12);
+}
+
 /// @brief 验证已关闭但句柄仍存活的镜像会被剔除，此后不再为它付出拷贝代价。
 /// @details resolve() 经由 push(T value) 传参，每次调用都有一次固有拷贝，与镜像无关；
 ///          因此断言的是「相对基线的增量」而非绝对值。
@@ -615,10 +657,11 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
     auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
     mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
 
-    // 第一次投递仍会拷给这条待剔除的镜像，因此高于基线
+    // 第一次投递仍可能拷给这条待剔除的镜像，因此不低于基线；
+    // 若实现改为先判 is_closed() 再拷贝并提前剔除，则会等于基线，同样合法
     CopyCounted::copies = 0;
     QVERIFY(source.resolve(CopyCounted(1)));
-    QVERIFY(CopyCounted::copies > baseline);
+    QVERIFY(CopyCounted::copies >= baseline);
 
     // 剔除之后，每次 resolve 只剩固有代价
     CopyCounted::copies = 0;
