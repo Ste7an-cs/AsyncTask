@@ -65,14 +65,14 @@ public:
         if(mirrors_){
             auto& list = *mirrors_;
             for(std::size_t i = 0; i < list.size(); ){
-                if(auto mirror = list[i].lock()){
-                    mirror->push(value);
-                    ++i;
-                }else{
-                    // swap-and-pop：扇出顺序无关，剔除失效项 O(1)，不做 memmove
+                auto mirror = list[i].lock();
+                // 句柄已析构，或镜像已关闭——两种情况都不再需要这条镜像
+                if(!mirror || mirror->push(value) == channel_status::closed){
                     list[i] = std::move(list.back());
                     list.pop_back();
+                    continue;
                 }
+                ++i;
             }
         }
         queue_.push_back(std::move(value));

@@ -39,6 +39,20 @@ do {\
         break;\
 } while (false)
 
+/// @brief 记录拷贝次数的测试用元素类型，用于观察扇出是否仍在向已关闭镜像投递。
+struct CopyCounted
+{
+    static int copies;
+    int value{0};
+    CopyCounted() = default;
+    explicit CopyCounted(int v):value(v){}
+    CopyCounted(const CopyCounted& other):value(other.value){ ++copies; }
+    CopyCounted& operator=(const CopyCounted& other){ value = other.value; ++copies; return *this; }
+    CopyCounted(CopyCounted&&) noexcept = default;
+    CopyCounted& operator=(CopyCounted&&) noexcept = default;
+};
+int CopyCounted::copies = 0;
+
 class SigObject : public QObject
 {
     Q_OBJECT
@@ -181,6 +195,7 @@ private slots:
     void test_case_broadcast_terminal_error();
     void test_case_broadcast_mirror_close_isolated();
     void test_case_broadcast_server_destroy_purges_mirror();
+    void test_case_broadcast_closed_mirror_pruned();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -582,6 +597,39 @@ void TestFiberAwait::test_case_broadcast_server_destroy_purges_mirror()
     auto finished = Coro::await_for(incoming, 100ms);
     QVERIFY(!finished);
     QCOMPARE(finished.error(), std::make_error_code(std::errc::no_message));
+}
+
+/// @brief 验证已关闭但句柄仍存活的镜像会被剔除，此后不再为它付出拷贝代价。
+/// @details resolve() 经由 push(T value) 传参，每次调用都有一次固有拷贝，与镜像无关；
+///          因此断言的是「相对基线的增量」而非绝对值。
+void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
+{
+    // 先标定：无镜像时每次 resolve 的固有拷贝代价
+    Coro::Awaitable<CopyCounted> plain;
+    CopyCounted::copies = 0;
+    QVERIFY(plain.resolve(CopyCounted(1)));
+    const int baseline = CopyCounted::copies;
+    QVERIFY(baseline > 0);
+
+    Coro::Awaitable<CopyCounted> source;
+    auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
+    mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
+
+    // 第一次投递仍会拷给这条待剔除的镜像，因此高于基线
+    CopyCounted::copies = 0;
+    QVERIFY(source.resolve(CopyCounted(1)));
+    QVERIFY(CopyCounted::copies > baseline);
+
+    // 剔除之后，每次 resolve 只剩固有代价
+    CopyCounted::copies = 0;
+    QVERIFY(source.resolve(CopyCounted(2)));
+    QVERIFY(source.resolve(CopyCounted(3)));
+    QCOMPARE(CopyCounted::copies, baseline * 2);
+
+    // 源侧照常收到全部三条
+    QCOMPARE(source.await().value().value, 1);
+    QCOMPARE(source.await().value().value, 2);
+    QCOMPARE(source.await().value().value, 3);
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
