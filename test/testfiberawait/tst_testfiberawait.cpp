@@ -747,27 +747,63 @@ void TestFiberAwait::test_case_broadcast_coexists_with_competing_consumers()
     TQVERIFY(subscriberB.get().value() == 50);
 }
 
-/// @brief 验证订阅者可被其他线程上的 fiber 消费，扇出跨线程投递正确。
+/// @brief 验证订阅者被固定到探测得到的非主线程 id 后，扇出投递确实在该线程上完成
+///        （而非恰好落在预置的工作线程池或主线程上）。
+/// @details Affinity::sticky() 无法直接拿到目标 QtFiberThread 的 std::thread::id；
+///          因此先用有限次数的粘连探测协程记录 std::this_thread::get_id()，收集到
+///          一个非主线程 id 后，再用 Affinity::fixed(id) 显式固定两个订阅者，并让
+///          它们各自在协程体内记录实际运行线程，与探测 id、主线程 id 比对。
 void TestFiberAwait::test_case_broadcast_cross_thread_consumers()
 {
+    const std::thread::id mainId = std::this_thread::get_id();
+
     auto worker = new Coro::QtFiberThread();
     worker->start();
     QThread::msleep(50);
+
+    // 有限次数地探测一个不同于主线程的可调度线程 id：每次探测协程以粘连亲和
+    // 运行，记录自己落地的线程；一旦拿到非主线程 id 即停止探测。
+    static constexpr int kMaxProbes = 8;
+    std::thread::id workerId{};
+    bool foundOffMain = false;
+    for(int i = 0; i < kMaxProbes && !foundOffMain; ++i){
+        std::thread::id probedId{};
+        auto probe = Coro::makeTask([&probedId](){
+            probedId = std::this_thread::get_id();
+            return 0;
+        }, Coro::Priority::Normal, Coro::Affinity::sticky());
+        probe.get();
+        if(probedId != mainId){
+            workerId = probedId;
+            foundOffMain = true;
+        }
+    }
+
+    if(!foundOffMain){
+        worker->quit();
+        delete worker;
+        QSKIP("未能在有限探测次数内发现非主线程的可调度线程 id，跳过跨线程断言");
+    }
 
     Coro::Awaitable<int> source;
     auto first = source.shared();
     auto second = source.shared();
 
-    auto subscriberA = Coro::makeTask([first](){
+    std::thread::id subscriberAId{};
+    std::thread::id subscriberBId{};
+
+    auto subscriberA = Coro::makeTask([first, &subscriberAId](){
+        subscriberAId = std::this_thread::get_id();
         int total{};
         while(auto value = first->await()) total += value.value();
         return total;
-    }, Coro::Priority::Normal, Coro::Affinity::sticky());
-    auto subscriberB = Coro::makeTask([second](){
+    }, Coro::Priority::Normal, Coro::Affinity::fixed(workerId));
+    auto subscriberB = Coro::makeTask([second, &subscriberBId](){
+        subscriberBId = std::this_thread::get_id();
         int total{};
         while(auto value = second->await()) total += value.value();
         return total;
-    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    }, Coro::Priority::Normal, Coro::Affinity::fixed(workerId));
 
     auto producer = Coro::makeTask([&source](){
         for(int i = 0; i < 30; i++){
@@ -781,6 +817,13 @@ void TestFiberAwait::test_case_broadcast_cross_thread_consumers()
     producer.get();
     TQVERIFY(subscriberA.get().value() == 60);
     TQVERIFY(subscriberB.get().value() == 60);
+
+    // 两个订阅者确实在被固定的非主线程上运行，而不是恰好落在主线程或某个
+    // 预置工作线程上。
+    TQVERIFY(subscriberAId == workerId);
+    TQVERIFY(subscriberAId != mainId);
+    TQVERIFY(subscriberBId == workerId);
+    TQVERIFY(subscriberBId != mainId);
 
     worker->quit();
     delete worker;
