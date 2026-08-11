@@ -66,11 +66,16 @@ public:
             auto& list = *mirrors_;
             for(std::size_t i = 0; i < list.size(); ){
                 auto mirror = list[i].lock();
-                // 句柄已析构，或镜像已关闭——两种情况都不再需要这条镜像
-                if(!mirror || mirror->push(value) == channel_status::closed){
+                if(!mirror){
+                    // 句柄已析构：weak_ptr 失效，swap-and-pop 剔除
                     list[i] = std::move(list.back());
                     list.pop_back();
                     continue;
+                }
+                // 已关闭的镜像跳过投递（省掉一次加锁与一次 T 拷贝），但保留在列表中，
+                // 以便 discard_pending() 仍能清掉它队列里即将悬空的值
+                if(!mirror->is_closed()){
+                    mirror->push(value);
                 }
                 ++i;
             }
@@ -244,10 +249,19 @@ public:
     void discard_pending(){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
         queue_.clear();
-        // 镜像里存的是同一批即将悬空的值，必须一并丢弃
+        // 镜像里存的是同一批即将悬空的值，必须一并丢弃；push() 关闭后即早返回，
+        // 因此这里是唯一还会遍历已关闭 channel 镜像列表的扇出点，顺便剔除失效槽位
         if(mirrors_){
-            for(auto& weak : *mirrors_){
-                if(auto mirror = weak.lock()) mirror->discard_pending();
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                auto mirror = list[i].lock();
+                if(!mirror){
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                    continue;
+                }
+                mirror->discard_pending();
+                ++i;
             }
         }
     }
