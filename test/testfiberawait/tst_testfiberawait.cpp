@@ -207,6 +207,12 @@ private slots:
     void test_case_broadcast_source_destroyed_converges_mirror();
     void test_case_broadcast_source_destroyed_converges_chain();
     void test_case_broadcast_generate();
+    void test_case_capacity_drop_oldest();
+    void test_case_capacity_unlimited();
+    void test_case_capacity_default_1024();
+    void test_case_capacity_shrink_trims();
+    void test_case_capacity_subscriber_inherits();
+    void test_case_capacity_drop_preserves_termination();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -962,6 +968,150 @@ void TestFiberAwait::test_case_broadcast_tcp_read_stream()
     QCOMPARE(auditEnd.error(), std::make_error_code(std::errc::no_message));
 
     delete peer;
+}
+
+/// @brief 验证容量收紧后 push 丢弃队首最旧值，仅保留最近 capacity 个且顺序不变。
+void TestFiberAwait::test_case_capacity_drop_oldest()
+{
+    Coro::Awaitable<int> source;
+    source.setCapacity(3);
+    QCOMPARE(source.capacity(), std::uint32_t(3));
+
+    for(int i = 1; i <= 5; ++i){
+        QVERIFY(source.resolve(i));
+    }
+
+    // 丢的应是最旧的 1、2，留下 3、4、5 且顺序不变——
+    // 如果丢的是队尾（最新值）或顺序被打乱，这里会先取到错误的值
+    QCOMPARE(source.await().value(), 3);
+    QCOMPARE(source.await().value(), 4);
+    QCOMPARE(source.await().value(), 5);
+
+    // 队列必须已经清空：容量判断若用 >= 而非 >（或丢弃逻辑多丢/少丢一个），
+    // 这里要么还能取到多余的值，要么此前已经提前变空
+    auto drained = Coro::await_for(source, std::chrono::milliseconds(20));
+    QVERIFY(!drained);
+    QCOMPARE(drained.error(), std::make_error_code(std::errc::timed_out));
+}
+
+/// @brief 验证容量设为 0 后队列无限增长，push 超过默认容量的数量也不丢弃。
+void TestFiberAwait::test_case_capacity_unlimited()
+{
+    Coro::Awaitable<int> source;
+    source.setCapacity(0);
+    QCOMPARE(source.capacity(), std::uint32_t(0));
+
+    static constexpr int kCount = 2000;
+    for(int i = 0; i < kCount; ++i){
+        QVERIFY(source.resolve(i));
+    }
+
+    // 逐个校验值与顺序，而非只看总数——如果 0 被误当成「容量为 0」而非
+    // 「无限」，队列会在第一次 push 之后就一直空着，首次 await 会立刻超时
+    for(int i = 0; i < kCount; ++i){
+        auto v = source.await();
+        QVERIFY(v);
+        QCOMPARE(v.value(), i);
+    }
+    auto drained = Coro::await_for(source, std::chrono::milliseconds(20));
+    QVERIFY(!drained);
+    QCOMPARE(drained.error(), std::make_error_code(std::errc::timed_out));
+}
+
+/// @brief 验证未设置容量时默认上限为 1024，push 1025 个后首个值被丢弃、恰好剩 1024 个。
+void TestFiberAwait::test_case_capacity_default_1024()
+{
+    Coro::Awaitable<int> source;
+    QCOMPARE(source.capacity(), std::uint32_t(1024));
+
+    for(int i = 0; i < 1025; ++i){
+        QVERIFY(source.resolve(i));
+    }
+
+    int count = 0;
+    int first = -1;
+    int last = -1;
+    while(auto v = Coro::await_for(source, std::chrono::milliseconds(20))){
+        if(count == 0) first = v.value();
+        last = v.value();
+        ++count;
+    }
+
+    // 恰好剩 1024 个，且首个被丢弃的是最早 push 的 0——
+    // 若默认容量不是 1024（偏大或偏小），或者丢的不是队首最旧值，这里都会失配
+    QCOMPARE(count, 1024);
+    QCOMPARE(first, 1);
+    QCOMPARE(last, 1024);
+}
+
+/// @brief 验证运行中调小容量会立即丢弃队首多余的旧值，而非等到下次 push 才生效。
+void TestFiberAwait::test_case_capacity_shrink_trims()
+{
+    Coro::Awaitable<int> source;   // 默认容量 1024，先攒够 5 个远低于上限的值
+    for(int i = 1; i <= 5; ++i){
+        QVERIFY(source.resolve(i));
+    }
+
+    source.setCapacity(2);   // 立即收紧：此刻队列里还有 5 个值，必须马上裁到剩 2 个
+    QCOMPARE(source.capacity(), std::uint32_t(2));
+
+    // 若 setCapacity 只改上限、不主动裁剪（留给下次 push 才生效），
+    // 这里会先取到本该被丢弃的 4
+    QCOMPARE(source.await().value(), 4);
+    QCOMPARE(source.await().value(), 5);
+
+    auto drained = Coro::await_for(source, std::chrono::milliseconds(20));
+    QVERIFY(!drained);
+    QCOMPARE(drained.error(), std::make_error_code(std::errc::timed_out));
+}
+
+/// @brief 验证 shared() 生成的订阅者继承源当前的容量，而非固定使用默认值。
+void TestFiberAwait::test_case_capacity_subscriber_inherits()
+{
+    Coro::Awaitable<int> source;
+    source.setCapacity(3);
+
+    auto sub = source.shared();
+    // 若继承逻辑被漏掉，新镜像会停留在默认的 1024
+    QCOMPARE(sub->capacity(), std::uint32_t(3));
+
+    for(int i = 1; i <= 5; ++i){
+        QVERIFY(source.resolve(i));
+    }
+
+    // capacity() 报数对，不代表丢弃真的生效——订阅者也必须按 3 丢到只剩最近 3 个
+    QCOMPARE(sub->await().value(), 3);
+    QCOMPARE(sub->await().value(), 4);
+    QCOMPARE(sub->await().value(), 5);
+    auto subDrained = Coro::await_for(sub, std::chrono::milliseconds(20));
+    QVERIFY(!subDrained);
+    QCOMPARE(subDrained.error(), std::make_error_code(std::errc::timed_out));
+
+    // 源自身不受订阅者容量影响，仍按自己的容量（3）独立丢弃
+    QCOMPARE(source.await().value(), 3);
+    QCOMPARE(source.await().value(), 4);
+    QCOMPARE(source.await().value(), 5);
+}
+
+/// @brief 验证小容量下溢出丢弃不影响关闭状态：存活值先被消费，随后仍能观察到首次记录的终止错误。
+void TestFiberAwait::test_case_capacity_drop_preserves_termination()
+{
+    Coro::Awaitable<int> source;
+    source.setCapacity(2);
+
+    for(int i = 1; i <= 5; ++i){   // 溢出丢弃 1、2、3，留下 4、5
+        QVERIFY(source.resolve(i));
+    }
+    source.close(std::make_error_code(std::errc::connection_reset));
+    source.close(std::make_error_code(std::errc::timed_out));   // 首次错误不得被覆盖
+
+    // 关闭状态必须不受丢弃影响：残留值仍先被取出，且顺序不受干扰
+    QCOMPARE(source.await().value(), 4);
+    QCOMPARE(source.await().value(), 5);
+    // 值耗尽后才浮现记录的终止原因，且必须是首次 close 的那个——
+    // 若丢弃逻辑误碰了 close_error_ 或误将 closed_ 提前置位，
+    // 这里要么取不到 4/5，要么看到错误的终止码
+    QCOMPARE(source.await().error(), std::make_error_code(std::errc::connection_reset));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。

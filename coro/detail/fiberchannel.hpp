@@ -5,6 +5,7 @@
 #include <boost/fiber/condition_variable.hpp>
 #include <boost/fiber/channel_op_status.hpp>
 #include <boost/fiber/exceptions.hpp>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <system_error>
@@ -40,7 +41,10 @@ template<class T>
 class FiberChannel{
     using channel_status = boost::fibers::channel_op_status;
 public:
-    /** @brief 默认构造，创建空队列 */
+    /** @brief 默认容量：超过该值 push 会丢弃队首最旧的值，见 setCapacity() */
+    static constexpr std::uint32_t kDefaultCapacity = 1024;
+
+    /** @brief 默认构造，创建空队列，初始容量为 kDefaultCapacity */
     FiberChannel() = default;
     /** @brief 禁止拷贝构造 */
     FiberChannel(const FiberChannel& ) = delete ;
@@ -65,6 +69,9 @@ public:
     }
     /**
      * @brief 添加一个元素 value 至队列
+     * @details 队列有容量上限（默认 kDefaultCapacity，见 setCapacity()）；push 使队列
+     *          超出上限时，先丢弃队首最旧的值再追加新值，净大小停留在上限，不会阻塞
+     *          生产者也不会返回失败。每个镜像按各自的容量独立丢弃，与源互不影响。
      * @param value 待入队的元素
      * @return 成功返回 success；如果 channel 已关闭返回 closed
      * @code
@@ -98,6 +105,10 @@ public:
             }
         }
         queue_.push_back(std::move(value));
+        // capacity_ == 0 表示无限容量（沿用旧行为）；否则丢弃队首最旧值，净大小停留在上限
+        while(capacity_ != 0 && queue_.size() > capacity_){
+            queue_.pop_front();
+        }
         cv_consumer_.notify_one();
         return channel_status::success;
     }
@@ -282,11 +293,45 @@ public:
             }
         }
     }
+    /**
+     * @brief 设置队列容量上限，超出时 push 会丢弃队首最旧的值。
+     * @details 若新容量小于当前排队值数量，立即从队首丢弃直至队列大小不超过新容量；
+     *          不改变关闭状态，也不修改已保留的终止错误。传 0 表示取消容量限制（旧行为）。
+     *          承载了自身即代表资源的值（例如 nextConnection() 流中的 QTcpSocket*）的
+     *          channel，丢弃意味着该资源永远得不到处理；这类场景应调大容量或直接传 0
+     *          取消限制，而不是依赖默认的 kDefaultCapacity。
+     * @param capacity 新的容量上限，0 表示无限
+     * @code
+     * ch->setCapacity(64);     // 收紧上限，立即丢弃多余的旧值
+     * ch->setCapacity(0);      // 取消上限，恢复无界队列（谨慎使用）
+     * @endcode
+     */
+    void setCapacity(std::uint32_t capacity){
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        capacity_ = capacity;
+        if(capacity_ != 0){
+            while(queue_.size() > capacity_){
+                queue_.pop_front();
+            }
+        }
+    }
+    /**
+     * @brief 查询当前的队列容量上限
+     * @return 容量上限；0 表示无限
+     * @code
+     * if(ch->capacity() == 0) qDebug() << "无界队列";
+     * @endcode
+     */
+    std::uint32_t capacity() const {
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        return capacity_;
+    }
 private:
     mutable boost::fibers::mutex mtx_;///< 保护队列的 fiber 互斥量
     boost::fibers::condition_variable cv_consumer_;///< 通知消费者的条件变量
     std::deque<T> queue_{};///< 底层元素队列
     std::atomic_bool closed_{false};///< 关闭标志
+    std::uint32_t capacity_{kDefaultCapacity};///< 队列容量上限，0 表示无限；紧跟 closed_ 声明以复用其后填充字节，避免 sizeof 增长
     std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
     std::unique_ptr<std::vector<std::weak_ptr<FiberChannel<T>>>> mirrors_;///< 镜像通道列表；无人调用 shared() 时保持空指针，不产生堆分配
 
