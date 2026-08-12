@@ -2,6 +2,16 @@
 
 日期：2026-08-11
 
+## 0. 订正（2026-08-12）：队列无界的决策被反转
+
+本文档最初在 §2「非目标」、§3.2 决策表、§8「已知限制」三处选择"队列无界，任其增长"，与当时的 `FiberChannel` 语义保持一致（详见各处历史文本）。
+
+上线后发现：本文档 §4「接口」给出的广播消费用法示例（与 `doc/使用说明.md` §6.7 一致），代码只在 `shared()` 得到的订阅者 `a`/`b` 上 `await`/`generate`，从不 `await` 源句柄 `src` 本身——这是广播场景下的常态，源句柄往往只用来分发、不参与消费。结果是源 channel 自己的队列因为无人 `pop` 而在活跃 socket 上无界增长，重新制造了一个本应被这次改动避免的 OOM 来源。
+
+据此追加实现，把 `FiberChannel` 由无界改为**有界 FIFO**：默认容量 1024，`push` 超限时丢弃队首最旧值，净大小停在上限；`0` 表示保留旧的无界行为；新增 `setCapacity(std::uint32_t)`/`capacity()`，`Awaitable<T>`/`Awaitable<void>` 提供同名透传；`shared()` 把源当前容量赋给新订阅者，`setCapacity` 在源上调用会级联传播给所有存活镜像。项目负责人已知悉这是用静默丢数据换取内存有界，并明确决定不追加丢弃计数等运行期信号；面向使用者的警告见 `doc/使用说明.md` §6.7。
+
+下面三处保留原文（加删除线）并给出订正后的描述，而不是静默改写：§2 非目标、§3.2 决策表「慢消费者」、§8 已知限制。
+
 ## 1. 背景与问题
 
 `Awaitable<T>` 内部持有单个 `FiberChannel<T>`，`await()` 走 `ch_->pop()`，是**破坏性出队**——元素被取走后即从队列移除。因此多个消费者持有同一个 `Awaitable`（或同一个 `std::shared_ptr<Awaitable<T>>`）时会互相抢占：一条消息只会被其中一个消费者看到。
@@ -20,7 +30,7 @@
 ### 非目标
 
 - **不做 replay。** 订阅之后才产生的数据才对订阅者可见。
-- **不做背压。** 队列无界，与现有 `FiberChannel` 一致。
+- **不做背压。** ~~队列无界，与现有 `FiberChannel` 一致。~~ **订正（见 §0）**：队列改为有容量上限的 FIFO（默认 1024，`0` 表示无限），超限 `push` 丢弃队首最旧值、净大小停在上限；生产者不会被阻塞、也感知不到丢弃，因此仍然不是真正的背压，只是把"无界增长"换成了"静默丢数据"。
 - **不做有限缓冲/丢弃策略。**
 - 不改变 `Awaitable` 的既有语义，不引入虚函数、不引入常驻 fiber。
 
@@ -50,7 +60,7 @@ sub2   : A B C D  ←  独立一份，一条不漏
 |---|---|---|
 | 共享语义 | 广播/扇出，每人收到每一条 | 场景是数据同步、日志分发 |
 | 迟到订阅者 | 无 replay，只收订阅之后的数据 | 内存有界性优先；长生命周期流不能永久保留历史 |
-| 慢消费者 | 无界队列，任其增长 | 与现有 `FiberChannel` 语义一致 |
+| 慢消费者 | ~~无界队列，任其增长~~ **订正（见 §0）**：有容量上限的 FIFO，默认 1024，超限丢弃队首最旧值 | ~~与现有 `FiberChannel` 语义一致~~ 广播用法下源句柄常年不被 `await`，无界队列在活跃 socket 上无限增长、重新引入 OOM，故反转为有界 |
 | 上游生命周期 | 由源句柄持有，与订阅者数量无关 | 避免"订阅者数降为 0 时误关上游且不可恢复"这类难复现的 bug |
 | 退订方式 | 纯 RAII（`weak_ptr` 失效即自动剔除） | 无需 `unsubscribe()` 接口 |
 | 扇出位置 | `FiberChannel::push` | 生产者只捕获 `channel()`，从不持有 `Awaitable` |
@@ -128,7 +138,9 @@ void addMirror(const std::shared_ptr<FiberChannel<T>>& mirror){
 }
 ```
 
-`push()` 增加扇出：`weak_ptr` 已过期（订阅句柄已析构）的槽位仍用 swap-and-pop 剔除（O(1)，无 memmove）；但**已关闭的镜像不剔除，只跳过投递**——`close()` 不清空 `mirrors_`，`discard_pending()` 靠这份列表在源销毁时把镜像队列里即将悬空的值一并丢弃，erase 会让这条路径永久失效（详见下面 `close`/`discard_pending` 的说明）：
+`push()` 增加扇出：`weak_ptr` 已过期（订阅句柄已析构）的槽位仍用 swap-and-pop 剔除（O(1)，无 memmove）；但**已关闭的镜像不剔除，只跳过投递**——`close()` 不清空 `mirrors_`，`discard_pending()` 靠这份列表在源销毁时把镜像队列里即将悬空的值一并丢弃，erase 会让这条路径永久失效（详见下面 `close`/`discard_pending` 的说明）。
+
+**（2026-08-12 追加，见 §0）** 下面的代码块已不是本次改动落地的最终版本：入队之后还多了一段容量检查——`capacity_ != 0 && queue_.size() > capacity_` 时循环 `pop_front()` 丢弃队首最旧值，直到队列大小回落到 `capacity_`。当前实现见 `coro/detail/fiberchannel.hpp` 的 `push()`：
 
 ```cpp
 channel_status push(T value){
@@ -155,6 +167,10 @@ channel_status push(T value){
         }
     }
     queue_.push_back(std::move(value));
+    // capacity_ == 0 表示无限容量（沿用旧行为）；否则丢弃队首最旧值，净大小停留在上限
+    while(capacity_ != 0 && queue_.size() > capacity_){
+        queue_.pop_front();
+    }
     cv_consumer_.notify_one();
     return channel_status::success;
 }
@@ -260,6 +276,8 @@ std::shared_ptr<Awaitable<T>> shared(){
 
 替代 `weak_ptr` 的方案（镜像持反向指针、显式注销）会给**所有** channel 增加 16 字节，劣于当前方案，不采用。
 
+**（2026-08-12 追加，见 §0）** 有界容量改动新增了 `std::uint32_t capacity_` 字段，紧跟 `closed_` 声明。它复用的正是上表里 `unique_ptr<vector>` 方案本身没能填满的那部分填充字节——168 字节的结构体里，`mirrors_` 指针之后到 8 字节对齐边界之间本还留着空间，`capacity_` 恰好落进去，`sizeof(FiberChannel<T>)` 仍是 **168**，不产生新增开销。但这也意味着填充已经用尽：下一次再有字段加进来，就会跨过 168 撑到 176（`make_shared` 请求 192，是否跨 glibc 分配桶需要那时候重新测）。`test/testfiberawait/tst_testfiberawait.cpp:1199` 用 `QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(168))` 把这个边界钉死，回归会被立即捕获。
+
 ## 7. 跨线程与锁顺序
 
 `FiberChannel` 本身已跨线程安全（fiber 版 mutex/condition_variable），镜像只是同类 channel，不引入新的同步原语。消费侧不变：订阅句柄可被任意线程上的 fiber 消费。
@@ -270,7 +288,7 @@ std::shared_ptr<Awaitable<T>> shared(){
 
 ## 8. 已知限制
 
-- 订阅者队列无界。某个订阅者长期不 `await` 会导致其自身队列持续增长，直至内存耗尽。该行为与现有 `FiberChannel` 一致，属既定选择。
+- ~~订阅者队列无界。某个订阅者长期不 `await` 会导致其自身队列持续增长，直至内存耗尽。该行为与现有 `FiberChannel` 一致，属既定选择。~~ **订正（见 §0）**：订阅者队列与源队列一样是有容量上限的 FIFO（默认 1024，`0` 表示无限），超限 `push` 丢弃队首最旧值；`setCapacity` 在源上调用会级联传播给所有存活镜像（含链式 `a->shared()->shared()`）。对字节流，丢弃是在流中间开洞而非丢尾部，下游按长度/分隔符解析的协议会就此错位而不自知；对承载 `QTcpSocket*`/`QNetworkDatagram` 等自身即代表资源的值，丢弃是丢整个连接/数据报。不能容忍丢失的场景需按需调大容量或传 `0` 取消上限；框架不提供丢弃计数等运行期信号，容量是唯一的调节手段。
 - 无 replay。`shared()` 之前产生的数据对订阅者不可见。若需要"先订阅再启动数据源"，由调用方保证顺序。
 - 失效订阅槽位延迟到下一次 `push` / `close` 才剔除。
 - 订阅者数量较多时会拖慢生产者所在的事件循环。

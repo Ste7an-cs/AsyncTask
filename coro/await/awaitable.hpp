@@ -1,6 +1,7 @@
 #ifndef AWAITABLE_HPP
 #define AWAITABLE_HPP
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -168,9 +169,32 @@ public:
     std::shared_ptr<Awaitable<T>> shared(){
         auto sub = std::make_shared<Awaitable<T>>();
         if(ch_){
+            sub->channel()->setCapacity(ch_->capacity());
             ch_->addMirror(sub->channel());
         }
         return sub;
+    }
+
+    /**
+     * @brief 设置内部队列的容量上限，超出时丢弃队首最旧的值。
+     * @details 透传给内部 FiberChannel::setCapacity()，详见其文档。
+     * @param capacity 新的容量上限，0 表示无限
+     * @code
+     * a.setCapacity(0);    // 承载 QTcpSocket* 等自身即资源的值时，取消丢弃
+     * @endcode
+     */
+    void setCapacity(std::uint32_t capacity){
+        if(ch_) ch_->setCapacity(capacity);
+    }
+    /**
+     * @brief 查询内部队列当前的容量上限
+     * @return 容量上限；0 表示无限
+     * @code
+     * if(a.capacity() != 0) qDebug() << "有界队列，上限" << a.capacity();
+     * @endcode
+     */
+    std::uint32_t capacity() const {
+        return ch_ ? ch_->capacity() : 0;
     }
 
     /**
@@ -356,9 +380,32 @@ public:
     std::shared_ptr<Awaitable<void>> shared(){
         auto sub = std::make_shared<Awaitable<void>>();
         if(ch_){
+            sub->channel()->setCapacity(ch_->capacity());
             ch_->addMirror(sub->channel());
         }
         return sub;
+    }
+
+    /**
+     * @brief 设置内部队列的容量上限，超出时丢弃队首最旧的值。
+     * @details 透传给内部 FiberChannel::setCapacity()，详见其文档。
+     * @param capacity 新的容量上限，0 表示无限
+     * @code
+     * a.setCapacity(0);    // 取消丢弃限制
+     * @endcode
+     */
+    void setCapacity(std::uint32_t capacity){
+        if(ch_) ch_->setCapacity(capacity);
+    }
+    /**
+     * @brief 查询内部队列当前的容量上限
+     * @return 容量上限；0 表示无限
+     * @code
+     * if(a.capacity() != 0) qDebug() << "有界队列，上限" << a.capacity();
+     * @endcode
+     */
+    std::uint32_t capacity() const {
+        return ch_ ? ch_->capacity() : 0;
     }
 
     /**
@@ -439,8 +486,10 @@ public:
             if(ch_->is_closed()){
                 return false;
             }
-            // void类型，如果队列满了，不用弹出旧的数据
-            // 因为队列不为空就表明可用，不考虑数据的时效性
+            // void 特化底层同样是有界 FiberChannel<int>（默认上限 kDefaultCapacity），
+            // 承载的是"事件发生一次"这种不可区分的标记，push 溢出时与其他类型一样会
+            // 丢弃队首最旧的标记。标记彼此没有区别，丢掉一个只丢失一次计数，
+            // 不会像 T 类型那样丢失"哪一次事件"的信息，因此这里不需要特殊处理。
             return (boost::fibers::channel_op_status::success == ch_->push(1));
         }
         return false;
