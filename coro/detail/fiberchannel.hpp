@@ -300,9 +300,15 @@ public:
      *          承载了自身即代表资源的值（例如 nextConnection() 流中的 QTcpSocket*）的
      *          channel，丢弃意味着该资源永远得不到处理；这类场景应调大容量或直接传 0
      *          取消限制，而不是依赖默认的 kDefaultCapacity。
+     *          同时把新容量传播给所有仍存活的镜像，做法与 close()/discard_pending()
+     *          的扇出一致：在持有源锁的情况下逐个取镜像自己的锁（锁序始终是源→镜像，
+     *          与既有扇出点相同，不会反向加锁造成死锁）。因此调用方在 shared() 之后
+     *          调 setCapacity() 一样会让所有订阅者跟着改变上限，不必在订阅前调用；
+     *          链式订阅（a->shared()->shared()）会经由镜像自身的 setCapacity() 递归
+     *          传播，一如 close() 的级联行为。
      * @param capacity 新的容量上限，0 表示无限
      * @code
-     * ch->setCapacity(64);     // 收紧上限，立即丢弃多余的旧值
+     * ch->setCapacity(64);     // 收紧上限，立即丢弃多余的旧值；已注册的镜像同步跟进
      * ch->setCapacity(0);      // 取消上限，恢复无界队列（谨慎使用）
      * @endcode
      */
@@ -312,6 +318,19 @@ public:
         if(capacity_ != 0){
             while(queue_.size() > capacity_){
                 queue_.pop_front();
+            }
+        }
+        if(mirrors_){
+            auto& list = *mirrors_;
+            for(std::size_t i = 0; i < list.size(); ){
+                auto mirror = list[i].lock();
+                if(!mirror){
+                    list[i] = std::move(list.back());
+                    list.pop_back();
+                    continue;
+                }
+                mirror->setCapacity(capacity);
+                ++i;
             }
         }
     }

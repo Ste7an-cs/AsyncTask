@@ -213,6 +213,10 @@ private slots:
     void test_case_capacity_shrink_trims();
     void test_case_capacity_subscriber_inherits();
     void test_case_capacity_drop_preserves_termination();
+    void test_case_capacity_setcapacity_propagates_to_mirrors();
+    void test_case_capacity_setcapacity_propagates_chained();
+    void test_case_capacity_void_specialization();
+    void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
     void test_case_autodisconnect_idempotent_late();
@@ -1112,6 +1116,87 @@ void TestFiberAwait::test_case_capacity_drop_preserves_termination()
     // 若丢弃逻辑误碰了 close_error_ 或误将 closed_ 提前置位，
     // 这里要么取不到 4/5，要么看到错误的终止码
     QCOMPARE(source.await().error(), std::make_error_code(std::errc::connection_reset));
+}
+
+/// @brief 验证 setCapacity 在 shared() 之后调用仍会传播给所有存活镜像，而非只是 shared() 时的一次性快照。
+void TestFiberAwait::test_case_capacity_setcapacity_propagates_to_mirrors()
+{
+    Coro::Awaitable<int> source;   // 默认容量 1024
+    auto subA = source.shared();
+    auto subB = source.shared();
+
+    source.setCapacity(3);   // 订阅之后才收紧——若继承只是 shared() 时的快照，这里不会传播
+    QCOMPARE(source.capacity(), std::uint32_t(3));
+    QCOMPARE(subA->capacity(), std::uint32_t(3));
+    QCOMPARE(subB->capacity(), std::uint32_t(3));
+
+    for(int i = 1; i <= 5; ++i){
+        QVERIFY(source.resolve(i));
+    }
+
+    // capacity() 报数对不代表丢弃真的生效：两个订阅者都必须按新容量 3
+    // 丢弃到只剩最近 3 个——如果 setCapacity 不传播，这里会先取到本该丢弃的值
+    QCOMPARE(subA->await().value(), 3);
+    QCOMPARE(subA->await().value(), 4);
+    QCOMPARE(subA->await().value(), 5);
+    auto subADrained = Coro::await_for(subA, std::chrono::milliseconds(20));
+    QVERIFY(!subADrained);
+    QCOMPARE(subADrained.error(), std::make_error_code(std::errc::timed_out));
+
+    QCOMPARE(subB->await().value(), 3);
+    QCOMPARE(subB->await().value(), 4);
+    QCOMPARE(subB->await().value(), 5);
+    auto subBDrained = Coro::await_for(subB, std::chrono::milliseconds(20));
+    QVERIFY(!subBDrained);
+    QCOMPARE(subBDrained.error(), std::make_error_code(std::errc::timed_out));
+}
+
+/// @brief 验证链式订阅（a->shared()->shared()）下 setCapacity 沿镜像链级联传播到叶子订阅者。
+void TestFiberAwait::test_case_capacity_setcapacity_propagates_chained()
+{
+    Coro::Awaitable<int> source;
+    auto mid = source.shared();
+    auto leaf = mid->shared();
+
+    source.setCapacity(2);
+
+    // 级联必须一路传到叶子订阅者，而不仅仅停在直接子级 mid
+    QCOMPARE(mid->capacity(), std::uint32_t(2));
+    QCOMPARE(leaf->capacity(), std::uint32_t(2));
+}
+
+/// @brief 验证 Awaitable<void> 特化下默认容量、setCapacity、溢出丢弃与 shared() 容量继承均生效。
+void TestFiberAwait::test_case_capacity_void_specialization()
+{
+    Coro::Awaitable<void> source;
+    QCOMPARE(source.capacity(), std::uint32_t(1024));   // 默认容量与 T 特化一致
+
+    source.setCapacity(3);
+    QCOMPARE(source.capacity(), std::uint32_t(3));
+
+    auto sub = source.shared();
+    // shared() 必须继承当前容量 3，而非停留在默认的 1024
+    QCOMPARE(sub->capacity(), std::uint32_t(3));
+
+    for(int i = 0; i < 10; ++i){
+        QVERIFY(source.resolve());
+    }
+
+    // 10 次 resolve 在容量 3 下应溢出丢弃 7 个最旧标记，只剩 3 个可等到；
+    // 标记彼此不可区分，因此只能通过成功 await 的次数验证丢弃真的发生
+    int successCount = 0;
+    while(auto v = Coro::await_for(source, std::chrono::milliseconds(20))){
+        ++successCount;
+    }
+    QCOMPARE(successCount, 3);
+}
+
+/// @brief 固定 FiberChannel 的布局大小，防止新增字段静默跨过 glibc 分配桶。
+/// @details 168 是 x86-64 / libstdc++ 上的实测值；capacity_ 已用尽 closed_ 之后的
+///          全部 padding，再加字段就会涨到 176。移植到其他平台时应重新测量并更新此值。
+void TestFiberAwait::test_case_channel_layout_size()
+{
+    QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(168));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。

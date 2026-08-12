@@ -486,8 +486,10 @@ public:
             if(ch_->is_closed()){
                 return false;
             }
-            // void类型，如果队列满了，不用弹出旧的数据
-            // 因为队列不为空就表明可用，不考虑数据的时效性
+            // void 特化底层同样是有界 FiberChannel<int>（默认上限 kDefaultCapacity），
+            // 承载的是"事件发生一次"这种不可区分的标记，push 溢出时与其他类型一样会
+            // 丢弃队首最旧的标记。标记彼此没有区别，丢掉一个只丢失一次计数，
+            // 不会像 T 类型那样丢失"哪一次事件"的信息，因此这里不需要特殊处理。
             return (boost::fibers::channel_op_status::success == ch_->push(1));
         }
         return false;
