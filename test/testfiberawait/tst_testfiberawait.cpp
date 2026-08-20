@@ -222,6 +222,7 @@ private slots:
     void test_case_hub_exhausted_runs_cleanup_once();
     void test_case_hub_discard_reaches_closed_queue();
     void test_case_hub_push_copy_parity();
+    void test_case_hub_cleanup_runs_outside_lock();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -1348,6 +1349,27 @@ void TestFiberAwait::test_case_hub_push_copy_parity()
     CopyCounted::copies = 0;
     QCOMPARE(hub->push(CopyCounted(2)), boost::fibers::channel_op_status::success);
     QCOMPARE(CopyCounted::copies, 1);                    // 两个接收者：一拷一移
+}
+
+/// @brief 验证消费者归零时的清理钩子在 hub 的 fiber mutex 之外执行。
+/// @details boost::fibers::mutex 不可重入，因此回调里再取一次 hub 的锁，就把这条
+///          结构性不变式变成了可被测试捕获的行为：若将来有人把 guard_.run() 挪进
+///          锁作用域内，本用例会死锁挂住，而不是静默通过。
+void TestFiberAwait::test_case_hub_cleanup_runs_outside_lock()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    auto queue = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(queue);
+
+    bool reentered = false;
+    Coro::ChannelHub<int>* raw = hub.get();
+    hub->setOnClose([raw, &reentered]{
+        raw->discard_pending();      // 需要取 hub 的锁；仍持锁调用本回调则死锁
+        reentered = true;
+    });
+
+    hub->detach(queue.get());        // 消费者归零，触发清理
+    QVERIFY(reentered);
 }
 
 /// @brief 固定 FiberChannel 的布局大小，防止新增字段静默跨过 glibc 分配桶。
