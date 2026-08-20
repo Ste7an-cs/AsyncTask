@@ -719,7 +719,7 @@ cd /tmp/at-build/testfiberawait && qmake /home/david/zpj/Framework-dev/AsyncTask
 cd /tmp/at-build/testfiberawait && ./testfiberawait
 ```
 
-预期：`Totals: 91 passed, 0 failed, 0 skipped`（基线 85 + 新增 6）。本任务未触碰 `Awaitable`，旧行为必须一条不差。
+预期：`Totals: 92 passed, 0 failed, 0 skipped`（基线 85 + 新增 7）。本任务未触碰 `Awaitable`，旧行为必须一条不差。
 
 - [ ] **Step 8: 提交**
 
@@ -1270,7 +1270,7 @@ void TestFiberAwait::test_case_broadcast_source_destroyed_keeps_chain_open()
 cd /tmp/at-build/testfiberawait && make -j$(nproc) && ./testfiberawait
 ```
 
-预期：`Totals: 97 passed, 0 failed, 0 skipped`（91 + 新增 6）。
+预期：`Totals: 98 passed, 0 failed, 0 skipped`（92 + 新增 6）。
 
 - [ ] **Step 11: 确认工厂文件零改动**
 
@@ -1462,7 +1462,7 @@ void TestFiberAwait::test_case_channel_layout_size()
 cd /tmp/at-build/testfiberawait && make clean && make -j$(nproc) && ./testfiberawait
 ```
 
-预期：`Totals: 97 passed, 0 failed, 0 skipped`。
+预期：`Totals: 98 passed, 0 failed, 0 skipped`。
 
 - [ ] **Step 7: 提交**
 
@@ -1547,7 +1547,7 @@ for t in testfibertask testexecutor test_scheduler/testscheduler.pro; do
 done
 ```
 
-预期：`testfiberawait` 为 `97 passed, 0 failed`，其余三个工程均 `0 failed`。
+预期：`testfiberawait` 为 `98 passed, 0 failed`，其余三个工程均 `0 failed`。
 
 - [ ] **Step 8: 提交**
 
