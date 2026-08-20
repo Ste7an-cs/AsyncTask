@@ -6,77 +6,10 @@
 #include <memory>
 #include <mutex>
 #include "detail/fiberchannel.hpp"
+#include "detail/channelhub.hpp"
 #include "detail/result.hpp"
 
 namespace Coro {
-
-namespace detail {
-
-/**
- * @brief 管理 Awaitable 的一次性终止清理回调。
- * @details 首次显式关闭或最后一个共享守卫析构时执行清理。回调在互斥锁外调用，
- *          避免清理过程重入时发生死锁。
- * @note 多次调用 run() 只会执行一次清理。
- * @code
- * // Awaitable 内部持有本守卫；工厂经 setOnClose 注入清理，
- * // 首次 close() 或最后一个持有者析构时恰好执行一次
- * Coro::Awaitable<int> a;
- * a.setOnClose([conn]{ QObject::disconnect(*conn); });
- * a.close();      // 此处断开连接；之后析构不会重复执行
- * @endcode
- */
-class AwaitableCloseGuard {
-    std::mutex mutex_;
-    std::function<void()> cleanup_;
-    bool closed_{false};
-public:
-    ~AwaitableCloseGuard(){ run(); }
-
-    /**
-     * @brief 设置终止清理回调。
-     * @details 替换旧回调时，旧回调会在互斥锁外立即执行；若已终止，传入回调也会在锁外立即执行。
-     * @param cleanup 终止时执行的清理回调。
-     * @code
-     * guard->set([conns]{ for(auto& c : conns) QObject::disconnect(*c); });
-     * @endcode
-     */
-    void set(std::function<void()> cleanup){
-        bool runImmediately = false;
-        std::function<void()> previous;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if(closed_){
-                runImmediately = true;
-            }else{
-                previous = std::move(cleanup_);
-                cleanup_ = std::move(cleanup);
-            }
-        }
-        if(previous) previous();
-        if(runImmediately && cleanup) cleanup();
-    }
-
-    /**
-     * @brief 执行一次终止清理。
-     * @details 首次调用取出回调并在互斥锁外执行，后续调用不再执行回调。
-     * @code
-     * guard->run();    // 执行清理
-     * guard->run();    // 幂等：不再重复执行
-     * @endcode
-     */
-    void run(){
-        std::function<void()> cleanup;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if(closed_) return;
-            closed_ = true;
-            cleanup = std::move(cleanup_);
-        }
-        if(cleanup) cleanup();
-    }
-};
-
-} // namespace detail
 
 /**
  * @brief 异步等待器，生产者/消费者模型。

@@ -53,6 +53,7 @@ HEADERS += \
     $$PWD/coro/await/awaitable.hpp \
     $$PWD/coro/await/generator.hpp \
     $$PWD/coro/detail/fiberchannel.hpp \
+    $$PWD/coro/detail/channelhub.hpp \
     $$PWD/coro/executor/fiberpool.h \
     $$PWD/coro/executor/scheduler/fiberproperty.h \
     $$PWD/coro/executor/scheduler/fiberscheduler.h \

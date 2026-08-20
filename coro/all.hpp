@@ -32,6 +32,7 @@
 // —— 基础层 ——
 #include "detail/result.hpp"        // Result<T, E>
 #include "detail/fiberchannel.hpp"  // FiberChannel<T>
+#include "detail/channelhub.hpp"     // ChannelHub<T>
 #include "detail/asyncdefine.h"     // launch_properties / sleep / msleep
 
 // —— 调度与执行器层 ——
