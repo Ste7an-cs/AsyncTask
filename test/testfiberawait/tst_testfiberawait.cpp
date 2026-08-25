@@ -232,6 +232,10 @@ private slots:
     void test_case_flat_closed_consumer_still_purged_on_source_destroy();
     void test_case_flat_move_assign_detaches_old_queue();
     void test_case_flat_shared_on_moved_from_converges();
+    void test_case_channel_wait_peek_does_not_consume();
+    void test_case_channel_wait_peek_closed_even_with_value();
+    void test_case_channel_wait_peek_for_timeout();
+    void test_case_channel_push_wakes_all_peekers();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -1388,6 +1392,103 @@ void TestFiberAwait::test_case_hub_cleanup_runs_outside_lock()
 
     hub->detach(queue.get());        // 消费者归零，触发清理
     QVERIFY(reentered);
+}
+
+/// @brief 验证 wait_peek 读取队首但不弹出，因此可反复读到同一个值。
+void TestFiberAwait::test_case_channel_wait_peek_does_not_consume()
+{
+    auto ch = std::make_shared<Coro::FiberChannel<int>>();
+    QCOMPARE(ch->push(7), boost::fibers::channel_op_status::success);
+
+    int first{};
+    QCOMPARE(ch->wait_peek(first), boost::fibers::channel_op_status::success);
+    QCOMPARE(first, 7);
+
+    int second{};
+    QCOMPARE(ch->wait_peek(second), boost::fibers::channel_op_status::success);
+    QCOMPARE(second, 7);                 // 仍是同一个值：peek 不消费
+
+    // 值确实还在队列里——pop 依然能取到它
+    int popped{};
+    QCOMPARE(ch->pop(popped), boost::fibers::channel_op_status::success);
+    QCOMPARE(popped, 7);
+}
+
+/// @brief 验证 channel 已关闭时 wait_peek 一律返回 closed，即使格中仍有值。
+/// @details 这与 pop 的"先取完余量再报关闭"是**刻意的差异**：peek 不消费，
+///          "余量"概念对它不成立；更重要的是，这是状态模式下唯一可能的终止信号。
+///          同一用例里对照验证 pop 的余量语义未被本次改动破坏。
+void TestFiberAwait::test_case_channel_wait_peek_closed_even_with_value()
+{
+    auto ch = std::make_shared<Coro::FiberChannel<int>>();
+    QCOMPARE(ch->push(5), boost::fibers::channel_op_status::success);
+    ch->close(std::make_error_code(std::errc::connection_reset));
+
+    int peeked{-1};
+    QCOMPARE(ch->wait_peek(peeked), boost::fibers::channel_op_status::closed);
+    QCOMPARE(peeked, -1);                // out 不被写入
+    QCOMPARE(ch->close_error(), std::make_error_code(std::errc::connection_reset));
+
+    // 对照：pop 仍保留"先取完余量"的既有语义
+    int popped{};
+    QCOMPARE(ch->pop(popped), boost::fibers::channel_op_status::success);
+    QCOMPARE(popped, 5);
+    QCOMPARE(ch->pop(popped), boost::fibers::channel_op_status::closed);
+}
+
+/// @brief 验证空且未关闭时 wait_peek_for 到期返回 timeout，且 channel 保持开放。
+void TestFiberAwait::test_case_channel_wait_peek_for_timeout()
+{
+    auto ch = std::make_shared<Coro::FiberChannel<int>>();
+    int value{};
+    QCOMPARE(ch->wait_peek_for(value, std::chrono::milliseconds(20)),
+             boost::fibers::channel_op_status::timeout);
+    QVERIFY(!ch->is_closed());
+
+    // 超时不影响后续：有值之后照常读到
+    QCOMPARE(ch->push(3), boost::fibers::channel_op_status::success);
+    QCOMPARE(ch->wait_peek_for(value, std::chrono::milliseconds(20)),
+             boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 3);
+}
+
+/// @brief 验证一次 push 会唤醒**全部**挂在 wait_peek 上的等待者。
+/// @details 状态模式下 N 个消费者 peek 同一个状态格，谁都不消费，因此 notify_one
+///          只会唤醒其中一个、其余继续睡到下一次赋值——这是会静默漏唤醒的缺陷。
+///          本用例是该缺陷唯一的防线：改回 notify_one 时，两个等待者会超时而
+///          woken 只到 1。
+void TestFiberAwait::test_case_channel_push_wakes_all_peekers()
+{
+    auto cell = std::make_shared<Coro::FiberChannel<int>>();
+    cell->setCapacity(1);
+    std::atomic_int woken{0};
+
+    auto peeker = [cell, &woken]{
+        return Coro::makeTask([cell, &woken]{
+            int v{};
+            // 用带超时的版本：漏唤醒时表现为干净的失败而非整套挂死
+            if(cell->wait_peek_for(v, std::chrono::seconds(2))
+                    == boost::fibers::channel_op_status::success && v == 9){
+                ++woken;
+            }
+            return 0;
+        }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    };
+    auto t1 = peeker();
+    auto t2 = peeker();
+    auto t3 = peeker();
+
+    auto producer = Coro::makeTask([cell]{
+        Coro::msleep(50);                // 先让三个等待者都挂上去
+        cell->push(9);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    producer.get();
+    t1.get();
+    t2.get();
+    t3.get();
+    QCOMPARE(woken.load(), 3);
 }
 
 /// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。
