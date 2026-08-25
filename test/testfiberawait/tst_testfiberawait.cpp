@@ -229,6 +229,8 @@ private slots:
     void test_case_flat_close_scope_is_self_only();
     void test_case_flat_cleanup_runs_once_on_last_handle();
     void test_case_flat_void_source_handle_dropped_keeps_stream();
+    void test_case_flat_closed_consumer_still_purged_on_source_destroy();
+    void test_case_flat_move_assign_detaches_old_queue();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -2797,6 +2799,7 @@ void TestFiberAwait::test_case_flat_close_scope_is_self_only()
     QCOMPARE(Coro::await_for(second, 100ms).value(), 2);
     auto sourceEnded = source.await();
     QVERIFY(!sourceEnded);
+    QCOMPARE(sourceEnded.error(), std::make_error_code(std::errc::no_message));
 }
 
 /// @brief 验证清理钩子在最后一个消费者消失时恰好跑一次。
@@ -2834,6 +2837,86 @@ void TestFiberAwait::test_case_flat_void_source_handle_dropped_keeps_stream()
     QCOMPARE(producer->push(1), boost::fibers::channel_op_status::success);
     QVERIFY(Coro::await_for(subscriber, 100ms));           // 丢源之后仍然送达
     QVERIFY(!subscriber->isClosed());
+}
+
+/// @brief 验证消费者关闭自己这一路后，来源析构时 discard_pending() 仍能触达该队列。
+/// @details corotcpserver.hpp 点名的场景：消费者先 close() 掉 awaitable、再 delete
+///          server，队列里已排队的 QTcpSocket* 即将悬空，必须被清掉。新语义下
+///          close() 只关自己这一路且**不摘表**，正是靠这条不变式，discard_pending()
+///          才能触达已关闭的 incoming 队列；若哪天改成 close() 即摘表，本用例会以
+///          取到野指针的形式在 ASan 下爆出来。
+///          audit 这一路虽未主动 close()，但 corotcpserver.hpp 的 closeStop 在
+///          server 的 destroyed 信号上无条件 channel->close() 整条 hub（与 incoming
+///          是否提前自关无关，见该文件 130-133/151 行），因此 server 析构后 audit
+///          同样以 no_message 收敛，与 test_case_broadcast_closed_stream_purges_mirror_on_destroy
+///          的镜像断言一致——这里同样断言明确的终止原因而非 !purged，否则「队列清空
+///          但仍挂起」的回归会被 100ms 超时悄悄掩盖。
+void TestFiberAwait::test_case_flat_closed_consumer_still_purged_on_source_destroy()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+    auto audit = incoming->shared();
+    QSignalSpy connectionSignal(server, &QTcpServer::newConnection);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());   // 连接已被 drain 进两条队列
+
+    incoming->close();   // 只关自己这一路；队列仍留在 hub 的消费者表里
+    delete server;       // 子 QTcpSocket 被删除，两侧队列里的指针即将悬空；server 析构
+                          // 也会经 closeStop 无条件关闭整条 hub
+
+    // 已关闭的 incoming 队列必须也被清空，否则消费者仍能弹出已删除对象
+    auto stale = Coro::await_for(incoming, 100ms);
+    QVERIFY(!stale);
+    QCOMPARE(stale.error(), std::make_error_code(std::errc::no_message));
+
+    // audit 随 server 析构一并终止（closeStop 整条 hub 关闭），队列已被清空 → 取不到野指针
+    auto purged = Coro::await_for(audit, 100ms);
+    QVERIFY(!purged);
+    QCOMPARE(purged.error(), std::make_error_code(std::errc::no_message));
+}
+
+/// @brief 验证移动赋值会摘除被覆盖句柄的队列，触发原数据流的归零清理。
+/// @details 仅释放 shared_ptr 不会触发 hub 的归零判定（归零只在 detach/notifyClosed
+///          里做）。若移动赋值漏掉 detach，原流的清理钩子永不执行、hub 永不关闭，
+///          生产者会继续 push 进一张空表还一路拿到 success。
+///          同时覆盖被移动方成为空壳后，其析构不得 detach、不得提前关闭新流。
+void TestFiberAwait::test_case_flat_move_assign_detaches_old_queue()
+{
+    int cleanups = 0;
+    std::shared_ptr<Coro::ChannelHub<int>> oldHub;
+    std::shared_ptr<Coro::ChannelHub<int>> newHub;
+    {
+        Coro::Awaitable<int> replaced;
+        replaced.setOnClose([&cleanups]{ ++cleanups; });
+        oldHub = replaced.channel();
+
+        Coro::Awaitable<int> incoming;
+        newHub = incoming.channel();
+
+        replaced = std::move(incoming);   // 覆盖：原数据流就此失去唯一消费者
+
+        QCOMPARE(cleanups, 1);
+        QVERIFY(oldHub->is_closed());
+        QCOMPARE(oldHub->push(1), boost::fibers::channel_op_status::closed);
+
+        // 被移动方成为空壳：await 立即返回，不阻塞
+        QVERIFY(!incoming.await());
+
+        // 接管的一路照常工作
+        QVERIFY(replaced.resolve(7));
+        QCOMPARE(replaced.await().value(), 7);
+        QVERIFY(!newHub->is_closed());
+    }
+    // 空壳 incoming 先析构（不得 detach、不得关闭 newHub），随后 replaced 析构
+    // 摘掉它现在持有的队列 → newHub 归零关闭；原流的钩子不得重复执行
+    QVERIFY(newHub->is_closed());
+    QCOMPARE(cleanups, 1);
 }
 
 void TestFiberAwait::cleanupTestCase()

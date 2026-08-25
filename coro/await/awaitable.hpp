@@ -73,10 +73,21 @@ public:
     Awaitable(Awaitable&& other) noexcept = default;
     /**
      * @brief 移动赋值（move-only）
+     * @details 先摘除自己原有的队列，再接管 other 的 hub 与队列。摘除不能省：
+     *          若本句柄是原数据流的最后一个消费者，仅释放 shared_ptr 不会触发 hub
+     *          的归零判定（归零只在 detach/notifyClosed 里做，push 不做），原流的
+     *          清理钩子将永不执行、上游连接迟迟不断。
      * @param other 被移动的源对象
      * @return 自身引用
      */
-    Awaitable& operator=(Awaitable&& other) noexcept = default;
+    Awaitable& operator=(Awaitable&& other) noexcept {
+        if(this != &other){
+            if(hub_ && queue_) hub_->detach(queue_.get());
+            hub_ = std::move(other.hub_);
+            queue_ = std::move(other.queue_);
+        }
+        return *this;
+    }
     /** @brief 禁止拷贝构造（避免多个持有者语义混乱） */
     Awaitable(const Awaitable&) = delete ;
     /** @brief 禁止拷贝赋值 */
@@ -123,8 +134,10 @@ public:
     bool isClosed() const { return queue_ && queue_->is_closed(); }
 
     /**
-     * @brief 设置内部队列的容量上限，超出时丢弃队首最旧的值。
-     * @details 透传给内部 ChannelHub::setCapacity()，详见其文档。
+     * @brief 设置整条数据流（hub）的容量上限，超出时丢弃队首最旧的值。
+     * @details 作用于 hub 而非本句柄的队列：会级联给该流当前所有存活的消费者队列，
+     *          并作为后续新订阅者（shared()）的默认容量。透传给内部
+     *          ChannelHub::setCapacity()，详见其文档。
      * @param capacity 新的容量上限，0 表示无限
      * @code
      * a.setCapacity(0);    // 承载 QTcpSocket* 等自身即资源的值时，取消丢弃
@@ -134,7 +147,7 @@ public:
         if(hub_) hub_->setCapacity(capacity);
     }
     /**
-     * @brief 查询内部队列当前的容量上限
+     * @brief 查询整条数据流（hub）当前的容量上限
      * @return 容量上限；0 表示无限
      * @code
      * if(a.capacity() != 0) qDebug() << "有界队列，上限" << a.capacity();
@@ -145,10 +158,17 @@ public:
     }
 
     /**
-     * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子。
+     * @brief 注册整条数据流关闭时执行一次的清理钩子（消费者归零时触发）。
      *
-     * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。替换旧回调时，旧回调会在
-     * 锁外立即执行；若 Awaitable 已关闭，传入回调也会在锁外立即执行。
+     * 钩子挂在 hub 上、属于整条流，而非某一个消费者句柄：当消费者归零（表中不再
+     * 存在既存活又未关闭的队列）时执行一次，用于及时取消订阅（如断开上游信号）。
+     * 与 Qt 解耦：仅保存 std::function，不含任何 Qt 类型。
+     *
+     * @warning 替换旧回调时，旧回调会在**锁外立即执行**；若数据流已关闭，传入的新
+     *          回调同样会在锁外立即执行。因此在 shared() 得到的订阅句柄上调用
+     *          setOnClose 会当场跑掉工厂注入的清理逻辑（如 disconnectAll），
+     *          静默掐断整条流——任一句柄设置都会替换并立即执行前一个回调，
+     *          不区分是源句柄还是订阅句柄。
      * @param fn 清理回调（如断开信号连接）
      * @code
      * // 扩展自定义来源时：把断连清理挂到 Awaitable 的收尾钩子
@@ -156,7 +176,7 @@ public:
      * auto conn = std::make_shared<QMetaObject::Connection>();
      * *conn = QObject::connect(dev, &QIODevice::readyRead,
      *                          [ch = a.channel(), dev]{ ch->push(dev->readAll()); });
-     * a.setOnClose([conn]{ QObject::disconnect(*conn); });   // close 或析构时断开
+     * a.setOnClose([conn]{ QObject::disconnect(*conn); });   // 消费者归零时断开
      * @endcode
      */
     void setOnClose(std::function<void()> fn){
@@ -301,10 +321,21 @@ public:
     Awaitable(Awaitable&& other) noexcept = default;
     /**
      * @brief 移动赋值（move-only）
+     * @details 先摘除自己原有的队列，再接管 other 的 hub 与队列。摘除不能省：
+     *          若本句柄是原数据流的最后一个消费者，仅释放 shared_ptr 不会触发 hub
+     *          的归零判定（归零只在 detach/notifyClosed 里做，push 不做），原流的
+     *          清理钩子将永不执行、上游连接迟迟不断。
      * @param other 被移动的源对象
      * @return 自身引用
      */
-    Awaitable& operator=(Awaitable&& other) noexcept = default;
+    Awaitable& operator=(Awaitable&& other) noexcept {
+        if(this != &other){
+            if(hub_ && queue_) hub_->detach(queue_.get());
+            hub_ = std::move(other.hub_);
+            queue_ = std::move(other.queue_);
+        }
+        return *this;
+    }
     /** @brief 禁止拷贝构造 */
     Awaitable(const Awaitable&) = delete ;
     /** @brief 禁止拷贝赋值 */
@@ -348,8 +379,10 @@ public:
     bool isClosed() const { return queue_ && queue_->is_closed(); }
 
     /**
-     * @brief 设置内部队列的容量上限，超出时丢弃队首最旧的值。
-     * @details 透传给内部 ChannelHub::setCapacity()，详见其文档。
+     * @brief 设置整条数据流（hub）的容量上限，超出时丢弃队首最旧的值。
+     * @details 作用于 hub 而非本句柄的队列：会级联给该流当前所有存活的消费者队列，
+     *          并作为后续新订阅者（shared()）的默认容量。透传给内部
+     *          ChannelHub::setCapacity()，详见其文档。
      * @param capacity 新的容量上限，0 表示无限
      * @code
      * a.setCapacity(0);    // 取消丢弃限制
@@ -359,7 +392,7 @@ public:
         if(hub_) hub_->setCapacity(capacity);
     }
     /**
-     * @brief 查询内部队列当前的容量上限
+     * @brief 查询整条数据流（hub）当前的容量上限
      * @return 容量上限；0 表示无限
      * @code
      * if(a.capacity() != 0) qDebug() << "有界队列，上限" << a.capacity();
@@ -370,9 +403,13 @@ public:
     }
 
     /**
-     * @brief 注册 Awaitable 关闭或析构时执行一次的清理钩子
-     * @details 替换旧回调时，旧回调会在锁外立即执行；若 Awaitable 已关闭，传入回调
-     *          也会在锁外立即执行。
+     * @brief 注册整条数据流关闭时执行一次的清理钩子（消费者归零时触发）。
+     * @details 钩子挂在 hub 上、属于整条流，而非某一个消费者句柄：当消费者归零
+     *          （表中不再存在既存活又未关闭的队列）时执行一次。
+     * @warning 替换旧回调时，旧回调会在**锁外立即执行**；若数据流已关闭，传入的新
+     *          回调同样会在锁外立即执行。因此在 shared() 得到的订阅句柄上调用
+     *          setOnClose 会当场跑掉工厂注入的清理逻辑（如 disconnectAll），
+     *          静默掐断整条流——任一句柄设置都会替换并立即执行前一个回调。
      * @param fn 清理回调
      * @code
      * Coro::Awaitable<void> a;
