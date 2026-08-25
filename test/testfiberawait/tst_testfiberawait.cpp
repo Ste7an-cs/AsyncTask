@@ -241,6 +241,17 @@ private slots:
     void test_case_hub_state_capacity_is_fixed();
     void test_case_hub_state_close_and_discard();
     void test_case_hub_queue_mode_defaults_unchanged();
+    void test_case_state_repeated_await_same_value();
+    void test_case_state_waits_for_first_value();
+    void test_case_state_latest_wins();
+    void test_case_state_shared_inherits_and_sees_current();
+    void test_case_state_discard_suspends_then_all_resume();
+    void test_case_state_close_terminates_even_with_value();
+    void test_case_state_handle_close_isolated();
+    void test_case_state_memory_is_constant();
+    void test_case_state_capacity_noop();
+    void test_case_state_void_specialization();
+    void test_case_state_moved_from_shell();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -1593,6 +1604,206 @@ void TestFiberAwait::test_case_hub_queue_mode_defaults_unchanged()
     int v{};
     QCOMPARE(q->pop(v), boost::fibers::channel_op_status::success);
     QCOMPARE(v, 42);
+}
+
+/// @brief 验证状态模式下多次 await 立即返回同一个值。
+void TestFiberAwait::test_case_state_repeated_await_same_value()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    QVERIFY(st.resolve(42));
+
+    QCOMPARE(st.await().value(), 42);
+    QCOMPARE(st.await().value(), 42);
+    QCOMPARE(st.await().value(), 42);    // 值不因读取而消失
+}
+
+/// @brief 验证尚无值时 await 阻塞，赋值后才返回。
+void TestFiberAwait::test_case_state_waits_for_first_value()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+
+    auto pending = st.await_for(50ms);
+    QVERIFY(!pending);
+    QCOMPARE(pending.error(), std::make_error_code(std::errc::timed_out));
+
+    QVERIFY(st.resolve(7));
+    QCOMPARE(st.await().value(), 7);
+}
+
+/// @brief 验证连续赋值时读到的恒为最后一个值。
+void TestFiberAwait::test_case_state_latest_wins()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    QVERIFY(st.resolve(1));
+    QVERIFY(st.resolve(2));
+    QVERIFY(st.resolve(3));
+    QCOMPARE(st.await().value(), 3);
+}
+
+/// @brief 验证 shared() 自动继承状态模式，且新订阅者立刻读到当前值。
+/// @details 状态模式不需要 replay 机制——状态本就在共享的状态格上。
+void TestFiberAwait::test_case_state_shared_inherits_and_sees_current()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    QVERIFY(st.resolve(5));
+
+    auto late = st.shared();             // 赋值之后才订阅
+    QCOMPARE(late->await().value(), 5);  // 仍能读到当前值
+    QCOMPARE(late->await().value(), 5);
+    QCOMPARE(st.await().value(), 5);     // 源与订阅者读同一份
+}
+
+/// @brief 验证清空使状态回到挂起，且下一次赋值唤醒**全部**等待者。
+/// @details 这是本设计最关键的防线：状态格上多个消费者都不消费，若 push 只
+///          notify_one，则只有一个被唤醒、其余超时，woken 会停在 1。
+void TestFiberAwait::test_case_state_discard_suspends_then_all_resume()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    auto sub1 = st.shared();
+    auto sub2 = st.shared();
+
+    QVERIFY(st.resolve(1));
+    QCOMPARE(st.await().value(), 1);
+
+    st.discardPending();                 // 回到无值：全体重新挂起
+    auto suspended = Coro::await_for(sub1, 50ms);
+    QVERIFY(!suspended);
+    QCOMPARE(suspended.error(), std::make_error_code(std::errc::timed_out));
+
+    std::atomic_int woken{0};
+    auto waiter = [&woken](std::shared_ptr<Coro::Awaitable<int>> handle){
+        return Coro::makeTask([handle, &woken]{
+            auto r = Coro::await_for(handle, std::chrono::seconds(2));
+            if(r && r.value() == 9) ++woken;
+            return 0;
+        }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    };
+    auto t1 = waiter(sub1);
+    auto t2 = waiter(sub2);
+    auto producer = Coro::makeTask([ch = st.channel()]{
+        Coro::msleep(50);                // 先让两个等待者都挂上去
+        ch->push(9);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    producer.get();
+    t1.get();
+    t2.get();
+    QCOMPARE(woken.load(), 2);
+    QCOMPARE(st.await().value(), 9);
+}
+
+/// @brief 验证关闭是状态模式下的终止信号：即使格中仍有值，await 也返回终止错误。
+/// @details 这是拿"最后的值"换"可检测的终止"。没有它，状态模式下 await 永远
+///          成功、永不报错，消费者无从得知流已终止，会对着陈旧值空转。
+void TestFiberAwait::test_case_state_close_terminates_even_with_value()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    QVERIFY(st.resolve(3));
+    QCOMPARE(st.await().value(), 3);
+
+    st.channel()->close(std::make_error_code(std::errc::connection_reset));
+
+    auto ended = st.await();
+    QVERIFY(!ended);
+    QCOMPARE(ended.error(), std::make_error_code(std::errc::connection_reset));
+
+    // 因此 while(await(a)) 这类循环能够退出
+    int spins = 0;
+    while(auto v = st.await()){
+        Q_UNUSED(v);
+        if(++spins > 3) break;           // 若未收敛，这里会兜住并使断言失败
+    }
+    QCOMPARE(spins, 0);
+}
+
+/// @brief 验证句柄自己 close() 只影响自己，其他消费者照常读到状态。
+void TestFiberAwait::test_case_state_handle_close_isolated()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    auto sub = st.shared();
+    QVERIFY(st.resolve(8));
+
+    sub->close(std::make_error_code(std::errc::operation_canceled));
+
+    auto closed = sub->await();
+    QVERIFY(!closed);
+    QCOMPARE(closed.error(), std::make_error_code(std::errc::operation_canceled));
+
+    QCOMPARE(st.await().value(), 8);     // 源不受影响
+}
+
+/// @brief 验证状态模式内存为 O(1)：无论多少消费者、赋值多少次，只保留一个值。
+void TestFiberAwait::test_case_state_memory_is_constant()
+{
+    Coro::Awaitable<std::shared_ptr<int>> st{Coro::AwaitMode::State};
+    auto sub1 = st.shared();
+    auto sub2 = st.shared();
+
+    std::weak_ptr<int> older;
+    {
+        auto a = std::make_shared<int>(1);
+        older = a;
+        QVERIFY(st.resolve(a));
+    }
+    QVERIFY(!older.expired());           // 当前状态持有它
+
+    std::weak_ptr<int> newer;
+    {
+        auto b = std::make_shared<int>(2);
+        newer = b;
+        QVERIFY(st.resolve(b));
+    }
+    QVERIFY(older.expired());            // 旧值被顶掉，不因三个消费者而多留副本
+    QVERIFY(!newer.expired());
+
+    QCOMPARE(*st.await().value(), 2);
+    QCOMPARE(*sub1->await().value(), 2);
+    QCOMPARE(*sub2->await().value(), 2);
+}
+
+/// @brief 验证状态模式下容量固定为 1，setCapacity 无效。
+void TestFiberAwait::test_case_state_capacity_noop()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    QCOMPARE(st.capacity(), std::uint32_t(1));
+    st.setCapacity(64);
+    QCOMPARE(st.capacity(), std::uint32_t(1));
+}
+
+/// @brief 验证 void 特化同样支持状态模式：事件是否已发生，可反复查询、可清空。
+void TestFiberAwait::test_case_state_void_specialization()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<void> st{Coro::AwaitMode::State};
+
+    auto pending = st.await_for(50ms);
+    QVERIFY(!pending);                   // 尚未发生
+
+    QVERIFY(st.resolve());
+    QVERIFY(st.await());                 // 已发生
+    QVERIFY(st.await());                 // 反复查询不变
+
+    st.discardPending();                 // 回到未发生
+    auto again = st.await_for(50ms);
+    QVERIFY(!again);
+    QCOMPARE(again.error(), std::make_error_code(std::errc::timed_out));
+}
+
+/// @brief 验证被移动过的状态模式空壳句柄，await 立即返回而非挂死。
+void TestFiberAwait::test_case_state_moved_from_shell()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    Coro::Awaitable<int> moved(std::move(st));
+    QVERIFY(moved.resolve(1));
+
+    auto r = st.await();                 // 空壳：必须立即返回，不得阻塞
+    QVERIFY(!r);
+    QCOMPARE(r.error(), std::make_error_code(std::errc::no_message));
+
+    QCOMPARE(moved.await().value(), 1);  // 接管的一路照常
 }
 
 /// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。

@@ -54,6 +54,25 @@ public:
     /** @brief 默认构造：新建一条数据流，并把自己的队列挂上去 */
     Awaitable(){ hub_->attach(queue_); }
     /**
+     * @brief 以指定语义模式构造一条新数据流。
+     * @details `AwaitMode::State` 时 await() 变为**非破坏性读取**：立即返回当前值，
+     *          多次读取值不变；尚无值时阻塞等待首个值；discardPending() 可使其回到
+     *          挂起。默认构造仍为队列模式，行为与既有完全一致。
+     * @param mode 语义模式
+     * @warning State 模式下 `while(auto v = Coro::await(a))` 与 `Coro::generate(a)`
+     *          会满速空转直到流关闭——这两种写法只适用于 Queue 模式。
+     * @code
+     * Coro::Awaitable<int> st{Coro::AwaitMode::State};
+     * st.resolve(42);
+     * QCOMPARE(st.await().value(), 42);
+     * QCOMPARE(st.await().value(), 42);   // 反复读同一个值
+     * @endcode
+     */
+    explicit Awaitable(AwaitMode mode)
+        : hub_(std::make_shared<ChannelHub<T>>(mode)){
+        hub_->attach(queue_);
+    }
+    /**
      * @brief 订阅构造：复用已有的 hub，挂一条属于自己的新队列。
      * @details 仅供 shared() 使用——SubscribeTag 是私有类型，外部无法构造。
      * @param hub 要订阅的数据流分发端
@@ -190,8 +209,33 @@ public:
     }
 
     /**
+     * @brief 丢弃待消费的值。
+     * @details 队列模式：只清空本句柄自己的队列，其他消费者不受影响。
+     *          状态模式：清空**共享的**状态格，此后所有消费者的 await() 都重新
+     *          阻塞——状态模式下不存在"自己那一路"，这是结构决定的，无法只清自己。
+     *          无论哪种模式，要显式影响整条流请用 `channel()->discard_pending()`。
+     *          本操作不改变关闭状态，也不修改已保留的终止原因。
+     * @code
+     * st.discardPending();     // 状态回到"无值"，await 重新挂起
+     * @endcode
+     */
+    void discardPending(){
+        if(hub_ && hub_->isState()){
+            if(const auto& cell = hub_->stateCell()){
+                cell->discard_pending();
+            }
+            return;
+        }
+        if(queue_){
+            queue_->discard_pending();
+        }
+    }
+
+    /**
      * @brief 等待一条消息（无数据时让出当前协程，不阻塞线程）
      * @return 取到数据返回 Result 值；队列关闭后返回首次终止错误，默认关闭为 no_message
+     * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
+     *          流关闭后返回终止错误（最后的值不再可读）。
      * @code
      * Coro::makeTask([&a]{
      *     while(auto v = a.await()){        // 关闭后循环自然结束
@@ -202,15 +246,30 @@ public:
      * @endcode
      */
     Result<T, std::error_code> await(){
-        if(queue_){
-            T value{};
-            auto status = queue_->pop(value);
+        if(!queue_){
+            return std::make_error_code(std::errc::no_message);   // 移动后的空壳
+        }
+        T value{};
+        if(hub_ && hub_->isState()){
+            // ---- 状态模式：读状态格，不消费 ----
+            if(queue_->is_closed()){
+                // 本句柄已 close()，或整流关闭时连带关掉了它。状态格不消费，
+                // 没有"余量"概念，直接以本句柄的终止原因收尾。
+                return queue_->close_error();
+            }
+            const auto& cell = hub_->stateCell();
+            auto status = cell->wait_peek(value);
             if(status == boost::fibers::channel_op_status::success){
                 return value;
             }
-            return queue_->close_error();
+            return cell->close_error();
         }
-        return std::make_error_code(std::errc::no_message);
+        // ---- 队列模式：以下与既有逐字相同，不得插入任何提前返回 ----
+        auto status = queue_->pop(value);
+        if(status == boost::fibers::channel_op_status::success){
+            return value;
+        }
+        return queue_->close_error();
     }
     /**
      * @brief 等待一条消息，最长等待 timeout 时长
@@ -218,6 +277,8 @@ public:
      * @tparam Period 时长的周期类型
      * @param timeout 最长等待时长
      * @return 取到数据返回 Result 值；超时返回 timed_out，关闭返回首次终止错误
+     * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
+     *          流关闭后返回终止错误（最后的值不再可读）。
      * @code
      * auto r = a.await_for(std::chrono::milliseconds(500));
      * if(!r && r.error() == std::make_error_code(std::errc::timed_out)){
@@ -227,18 +288,32 @@ public:
      */
     template<typename Rep, typename Period>
     Result<T, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
-        if(queue_){
-            T value{};
-            auto status = queue_->pop_wait_for(value, timeout);
+        if(!queue_){
+            return std::make_error_code(std::errc::timed_out);    // 移动后的空壳
+        }
+        T value{};
+        if(hub_ && hub_->isState()){
+            if(queue_->is_closed()){
+                return queue_->close_error();
+            }
+            const auto& cell = hub_->stateCell();
+            auto status = cell->wait_peek_for(value, timeout);
             if(status == boost::fibers::channel_op_status::success){
                 return value;
             }
             if(status == boost::fibers::channel_op_status::timeout){
                 return std::make_error_code(std::errc::timed_out);
             }
-            return queue_->close_error();
+            return cell->close_error();
         }
-        return std::make_error_code(std::errc::timed_out);
+        auto status = queue_->pop_wait_for(value, timeout);
+        if(status == boost::fibers::channel_op_status::success){
+            return value;
+        }
+        if(status == boost::fibers::channel_op_status::timeout){
+            return std::make_error_code(std::errc::timed_out);
+        }
+        return queue_->close_error();
     }
 
     /**
@@ -307,6 +382,24 @@ class Awaitable<void>{
 public:
     /** @brief 默认构造：新建一条数据流，并把自己的队列挂上去 */
     Awaitable(){ hub_->attach(queue_); }
+    /**
+     * @brief 以指定语义模式构造一条新数据流。
+     * @details `AwaitMode::State` 时语义退化为"事件是否已发生"：已发生则 await()
+     *          立即成功且可反复查询，discardPending() 使其回到未发生。默认构造仍为
+     *          队列模式，行为与既有完全一致。
+     * @param mode 语义模式
+     * @warning State 模式下 `while(Coro::await(a))` 与 `Coro::generate(a)` 会满速
+     *          空转直到流关闭。
+     * @code
+     * Coro::Awaitable<void> ready{Coro::AwaitMode::State};
+     * ready.resolve();
+     * QVERIFY(ready.await());      // 反复查询都成功
+     * @endcode
+     */
+    explicit Awaitable(AwaitMode mode)
+        : hub_(std::make_shared<ChannelHub<int>>(mode)){
+        hub_->attach(queue_);
+    }
     /**
      * @brief 订阅构造：复用已有的 hub，挂一条属于自己的新队列。
      * @details 仅供 shared() 使用——SubscribeTag 是私有类型，外部无法构造。
@@ -435,8 +528,33 @@ public:
     }
 
     /**
+     * @brief 丢弃待消费的值。
+     * @details 队列模式：只清空本句柄自己的队列，其他消费者不受影响。
+     *          状态模式：清空**共享的**状态格，此后所有消费者的 await() 都重新
+     *          阻塞——状态模式下不存在"自己那一路"，这是结构决定的，无法只清自己。
+     *          无论哪种模式，要显式影响整条流请用 `channel()->discard_pending()`。
+     *          本操作不改变关闭状态，也不修改已保留的终止原因。
+     * @code
+     * ready.discardPending();     // 回到"未发生"，await 重新挂起
+     * @endcode
+     */
+    void discardPending(){
+        if(hub_ && hub_->isState()){
+            if(const auto& cell = hub_->stateCell()){
+                cell->discard_pending();
+            }
+            return;
+        }
+        if(queue_){
+            queue_->discard_pending();
+        }
+    }
+
+    /**
      * @brief 等待事件发生一次（无数据时让出协程）
      * @return 事件到达返回成功 Result；队列关闭后返回首次终止错误，默认关闭为 no_message
+     * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
+     *          流关闭后返回终止错误（最后的值不再可读）。
      * @code
      * Coro::makeTask([sock]{
      *     if(Coro::coro(sock).waitForConnected()->await()) startWork();
@@ -445,15 +563,26 @@ public:
      * @endcode
      */
     Result<void, std::error_code> await(){
-        if(queue_){
-            int value{};
-            auto status = queue_->pop(value);
+        if(!queue_){
+            return std::make_error_code(std::errc::no_message);
+        }
+        int value{};
+        if(hub_ && hub_->isState()){
+            if(queue_->is_closed()){
+                return queue_->close_error();
+            }
+            const auto& cell = hub_->stateCell();
+            auto status = cell->wait_peek(value);
             if(status == boost::fibers::channel_op_status::success){
                 return Result<void, std::error_code>();
             }
-            return queue_->close_error();
+            return cell->close_error();
         }
-        return std::make_error_code(std::errc::no_message);
+        auto status = queue_->pop(value);
+        if(status == boost::fibers::channel_op_status::success){
+            return Result<void, std::error_code>();
+        }
+        return queue_->close_error();
     }
 
     /**
@@ -462,6 +591,8 @@ public:
      * @tparam Period 时长的周期类型
      * @param timeout 最长等待时长
      * @return 事件到达返回成功 Result；超时返回 timed_out，关闭返回首次终止错误
+     * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
+     *          流关闭后返回终止错误（最后的值不再可读）。
      * @code
      * auto ok = Coro::coro(sock).waitForConnected()->await_for(std::chrono::seconds(2));
      * if(!ok) qWarning() << ok.error().message().c_str();
@@ -469,18 +600,32 @@ public:
      */
     template<typename Rep, typename Period>
     Result<void, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
-        if(queue_){
-            int value{};
-            auto status = queue_->pop_wait_for(value, timeout);
+        if(!queue_){
+            return std::make_error_code(std::errc::timed_out);
+        }
+        int value{};
+        if(hub_ && hub_->isState()){
+            if(queue_->is_closed()){
+                return queue_->close_error();
+            }
+            const auto& cell = hub_->stateCell();
+            auto status = cell->wait_peek_for(value, timeout);
             if(status == boost::fibers::channel_op_status::success){
                 return Result<void, std::error_code>();
             }
             if(status == boost::fibers::channel_op_status::timeout){
                 return std::make_error_code(std::errc::timed_out);
             }
-            return queue_->close_error();
+            return cell->close_error();
         }
-        return std::make_error_code(std::errc::timed_out);
+        auto status = queue_->pop_wait_for(value, timeout);
+        if(status == boost::fibers::channel_op_status::success){
+            return Result<void, std::error_code>();
+        }
+        if(status == boost::fibers::channel_op_status::timeout){
+            return std::make_error_code(std::errc::timed_out);
+        }
+        return queue_->close_error();
     }
 
     /**
