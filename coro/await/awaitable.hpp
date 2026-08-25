@@ -8,6 +8,7 @@
 #include "detail/fiberchannel.hpp"
 #include "detail/channelhub.hpp"
 #include "detail/result.hpp"
+#include <boost/fiber/operations.hpp>
 
 namespace Coro {
 
@@ -59,8 +60,11 @@ public:
      *          多次读取值不变；尚无值时阻塞等待首个值；discardPending() 可使其回到
      *          挂起。默认构造仍为队列模式，行为与既有完全一致。
      * @param mode 语义模式
-     * @warning State 模式下 `while(auto v = Coro::await(a))` 与 `Coro::generate(a)`
-     *          会满速空转直到流关闭——这两种写法只适用于 Queue 模式。
+     * @warning State 模式下 `await()` 不消费、立即返回当前值，因此
+     *          `while(auto v = Coro::await(a))` 与 `Coro::generate(a)` 是**忙循环**，
+     *          会持续占用 CPU 直到流关闭才终止。框架在状态读取的成功路径上主动让出
+     *          协程，因此它不会饿死同线程的其它协程，但仍不建议这样写——状态模式
+     *          应当按需读取一次，而不是循环消费。
      * @code
      * Coro::Awaitable<int> st{Coro::AwaitMode::State};
      * st.resolve(42);
@@ -209,23 +213,16 @@ public:
     }
 
     /**
-     * @brief 丢弃待消费的值。
-     * @details 队列模式：只清空本句柄自己的队列，其他消费者不受影响。
-     *          状态模式：清空**共享的**状态格，此后所有消费者的 await() 都重新
-     *          阻塞——状态模式下不存在"自己那一路"，这是结构决定的，无法只清自己。
-     *          无论哪种模式，要显式影响整条流请用 `channel()->discard_pending()`。
+     * @brief 丢弃本句柄待消费的值。
+     * @details 队列模式下清空自己队列中排队的值；状态模式下使本句柄回到"无值"，
+     *          此后 await() 重新阻塞直到下一次赋值。**只作用于本句柄这一路**，
+     *          其他消费者不受影响；要清空整条流请用 `channel()->discard_pending()`。
      *          本操作不改变关闭状态，也不修改已保留的终止原因。
      * @code
-     * st.discardPending();     // 状态回到"无值"，await 重新挂起
+     * st.discardPending();     // 本句柄回到"无值"，await 重新挂起
      * @endcode
      */
     void discardPending(){
-        if(hub_ && hub_->isState()){
-            if(const auto& cell = hub_->stateCell()){
-                cell->discard_pending();
-            }
-            return;
-        }
         if(queue_){
             queue_->discard_pending();
         }
@@ -250,23 +247,18 @@ public:
             return std::make_error_code(std::errc::no_message);   // 移动后的空壳
         }
         T value{};
-        if(hub_ && hub_->isState()){
-            // ---- 状态模式：读状态格，不消费 ----
-            if(queue_->is_closed()){
-                // 本句柄已 close()，或整流关闭时连带关掉了它。状态格不消费，
-                // 没有"余量"概念，直接以本句柄的终止原因收尾。
-                return queue_->close_error();
-            }
-            const auto& cell = hub_->stateCell();
-            auto status = cell->wait_peek(value);
-            if(status == boost::fibers::channel_op_status::success){
-                return value;
-            }
-            return cell->close_error();
-        }
-        // ---- 队列模式：以下与既有逐字相同，不得插入任何提前返回 ----
-        auto status = queue_->pop(value);
+        const bool state = (hub_ && hub_->isState());
+        // 两种模式都等在**自己队列**的条件变量上；差别只在读取方式：
+        // 状态模式非破坏性 peek（值留在队列里可反复读），队列模式破坏性 pop。
+        auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
         if(status == boost::fibers::channel_op_status::success){
+            if(state){
+                // 命中值时 wait_peek 的谓词立即为真、无竞争的 fiber mutex 也不挂起，
+                // 整个 await 一次协程让出都不会发生。不在这里主动让出，
+                // while(await(a)) 这类循环会饿死同线程的一切——包括关闭者、
+                // 生产者与 Qt 泵协程，该线程的事件循环将彻底停摆（spec §3.5）。
+                boost::this_fiber::yield();
+            }
             return value;
         }
         return queue_->close_error();
@@ -292,22 +284,13 @@ public:
             return std::make_error_code(std::errc::timed_out);    // 移动后的空壳
         }
         T value{};
-        if(hub_ && hub_->isState()){
-            if(queue_->is_closed()){
-                return queue_->close_error();
-            }
-            const auto& cell = hub_->stateCell();
-            auto status = cell->wait_peek_for(value, timeout);
-            if(status == boost::fibers::channel_op_status::success){
-                return value;
-            }
-            if(status == boost::fibers::channel_op_status::timeout){
-                return std::make_error_code(std::errc::timed_out);
-            }
-            return cell->close_error();
-        }
-        auto status = queue_->pop_wait_for(value, timeout);
+        const bool state = (hub_ && hub_->isState());
+        auto status = state ? queue_->wait_peek_for(value, timeout)
+                            : queue_->pop_wait_for(value, timeout);
         if(status == boost::fibers::channel_op_status::success){
+            if(state){
+                boost::this_fiber::yield();   // 理由同 await()，见 spec §3.5
+            }
             return value;
         }
         if(status == boost::fibers::channel_op_status::timeout){
@@ -344,17 +327,22 @@ public:
         close(std::make_error_code(std::errc::no_message));
     }
     /**
-     * @brief 关闭自己这一路并记录终止原因，唤醒本路的等待者。
-     * @details 只作用于本句柄的队列，源与其他订阅者不受影响。若本路是最后一条
-     *          未关闭的消费者，hub 随之关闭并执行一次清理（断开上游）。
+     * @brief 关闭整条数据流并记录终止原因，唤醒并收敛所有消费者。
+     * @details 关闭 hub 表里**所有**消费者队列（含 shared() 得到的订阅者），随后触发
+     *          一次清理（断开上游）。业务代码持句柄调 close() 时期望的正是整条流终止；
+     *          订阅者若不知情，会继续等待一条已经没有生产者的流。
+     *          **想只退订自己，请析构句柄而不要调本方法**——析构只摘自己那条队列。
+     *          只有首次关闭记录的终止原因可被观察，后续关闭不会覆盖该错误。
      * @param error 终止原因
      * @code
-     * a.close(std::make_error_code(std::errc::connection_reset));
+     * a.close(std::make_error_code(std::errc::connection_reset));   // 全体收敛
      * @endcode
      */
     void close(std::error_code error){
-        if(queue_) queue_->close(error);
-        if(hub_) hub_->notifyClosed(error);
+        if(hub_){
+            hub_->close(error);          // 传播：关闭所有消费者队列
+            hub_->notifyClosed(error);   // 关完之后表中已无未关闭的队列 -> 归零 -> 跑一次清理
+        }
     }
 };
 
@@ -388,8 +376,11 @@ public:
      *          立即成功且可反复查询，discardPending() 使其回到未发生。默认构造仍为
      *          队列模式，行为与既有完全一致。
      * @param mode 语义模式
-     * @warning State 模式下 `while(Coro::await(a))` 与 `Coro::generate(a)` 会满速
-     *          空转直到流关闭。
+     * @warning State 模式下 `await()` 不消费、立即返回当前值，因此
+     *          `while(Coro::await(a))` 与 `Coro::generate(a)` 是**忙循环**，会持续
+     *          占用 CPU 直到流关闭才终止。框架在状态读取的成功路径上主动让出协程，
+     *          因此它不会饿死同线程的其它协程，但仍不建议这样写——状态模式应当
+     *          按需读取一次，而不是循环消费。
      * @code
      * Coro::Awaitable<void> ready{Coro::AwaitMode::State};
      * ready.resolve();
@@ -528,23 +519,16 @@ public:
     }
 
     /**
-     * @brief 丢弃待消费的值。
-     * @details 队列模式：只清空本句柄自己的队列，其他消费者不受影响。
-     *          状态模式：清空**共享的**状态格，此后所有消费者的 await() 都重新
-     *          阻塞——状态模式下不存在"自己那一路"，这是结构决定的，无法只清自己。
-     *          无论哪种模式，要显式影响整条流请用 `channel()->discard_pending()`。
+     * @brief 丢弃本句柄待消费的值。
+     * @details 队列模式下清空自己队列中排队的值；状态模式下使本句柄回到"无值"，
+     *          此后 await() 重新阻塞直到下一次赋值。**只作用于本句柄这一路**，
+     *          其他消费者不受影响；要清空整条流请用 `channel()->discard_pending()`。
      *          本操作不改变关闭状态，也不修改已保留的终止原因。
      * @code
-     * ready.discardPending();     // 回到"未发生"，await 重新挂起
+     * ready.discardPending();     // 本句柄回到"未发生"，await 重新挂起
      * @endcode
      */
     void discardPending(){
-        if(hub_ && hub_->isState()){
-            if(const auto& cell = hub_->stateCell()){
-                cell->discard_pending();
-            }
-            return;
-        }
         if(queue_){
             queue_->discard_pending();
         }
@@ -567,19 +551,12 @@ public:
             return std::make_error_code(std::errc::no_message);
         }
         int value{};
-        if(hub_ && hub_->isState()){
-            if(queue_->is_closed()){
-                return queue_->close_error();
-            }
-            const auto& cell = hub_->stateCell();
-            auto status = cell->wait_peek(value);
-            if(status == boost::fibers::channel_op_status::success){
-                return Result<void, std::error_code>();
-            }
-            return cell->close_error();
-        }
-        auto status = queue_->pop(value);
+        const bool state = (hub_ && hub_->isState());
+        auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
         if(status == boost::fibers::channel_op_status::success){
+            if(state){
+                boost::this_fiber::yield();   // 理由同 Awaitable<T>::await()，见 spec §3.5
+            }
             return Result<void, std::error_code>();
         }
         return queue_->close_error();
@@ -604,22 +581,13 @@ public:
             return std::make_error_code(std::errc::timed_out);
         }
         int value{};
-        if(hub_ && hub_->isState()){
-            if(queue_->is_closed()){
-                return queue_->close_error();
-            }
-            const auto& cell = hub_->stateCell();
-            auto status = cell->wait_peek_for(value, timeout);
-            if(status == boost::fibers::channel_op_status::success){
-                return Result<void, std::error_code>();
-            }
-            if(status == boost::fibers::channel_op_status::timeout){
-                return std::make_error_code(std::errc::timed_out);
-            }
-            return cell->close_error();
-        }
-        auto status = queue_->pop_wait_for(value, timeout);
+        const bool state = (hub_ && hub_->isState());
+        auto status = state ? queue_->wait_peek_for(value, timeout)
+                            : queue_->pop_wait_for(value, timeout);
         if(status == boost::fibers::channel_op_status::success){
+            if(state){
+                boost::this_fiber::yield();   // 理由同 Awaitable<T>::await()，见 spec §3.5
+            }
             return Result<void, std::error_code>();
         }
         if(status == boost::fibers::channel_op_status::timeout){
@@ -659,17 +627,22 @@ public:
         close(std::make_error_code(std::errc::no_message));
     }
     /**
-     * @brief 关闭自己这一路并记录终止原因，唤醒本路的等待者。
-     * @details 只作用于本句柄的队列，源与其他订阅者不受影响。若本路是最后一条
-     *          未关闭的消费者，hub 随之关闭并执行一次清理（断开上游）。
+     * @brief 关闭整条数据流并记录终止原因，唤醒并收敛所有消费者。
+     * @details 关闭 hub 表里**所有**消费者队列（含 shared() 得到的订阅者），随后触发
+     *          一次清理（断开上游）。业务代码持句柄调 close() 时期望的正是整条流终止；
+     *          订阅者若不知情，会继续等待一条已经没有生产者的流。
+     *          **想只退订自己，请析构句柄而不要调本方法**——析构只摘自己那条队列。
+     *          只有首次关闭记录的终止原因可被观察，后续关闭不会覆盖该错误。
      * @param error 终止原因
      * @code
-     * a.close(std::make_error_code(std::errc::connection_reset));
+     * a.close(std::make_error_code(std::errc::connection_reset));   // 全体收敛
      * @endcode
      */
     void close(std::error_code error){
-        if(queue_) queue_->close(error);
-        if(hub_) hub_->notifyClosed(error);
+        if(hub_){
+            hub_->close(error);          // 传播：关闭所有消费者队列
+            hub_->notifyClosed(error);   // 关完之后表中已无未关闭的队列 -> 归零 -> 跑一次清理
+        }
     }
 };
 

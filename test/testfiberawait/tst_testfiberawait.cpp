@@ -194,7 +194,7 @@ private slots:
     void test_case_broadcast_raii_unsubscribe();
     void test_case_broadcast_subscribe_after_close();
     void test_case_broadcast_terminal_error();
-    void test_case_broadcast_mirror_close_isolated();
+    void test_case_broadcast_destroy_unsubscribes_without_closing();
     void test_case_broadcast_server_destroy_purges_mirror();
     void test_case_broadcast_void();
     void test_case_broadcast_coexists_with_competing_consumers();
@@ -226,7 +226,7 @@ private slots:
     void test_case_flat_source_handle_dropped_keeps_stream();
     void test_case_flat_source_queue_released_with_handle();
     void test_case_flat_no_consumer_stops_buffering();
-    void test_case_flat_close_scope_is_self_only();
+    void test_case_flat_close_terminates_whole_stream();
     void test_case_flat_cleanup_runs_once_on_last_handle();
     void test_case_flat_void_source_handle_dropped_keeps_stream();
     void test_case_flat_closed_consumer_still_purged_on_source_destroy();
@@ -237,7 +237,6 @@ private slots:
     void test_case_channel_wait_peek_for_timeout();
     void test_case_channel_push_wakes_all_peekers();
     void test_case_hub_state_keeps_latest();
-    void test_case_hub_state_no_fanout_to_queues();
     void test_case_hub_state_capacity_is_fixed();
     void test_case_hub_state_close_and_discard();
     void test_case_hub_queue_mode_defaults_unchanged();
@@ -247,11 +246,13 @@ private slots:
     void test_case_state_shared_inherits_and_sees_current();
     void test_case_state_discard_suspends_then_all_resume();
     void test_case_state_close_terminates_even_with_value();
-    void test_case_state_handle_close_isolated();
-    void test_case_state_memory_is_constant();
+    void test_case_state_close_terminates_whole_stream();
+    void test_case_state_memory_is_one_per_consumer();
     void test_case_state_capacity_noop();
     void test_case_state_void_specialization();
     void test_case_state_moved_from_shell();
+    void test_case_state_close_wakes_blocked_await();
+    void test_case_state_await_yields_to_same_thread();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -594,8 +595,8 @@ void TestFiberAwait::test_case_broadcast_subscribe_after_close()
 }
 
 /// @brief 验证生产者侧关闭整条流时，终止原因传播到每个消费者且不被覆盖。
-/// @details 消费者侧的 close() 只关自己这一路（见 test_case_flat_close_scope_is_self_only），
-///          整流终止是生产者的职责，走 channel()（即 ChannelHub）上的 close。
+/// @details 消费者侧的 close() 同样会终止整条流（见 test_case_flat_close_terminates_whole_stream），
+///          这里改走 channel()（即 ChannelHub）上的 close 单独验证生产者侧路径。
 void TestFiberAwait::test_case_broadcast_terminal_error()
 {
     Coro::Awaitable<int> source;
@@ -615,21 +616,24 @@ void TestFiberAwait::test_case_broadcast_terminal_error()
     QCOMPARE(source.await().error(), std::make_error_code(std::errc::connection_reset));
 }
 
-/// @brief 验证单个订阅者关闭只终止自己，源与其他订阅者不受影响。
-void TestFiberAwait::test_case_broadcast_mirror_close_isolated()
+/// @brief 验证析构订阅句柄只退订自己，源与其他订阅者照常。
+/// @details close() 现在会终止整条流（见 test_case_flat_close_terminates_whole_stream），
+///          因此"只退订自己"的唯一表达方式是析构句柄。
+void TestFiberAwait::test_case_broadcast_destroy_unsubscribes_without_closing()
 {
     Coro::Awaitable<int> source;
-    auto first = source.shared();
-    auto second = source.shared();
+    auto keep = source.shared();
+    {
+        auto temporary = source.shared();
+        QVERIFY(source.resolve(5));
+        QCOMPARE(temporary->await().value(), 5);
+    }                                              // temporary 析构：只退订自己
 
-    first->close(std::make_error_code(std::errc::operation_canceled));
-    QVERIFY(source.resolve(5));
-    source.channel()->close();
-
-    QCOMPARE(first->await().error(), std::make_error_code(std::errc::operation_canceled));
-    QCOMPARE(second->await().value(), 5);
-    QCOMPARE(second->await().error(), std::make_error_code(std::errc::no_message));
+    QVERIFY(source.resolve(6));                    // 流仍然活着
+    QCOMPARE(keep->await().value(), 5);
+    QCOMPARE(keep->await().value(), 6);
     QCOMPARE(source.await().value(), 5);
+    QCOMPARE(source.await().value(), 6);
 }
 
 /// @brief 验证服务器销毁时镜像队列中的悬空连接指针一并被丢弃。
@@ -689,53 +693,46 @@ void TestFiberAwait::test_case_broadcast_closed_stream_purges_mirror_on_destroy(
     QCOMPARE(mirrored.error(), std::make_error_code(std::errc::no_message));
 }
 
-/// @brief 验证已关闭的镜像排在存活镜像之前时，剔除不会连带跳过后者。
+/// @brief 验证 push 跳过已关闭的队列时，不会漏掉排在其后的存活队列。
 void TestFiberAwait::test_case_broadcast_prune_preserves_later_mirror()
 {
-    Coro::Awaitable<int> source;
-    auto closedFirst = source.shared();   // 先注册，位于扇出列表前部
-    auto live = source.shared();
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    auto closedFirst = std::make_shared<Coro::FiberChannel<int>>();
+    auto live = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(closedFirst);                      // 先注册，位于表前部
+    hub->attach(live);
 
     closedFirst->close();
-    QVERIFY(source.resolve(11));
-    QVERIFY(source.resolve(12));
+    QCOMPARE(hub->push(11), boost::fibers::channel_op_status::success);
+    QCOMPARE(hub->push(12), boost::fibers::channel_op_status::success);
 
-    QCOMPARE(live->await().value(), 11);
-    QCOMPARE(live->await().value(), 12);
+    int v{};
+    QCOMPARE(live->pop(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 11);
+    QCOMPARE(live->pop(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 12);
 }
 
-/// @brief 验证已关闭但句柄仍存活的镜像不再产生投递拷贝，同时仍留在扇出列表里。
-/// @details resolve() 经由 push(T value) 传参，每次调用都有一次固有拷贝，与镜像无关；
-///          因此断言的是「相对基线的增量」而非绝对值。
+/// @brief 验证已关闭的队列此后不再产生投递拷贝。
 void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
 {
-    // 先标定：无镜像时每次 resolve 的固有拷贝代价
-    Coro::Awaitable<CopyCounted> plain;
+    auto hub = std::make_shared<Coro::ChannelHub<CopyCounted>>();
+    auto only = std::make_shared<Coro::FiberChannel<CopyCounted>>();
+    hub->attach(only);
+
+    // 标定：单个存活队列时每次 push 的固有拷贝代价
     CopyCounted::copies = 0;
-    QVERIFY(plain.resolve(CopyCounted(1)));
+    QCOMPARE(hub->push(CopyCounted(1)), boost::fibers::channel_op_status::success);
     const int baseline = CopyCounted::copies;
-    QVERIFY(baseline > 0);
 
-    Coro::Awaitable<CopyCounted> source;
-    auto mirror = source.shared();          // 句柄全程存活，weak_ptr 不会失效
-    mirror->close();                        // 镜像自己关闭，但仍留在扇出列表里
+    auto closing = std::make_shared<Coro::FiberChannel<CopyCounted>>();
+    hub->attach(closing);
+    closing->close();                              // 已关闭但仍在表中
 
-    // 第一次投递仍可能拷给这条待剔除的镜像，因此不低于基线；这一句在任何合理实现下
-    // 都成立，不具区分力——真正有区分力的断言是下面第二段的 QCOMPARE(..., baseline * 2)
     CopyCounted::copies = 0;
-    QVERIFY(source.resolve(CopyCounted(1)));
-    QVERIFY(CopyCounted::copies >= baseline);
-
-    // 已关闭的镜像此后不再产生投递拷贝，每次 resolve 只剩固有代价
-    CopyCounted::copies = 0;
-    QVERIFY(source.resolve(CopyCounted(2)));
-    QVERIFY(source.resolve(CopyCounted(3)));
-    QCOMPARE(CopyCounted::copies, baseline * 2);
-
-    // 源侧照常收到全部三条
-    QCOMPARE(source.await().value().value, 1);
-    QCOMPARE(source.await().value().value, 2);
-    QCOMPARE(source.await().value().value, 3);
+    QCOMPARE(hub->push(CopyCounted(2)), boost::fibers::channel_op_status::success);
+    QCOMPARE(hub->push(CopyCounted(3)), boost::fibers::channel_op_status::success);
+    QCOMPARE(CopyCounted::copies, baseline * 2);   // 已关闭的那条不再产生拷贝
 }
 
 /// @brief 验证 discard_pending() 剔除失效镜像时不会跳过排在其后的存活镜像。
@@ -1507,43 +1504,31 @@ void TestFiberAwait::test_case_channel_push_wakes_all_peekers()
     QCOMPARE(woken.load(), 3);
 }
 
-/// @brief 验证状态模式的 hub 只保留最新值，且可被反复读取。
+/// @brief 验证状态模式的 hub 把最新值扇出到各消费者队列，且每条只保留一个。
 void TestFiberAwait::test_case_hub_state_keeps_latest()
 {
     auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
     QVERIFY(hub->isState());
-    QVERIFY(hub->stateCell() != nullptr);
+
+    auto q = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(q);
+    QCOMPARE(q->capacity(), std::uint32_t(1));     // attach 时被设为容量 1
 
     QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
     QCOMPARE(hub->push(2), boost::fibers::channel_op_status::success);
     QCOMPARE(hub->push(3), boost::fibers::channel_op_status::success);
 
     int v{};
-    QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::success);
-    QCOMPARE(v, 3);                      // 最新值覆盖
-    QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::success);
-    QCOMPARE(v, 3);                      // 反复读不变
-}
+    QCOMPARE(q->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 3);                                 // 最新值覆盖
+    QCOMPARE(q->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 3);                                 // 反复读不变
 
-/// @brief 验证状态模式下 push 不向消费者队列扇出——内存与消费者数量无关。
-void TestFiberAwait::test_case_hub_state_no_fanout_to_queues()
-{
-    auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
-    auto q1 = std::make_shared<Coro::FiberChannel<int>>();
-    auto q2 = std::make_shared<Coro::FiberChannel<int>>();
-    hub->attach(q1);
-    hub->attach(q2);
-
-    for(int i = 0; i < 5; ++i){
-        QCOMPARE(hub->push(i), boost::fibers::channel_op_status::success);
-    }
-
-    // 消费者队列始终为空：状态模式只写状态格
-    int v{};
-    QCOMPARE(q1->wait_peek_for(v, std::chrono::milliseconds(20)),
-             boost::fibers::channel_op_status::timeout);
-    QCOMPARE(q2->wait_peek_for(v, std::chrono::milliseconds(20)),
-             boost::fibers::channel_op_status::timeout);
+    // 后挂载的队列被播种为当前值
+    auto late = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(late);
+    QCOMPARE(late->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 3);
 }
 
 /// @brief 验证状态模式下容量固定为 1，setCapacity 无效。
@@ -1555,36 +1540,49 @@ void TestFiberAwait::test_case_hub_state_capacity_is_fixed()
     hub->setCapacity(64);                // 状态天然容量 1，应被忽略
     QCOMPARE(hub->capacity(), std::uint32_t(1));
 
+    auto q = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(q);
+    QCOMPARE(q->capacity(), std::uint32_t(1));
+
     QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
     QCOMPARE(hub->push(2), boost::fibers::channel_op_status::success);
     int v{};
-    QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(q->wait_peek(v), boost::fibers::channel_op_status::success);
     QCOMPARE(v, 2);                      // 仍只保留一个
 }
 
-/// @brief 验证状态模式下 close 关闭状态格、discard_pending 清空状态格。
+/// @brief 验证状态模式下 close 关闭消费者队列、discard_pending 清空它们。
 void TestFiberAwait::test_case_hub_state_close_and_discard()
 {
-    // discard：值被清掉，状态格回到空但仍开放
+    // discard：队列中的值被清掉，回到空但仍开放；新 attach 不再被播种
     {
         auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+        auto q = std::make_shared<Coro::FiberChannel<int>>();
+        hub->attach(q);
         QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
         hub->discard_pending();
         int v{};
-        QCOMPARE(hub->stateCell()->wait_peek_for(v, std::chrono::milliseconds(20)),
+        QCOMPARE(q->wait_peek_for(v, std::chrono::milliseconds(20)),
                  boost::fibers::channel_op_status::timeout);
-        QVERIFY(!hub->stateCell()->is_closed());
+        QVERIFY(!q->is_closed());
+
+        auto late = std::make_shared<Coro::FiberChannel<int>>();
+        hub->attach(late);
+        QCOMPARE(late->wait_peek_for(v, std::chrono::milliseconds(20)),
+                 boost::fibers::channel_op_status::timeout);   // 副本已被清空，不再播种
     }
-    // close：状态格随之关闭，且带上同一个终止原因
+    // close：所有消费者队列随之关闭，且带上同一个终止原因
     {
         auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+        auto q = std::make_shared<Coro::FiberChannel<int>>();
+        hub->attach(q);
         QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
         hub->close(std::make_error_code(std::errc::connection_reset));
-        QVERIFY(hub->stateCell()->is_closed());
-        QCOMPARE(hub->stateCell()->close_error(),
+        QVERIFY(q->is_closed());
+        QCOMPARE(q->close_error(),
                  std::make_error_code(std::errc::connection_reset));
         int v{};
-        QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::closed);
+        QCOMPARE(q->wait_peek(v), boost::fibers::channel_op_status::closed);
         QCOMPARE(hub->push(2), boost::fibers::channel_op_status::closed);
     }
 }
@@ -1594,7 +1592,6 @@ void TestFiberAwait::test_case_hub_queue_mode_defaults_unchanged()
 {
     auto hub = std::make_shared<Coro::ChannelHub<int>>();
     QVERIFY(!hub->isState());
-    QVERIFY(hub->stateCell() == nullptr);
     QCOMPARE(hub->capacity(), Coro::FiberChannel<int>::kDefaultCapacity);
 
     // 扇出照常
@@ -1655,8 +1652,10 @@ void TestFiberAwait::test_case_state_shared_inherits_and_sees_current()
 }
 
 /// @brief 验证清空使状态回到挂起，且下一次赋值唤醒**全部**等待者。
-/// @details 这是本设计最关键的防线：状态格上多个消费者都不消费，若 push 只
-///          notify_one，则只有一个被唤醒、其余超时，woken 会停在 1。
+/// @details discardPending() 现在只作用于本句柄这一路（见其文档）；要让全体消费者
+///          一起回到挂起，须走 channel()->discard_pending() 清空整条流。这是本设计
+///          最关键的防线：多个消费者各自的队列都不消费，若 push 只 notify_one，
+///          则只有一个被唤醒、其余超时，woken 会停在 1。
 void TestFiberAwait::test_case_state_discard_suspends_then_all_resume()
 {
     using namespace std::chrono_literals;
@@ -1667,7 +1666,7 @@ void TestFiberAwait::test_case_state_discard_suspends_then_all_resume()
     QVERIFY(st.resolve(1));
     QCOMPARE(st.await().value(), 1);
 
-    st.discardPending();                 // 回到无值：全体重新挂起
+    st.channel()->discard_pending();     // 回到无值：全体重新挂起
     auto suspended = Coro::await_for(sub1, 50ms);
     QVERIFY(!suspended);
     QCOMPARE(suspended.error(), std::make_error_code(std::errc::timed_out));
@@ -1719,28 +1718,32 @@ void TestFiberAwait::test_case_state_close_terminates_even_with_value()
     QCOMPARE(spins, 0);
 }
 
-/// @brief 验证句柄自己 close() 只影响自己，其他消费者照常读到状态。
-void TestFiberAwait::test_case_state_handle_close_isolated()
+/// @brief 验证状态模式下句柄 close() 同样终止整条流。
+void TestFiberAwait::test_case_state_close_terminates_whole_stream()
 {
     Coro::Awaitable<int> st{Coro::AwaitMode::State};
     auto sub = st.shared();
     QVERIFY(st.resolve(8));
+    QCOMPARE(sub->await().value(), 8);
 
     sub->close(std::make_error_code(std::errc::operation_canceled));
 
-    auto closed = sub->await();
-    QVERIFY(!closed);
-    QCOMPARE(closed.error(), std::make_error_code(std::errc::operation_canceled));
+    auto subEnded = sub->await();
+    QVERIFY(!subEnded);
+    QCOMPARE(subEnded.error(), std::make_error_code(std::errc::operation_canceled));
 
-    QCOMPARE(st.await().value(), 8);     // 源不受影响
+    auto srcEnded = st.await();
+    QVERIFY(!srcEnded);
+    QCOMPARE(srcEnded.error(), std::make_error_code(std::errc::operation_canceled));
 }
 
-/// @brief 验证状态模式内存为 O(1)：无论多少消费者、赋值多少次，只保留一个值。
-void TestFiberAwait::test_case_state_memory_is_constant()
+/// @brief 验证状态模式下每个消费者各持有一份当前值，且各自只保留一份。
+/// @details 与初版设计（全流共享一份、O(1)）不同：状态现在存在各消费者自己的队列里，
+///          因此是 O(N)——N 个消费者各一份，加 hub 的一份播种副本。
+void TestFiberAwait::test_case_state_memory_is_one_per_consumer()
 {
     Coro::Awaitable<std::shared_ptr<int>> st{Coro::AwaitMode::State};
-    auto sub1 = st.shared();
-    auto sub2 = st.shared();
+    auto sub = st.shared();
 
     std::weak_ptr<int> older;
     {
@@ -1748,7 +1751,7 @@ void TestFiberAwait::test_case_state_memory_is_constant()
         older = a;
         QVERIFY(st.resolve(a));
     }
-    QVERIFY(!older.expired());           // 当前状态持有它
+    QVERIFY(!older.expired());                     // 各消费者与 hub 副本持有它
 
     std::weak_ptr<int> newer;
     {
@@ -1756,12 +1759,11 @@ void TestFiberAwait::test_case_state_memory_is_constant()
         newer = b;
         QVERIFY(st.resolve(b));
     }
-    QVERIFY(older.expired());            // 旧值被顶掉，不因三个消费者而多留副本
+    QVERIFY(older.expired());                      // 容量 1：旧值被挤掉，不累积
     QVERIFY(!newer.expired());
 
     QCOMPARE(*st.await().value(), 2);
-    QCOMPARE(*sub1->await().value(), 2);
-    QCOMPARE(*sub2->await().value(), 2);
+    QCOMPARE(*sub->await().value(), 2);
 }
 
 /// @brief 验证状态模式下容量固定为 1，setCapacity 无效。
@@ -1806,11 +1808,77 @@ void TestFiberAwait::test_case_state_moved_from_shell()
     QCOMPARE(moved.await().value(), 1);  // 接管的一路照常
 }
 
+/// @brief 验证阻塞在状态模式 await() 上的协程，会被 close() 当场唤醒。
+/// @details 这是本次结构修订的直接收益：状态存在自己的队列里，close 关的就是它
+///          等待的那条队列，唤醒的就是它本人。初版共享状态格时这做不到——
+///          喊的（自己队列的 cv）和睡的（共享状态格的 cv）不是同一个对象。
+void TestFiberAwait::test_case_state_close_wakes_blocked_await()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    auto handle = st.shared();                     // 尚未赋值，await 会阻塞
+
+    std::atomic_bool woke{false};
+    std::error_code got;
+    auto waiter = Coro::makeTask([handle, &woke, &got]{
+        auto r = handle->await();                  // 无值：阻塞
+        if(!r) got = r.error();
+        woke = true;
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    auto closer = Coro::makeTask([&st]{
+        Coro::msleep(50);                          // 先让 waiter 挂上去
+        st.close(std::make_error_code(std::errc::connection_reset));
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    closer.get();
+    waiter.get();
+    QVERIFY(woke.load());
+    QCOMPARE(got, std::make_error_code(std::errc::connection_reset));
+}
+
+/// @brief 验证状态模式的 await 在命中值时让出协程，不会饿死同线程的其它协程。
+/// @details 命中值时 wait_peek 的谓词立即为真、无竞争的 fiber mutex 也不挂起，
+///          若不主动 yield，满速读取的循环会让同线程的关闭者永远排不上队——
+///          实测可跑到五百万次而关闭者一次未被调度。去掉 await 里的 yield，
+///          本用例会因循环撞上兜底而失败。
+void TestFiberAwait::test_case_state_await_yields_to_same_thread()
+{
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    QVERIFY(st.resolve(1));
+
+    std::atomic_llong iters{0};
+    std::atomic_bool hitCap{false};
+    auto spinner = Coro::makeTask([&st, &iters, &hitCap]{
+        while(auto v = st.await()){
+            Q_UNUSED(v);
+            if(iters.fetch_add(1) > 2000000){      // 兜底：没让出协程就会撞到这里
+                hitCap = true;
+                break;
+            }
+        }
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    auto closer = Coro::makeTask([&st]{
+        Coro::msleep(50);
+        st.close();
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    closer.get();
+    spinner.get();
+    QVERIFY2(!hitCap.load(), "await 未让出协程：同线程的关闭者被饿死");
+}
+
 /// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。
 /// @details 两者都由 make_shared 创建，加 16 字节控制块后落入分配桶；体积跳变会
 ///          悄悄增加每条流的堆占用，因此在这里钉死。换平台需重新测定。
 void TestFiberAwait::test_case_channel_layout_size()
 {
+    qDebug() << "sizeof(FiberChannel<int>) =" << sizeof(Coro::FiberChannel<int>)
+             << "sizeof(ChannelHub<int>) =" << sizeof(Coro::ChannelHub<int>);
     QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(160));
     QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(176));
 }
@@ -3208,32 +3276,39 @@ void TestFiberAwait::test_case_flat_no_consumer_stops_buffering()
 }
 
 /// @brief 验证 close() 只作用于自己这一路，源与订阅者互不牵连。
-void TestFiberAwait::test_case_flat_close_scope_is_self_only()
+/// @brief 验证任一句柄调 close() 都会终止整条流，所有消费者一起收敛。
+/// @details 2026-08-25 推翻了"close() 只关自己这一路"：业务代码持句柄 close() 时
+///          期望的是整条流终止，订阅者不知情会继续等一条已无生产者的流。
+///          想只退订自己请析构句柄（见 test_case_broadcast_raii_unsubscribe）。
+void TestFiberAwait::test_case_flat_close_terminates_whole_stream()
 {
-    using namespace std::chrono_literals;
     Coro::Awaitable<int> source;
     auto first = source.shared();
     auto second = source.shared();
 
-    // 订阅者关自己：源与另一个订阅者照常
-    first->close();
     QVERIFY(source.resolve(1));
     QCOMPARE(source.await().value(), 1);
-    QCOMPARE(second->await().value(), 1);
-    auto firstEnded = Coro::await_for(first, 100ms);
-    QVERIFY(!firstEnded);
-    QCOMPARE(firstEnded.error(), std::make_error_code(std::errc::no_message));
+    QCOMPARE(first->await().value(), 1);
 
-    // 源关自己：两个订阅者不受影响
-    source.close();
-    QVERIFY(source.channel()->push(2) == boost::fibers::channel_op_status::success);
-    QCOMPARE(Coro::await_for(second, 100ms).value(), 2);
+    // 订阅者关闭 -> 整条流终止，源与另一个订阅者一并收敛
+    first->close(std::make_error_code(std::errc::operation_canceled));
+
+    QCOMPARE(second->await().value(), 1);          // 已排队的余量仍先取完
+    auto secondEnded = second->await();
+    QVERIFY(!secondEnded);
+    QCOMPARE(secondEnded.error(), std::make_error_code(std::errc::operation_canceled));
+
     auto sourceEnded = source.await();
     QVERIFY(!sourceEnded);
-    QCOMPARE(sourceEnded.error(), std::make_error_code(std::errc::no_message));
+    QCOMPARE(sourceEnded.error(), std::make_error_code(std::errc::operation_canceled));
+
+    QVERIFY(!source.resolve(2));                   // 流已终止，投递被拒
 }
 
-/// @brief 验证清理钩子在最后一个消费者消失时恰好跑一次。
+/// @brief 验证清理钩子恰好跑一次：close() 终止整条流即触发，重复关闭/析构不重跑。
+/// @details 2026-08-25 close() 改为终止整条流后，任一句柄 close() 都会当场让消费者
+///          归零，清理钩子随之立即执行一次；此后无论是另一句柄再 close()，还是
+///          两个句柄相继析构，都不得重复触发。
 void TestFiberAwait::test_case_flat_cleanup_runs_once_on_last_handle()
 {
     int cleanups = 0;
@@ -3242,10 +3317,10 @@ void TestFiberAwait::test_case_flat_cleanup_runs_once_on_last_handle()
         source.setOnClose([&cleanups]{ ++cleanups; });
         auto subscriber = source.shared();
 
-        source.close();                        // 还有订阅者在，不能跑清理
-        QCOMPARE(cleanups, 0);
+        source.close();                        // 终止整条流，消费者随之归零，跑一次
+        QCOMPARE(cleanups, 1);
 
-        subscriber->close();                   // 最后一路关闭，跑一次
+        subscriber->close();                   // 流已终止，重复关闭不重复跑
         QCOMPARE(cleanups, 1);
     }                                           // 两个句柄析构，不得重复跑
     QCOMPARE(cleanups, 1);
