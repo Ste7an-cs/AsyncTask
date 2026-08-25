@@ -14,16 +14,16 @@ namespace Coro {
 /**
  * @brief 异步等待器，生产者/消费者模型。
  *
- * 生产者通过 channel() 拿到共享队列并 push 消息，消费者 await 等待消息。
- * 跨线程安全（由 FiberChannel 保证）。
+ * 生产者通过 channel() 拿到共享的数据流分发端（ChannelHub）并 push 消息，
+ * 消费者 await 等待消息。跨线程安全（由 FiberChannel/ChannelHub 保证）。
  *
- * 该类与具体来源(Qt/std)解耦：只持有一个共享 channel 与一个不透明的
- * 生命周期守卫 guard_。工厂层通过 setOnClose 注入清理逻辑(如断开信号)，
- * 首次关闭或最终析构时自动执行，从而实现及时取消订阅。关闭且已排队值耗尽后，
- * 消费者只能观察到首次记录的终止错误。
+ * 该类与具体来源(Qt/std)解耦：持有一个共享 hub 与一条自己独占的队列。工厂层
+ * 通过 setOnClose 注入清理逻辑(如断开信号)，最后一个消费者句柄消失时自动执行
+ * 一次，从而实现及时取消订阅。关闭且已排队值耗尽后，消费者只能观察到首次
+ * 记录的终止错误。
  *
- * move-only，按值传递；内部 channel 为 shared_ptr，生产者只捕获 channel()
- * 而不持有整个 Awaitable，避免引用环。
+ * move-only，按值传递；hub 为 shared_ptr，生产者只捕获 channel() 而不持有
+ * 整个 Awaitable，避免引用环。
  *
  * @tparam T 等待/传递的数据类型
  * @code
@@ -45,14 +45,27 @@ namespace Coro {
  */
 template<typename T>
 class Awaitable{
-    std::shared_ptr<FiberChannel<T>> ch_{std::make_shared<FiberChannel<T>>()};
-    std::shared_ptr<detail::AwaitableCloseGuard> guard_{
-        std::make_shared<detail::AwaitableCloseGuard>()};
+    /** @brief 订阅构造的标记类型：私有，使订阅构造函数无法被外部调用 */
+    struct SubscribeTag{};
+
+    std::shared_ptr<ChannelHub<T>> hub_{std::make_shared<ChannelHub<T>>()};
+    std::shared_ptr<FiberChannel<T>> queue_{std::make_shared<FiberChannel<T>>()};
 public:
-    /** @brief 默认构造，内部自动创建一个空的共享队列 */
-    Awaitable() = default;
-    /** @brief 析构，尚未关闭时触发 guard_ 的清理钩子 */
-    ~Awaitable() = default;
+    /** @brief 默认构造：新建一条数据流，并把自己的队列挂上去 */
+    Awaitable(){ hub_->attach(queue_); }
+    /**
+     * @brief 订阅构造：复用已有的 hub，挂一条属于自己的新队列。
+     * @details 仅供 shared() 使用——SubscribeTag 是私有类型，外部无法构造。
+     * @param hub 要订阅的数据流分发端
+     */
+    Awaitable(std::shared_ptr<ChannelHub<T>> hub, SubscribeTag)
+        : hub_(std::move(hub)){
+        if(hub_) hub_->attach(queue_);
+    }
+    /** @brief 析构：摘除自己那条队列；若消费者就此归零，hub 会执行一次清理 */
+    ~Awaitable(){
+        if(hub_ && queue_) hub_->detach(queue_.get());
+    }
     /**
      * @brief 移动构造（move-only）
      * @param other 被移动的源对象
@@ -70,54 +83,55 @@ public:
     Awaitable& operator=(const Awaitable&) = delete ;
 
     /**
-     * @brief 生产者侧共享的队列。生产者只捕获它、不持有整个 Awaitable。
-     * @return 内部共享队列的 shared_ptr
+     * @brief 生产者侧共享的分发端。生产者只捕获它、不持有整个 Awaitable。
+     * @return 内部数据流分发端的 shared_ptr
      * @code
      * Coro::Awaitable<QByteArray> a;
-     * // 生产端只捕 channel：即使回调常驻，也不会延长 Awaitable 寿命
      * QObject::connect(dev, &QIODevice::readyRead, [ch = a.channel(), dev]{
      *     ch->push(dev->readAll());
      * });
      * @endcode
      */
-    std::shared_ptr<FiberChannel<T>> channel() const { return ch_; }
+    std::shared_ptr<ChannelHub<T>> channel() const { return hub_; }
 
     /**
      * @brief 注册一个共享订阅者，此后源产生的每个值都会同步复制一份投递给它。
      *
      * 返回的是普通 Awaitable，因此 Coro::await / await_for / generate 均原样可用。
-     * 订阅者之间互为广播（各得全量），与直接 await 本对象的抢占式消费者也不竞争。
-     * 不做 replay：本次调用之前已产生的值对订阅者不可见。订阅句柄析构即自动退订。
-     * 源关闭时经由 FiberChannel::close 直接扇出到镜像，不经过订阅句柄自身的 close()，
-     * 因此订阅句柄上的 setOnClose 钩子在这种情况下不会触发，仍要等该句柄自身析构。
-     * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
+     * 订阅者与源在消费者表上没有身份差别：各得全量、互不竞争，句柄析构即自动退订。
+     * 不做 replay：本次调用之前已产生的值对订阅者不可见。
+     * 源句柄析构不会终止订阅者——上游活到最后一个句柄消失为止。
+     * @return 共享订阅句柄；数据流已关闭时返回的句柄立即以其终止原因收敛
      * @code
      * auto src = Coro::coro(sock).readAll();
-     * auto sync = src->shared();      // 数据同步
-     * auto audit = src->shared();     // 日志分发
-     * Coro::makeTask([sync]{ while(auto c = Coro::await(sync)) apply(c.value()); return 0; });
-     * Coro::makeTask([audit]{ for(auto c : Coro::generate(audit)) log(c); return 0; });
+     * auto sync = src->shared();
+     * auto audit = src->shared();
      * @endcode
      */
     std::shared_ptr<Awaitable<T>> shared(){
-        auto sub = std::make_shared<Awaitable<T>>();
-        if(ch_){
-            sub->channel()->setCapacity(ch_->capacity());
-            ch_->addMirror(sub->channel());
-        }
-        return sub;
+        return std::make_shared<Awaitable<T>>(hub_, SubscribeTag{});
     }
 
     /**
+     * @brief 查询自己这一路是否已关闭。
+     * @details 查的是本句柄独占的队列，而非整条流——订阅者关掉自己不影响别人。
+     * @return 自己这一路已关闭返回 true
+     * @code
+     * while(!a.isClosed()) produce(a);
+     * @endcode
+     */
+    bool isClosed() const { return queue_ && queue_->is_closed(); }
+
+    /**
      * @brief 设置内部队列的容量上限，超出时丢弃队首最旧的值。
-     * @details 透传给内部 FiberChannel::setCapacity()，详见其文档。
+     * @details 透传给内部 ChannelHub::setCapacity()，详见其文档。
      * @param capacity 新的容量上限，0 表示无限
      * @code
      * a.setCapacity(0);    // 承载 QTcpSocket* 等自身即资源的值时，取消丢弃
      * @endcode
      */
     void setCapacity(std::uint32_t capacity){
-        if(ch_) ch_->setCapacity(capacity);
+        if(hub_) hub_->setCapacity(capacity);
     }
     /**
      * @brief 查询内部队列当前的容量上限
@@ -127,7 +141,7 @@ public:
      * @endcode
      */
     std::uint32_t capacity() const {
-        return ch_ ? ch_->capacity() : 0;
+        return hub_ ? hub_->capacity() : 0;
     }
 
     /**
@@ -146,7 +160,7 @@ public:
      * @endcode
      */
     void setOnClose(std::function<void()> fn){
-        if(guard_) guard_->set(std::move(fn));
+        if(hub_) hub_->setOnClose(std::move(fn));
     }
 
     /**
@@ -162,13 +176,13 @@ public:
      * @endcode
      */
     Result<T, std::error_code> await(){
-        if(ch_){
+        if(queue_){
             T value{};
-            auto status = ch_->pop(value);
+            auto status = queue_->pop(value);
             if(status == boost::fibers::channel_op_status::success){
                 return value;
             }
-            return ch_->close_error();
+            return queue_->close_error();
         }
         return std::make_error_code(std::errc::no_message);
     }
@@ -187,16 +201,16 @@ public:
      */
     template<typename Rep, typename Period>
     Result<T, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
-        if(ch_){
+        if(queue_){
             T value{};
-            auto status = ch_->pop_wait_for(value, timeout);
+            auto status = queue_->pop_wait_for(value, timeout);
             if(status == boost::fibers::channel_op_status::success){
                 return value;
             }
             if(status == boost::fibers::channel_op_status::timeout){
                 return std::make_error_code(std::errc::timed_out);
             }
-            return ch_->close_error();
+            return queue_->close_error();
         }
         return std::make_error_code(std::errc::timed_out);
     }
@@ -204,23 +218,23 @@ public:
     /**
      * @brief 生产者侧投递一条数据
      * @param value 待投递的数据
-     * @return 成功入队返回 true；队列不存在或已关闭返回 false
+     * @return 成功入队返回 true；数据流不存在或已关闭返回 false
      * @code
      * Coro::Awaitable<int> a;
      * a.resolve(42);                       // 消费侧 a.await() 即可取到 42
      * @endcode
      */
     bool resolve(const T& value){
-        if(ch_){
-            if(ch_->is_closed()){
+        if(hub_){
+            if(hub_->is_closed()){
                 return false;
             }
-            return (boost::fibers::channel_op_status::success == ch_->push(value));
+            return (boost::fibers::channel_op_status::success == hub_->push(value));
         }
         return false;
     }
     /**
-     * @brief 关闭内部队列，唤醒并收敛所有等待者
+     * @brief 关闭自己这一路，唤醒本路的等待者
      * @code
      * a.close();       // 正常终止：已排队值仍先被消费，随后得到 no_message
      * @endcode
@@ -229,28 +243,26 @@ public:
         close(std::make_error_code(std::errc::no_message));
     }
     /**
-     * @brief 关闭内部队列并记录终止原因，唤醒并收敛所有等待者
-     * @details 只有首次关闭记录的终止原因可被消费者观察，后续关闭不会覆盖该错误。
+     * @brief 关闭自己这一路并记录终止原因，唤醒本路的等待者。
+     * @details 只作用于本句柄的队列，源与其他订阅者不受影响。若本路是最后一条
+     *          未关闭的消费者，hub 随之关闭并执行一次清理（断开上游）。
      * @param error 终止原因
      * @code
-     * // 异常终止：保留首个错误码，消费者据此区分正常结束与出错
      * a.close(std::make_error_code(std::errc::connection_reset));
      * @endcode
      */
     void close(std::error_code error){
-        if(ch_){
-            ch_->close(error);
-        }
-        if(guard_) guard_->run();
+        if(queue_) queue_->close(error);
+        if(hub_) hub_->notifyClosed(error);
     }
 };
 
 /**
  * @brief 异步等待器 void 特化。
  *
- * 无数据负载，仅表达"事件发生一次"；内部用 FiberChannel<int> 承载信号。
- * 关闭且已排队值耗尽后，消费者只能观察到首次记录的终止错误；生命周期清理在
- * 首次关闭或最后一个共享守卫析构时执行一次。
+ * 无数据负载，仅表达"事件发生一次"；内部用 ChannelHub<int> / FiberChannel<int>
+ * 承载信号。关闭且已排队值耗尽后，消费者只能观察到首次记录的终止错误；生命周期
+ * 清理在最后一个消费者句柄消失时执行一次。
  * @code
  * // 等待"某事发生一次"，无数据负载；结果可直接当 bool 用
  * if(Coro::await(Coro::coro(sock).waitForConnected())){
@@ -262,14 +274,26 @@ public:
  */
 template<>
 class Awaitable<void>{
-    std::shared_ptr<FiberChannel<int>> ch_{std::make_shared<FiberChannel<int>>()};
-    std::shared_ptr<detail::AwaitableCloseGuard> guard_{
-        std::make_shared<detail::AwaitableCloseGuard>()};
+    struct SubscribeTag{};
+
+    std::shared_ptr<ChannelHub<int>> hub_{std::make_shared<ChannelHub<int>>()};
+    std::shared_ptr<FiberChannel<int>> queue_{std::make_shared<FiberChannel<int>>()};
 public:
-    /** @brief 默认构造 */
-    Awaitable() = default;
-    /** @brief 析构 */
-    ~Awaitable() = default;
+    /** @brief 默认构造：新建一条数据流，并把自己的队列挂上去 */
+    Awaitable(){ hub_->attach(queue_); }
+    /**
+     * @brief 订阅构造：复用已有的 hub，挂一条属于自己的新队列。
+     * @details 仅供 shared() 使用——SubscribeTag 是私有类型，外部无法构造。
+     * @param hub 要订阅的数据流分发端
+     */
+    Awaitable(std::shared_ptr<ChannelHub<int>> hub, SubscribeTag)
+        : hub_(std::move(hub)){
+        if(hub_) hub_->attach(queue_);
+    }
+    /** @brief 析构：摘除自己那条队列；若消费者就此归零，hub 会执行一次清理 */
+    ~Awaitable(){
+        if(hub_ && queue_) hub_->detach(queue_.get());
+    }
     /**
      * @brief 移动构造（move-only）
      * @param other 被移动的源对象
@@ -287,48 +311,52 @@ public:
     Awaitable& operator=(const Awaitable&) = delete ;
 
     /**
-     * @brief 生产者侧共享的队列
-     * @return 内部共享队列的 shared_ptr
+     * @brief 生产者侧共享的分发端
+     * @return 内部数据流分发端的 shared_ptr
      * @code
      * Coro::Awaitable<void> a;
-     * // void 特化内部用 FiberChannel<int> 承载"发生一次"，push 任意值即可
+     * // void 特化内部用 ChannelHub<int> 承载"发生一次"，push 任意值即可
      * QObject::connect(obj, &Obj::done, [ch = a.channel()]{ ch->push(1); });
      * @endcode
      */
-    std::shared_ptr<FiberChannel<int>> channel() const { return ch_; }
+    std::shared_ptr<ChannelHub<int>> channel() const { return hub_; }
 
     /**
      * @brief 注册一个共享订阅者，此后每次 resolve() 都会同步通知它一次。
      *
-     * 语义与 Awaitable<T>::shared() 相同：订阅者之间互为广播，与直接 await
-     * 本对象的抢占式消费者不竞争，不做 replay，句柄析构即自动退订。
-     * 源关闭时经由 FiberChannel::close 直接扇出到镜像，不经过订阅句柄自身的 close()，
-     * 因此订阅句柄上的 setOnClose 钩子在这种情况下不会触发，仍要等该句柄自身析构。
-     * @return 共享订阅句柄；源已关闭时返回的句柄立即以源的终止原因收敛
+     * 语义与 Awaitable<T>::shared() 相同：订阅者与源在消费者表上没有身份差别，
+     * 各得全量、互不竞争，不做 replay，句柄析构即自动退订。
+     * 源句柄析构不会终止订阅者——上游活到最后一个句柄消失为止。
+     * @return 共享订阅句柄；数据流已关闭时返回的句柄立即以其终止原因收敛
      * @code
      * Coro::Awaitable<void> done;
      * auto watcher = done.shared();     // 与直接 await(done) 的消费者各得一份
      * @endcode
      */
     std::shared_ptr<Awaitable<void>> shared(){
-        auto sub = std::make_shared<Awaitable<void>>();
-        if(ch_){
-            sub->channel()->setCapacity(ch_->capacity());
-            ch_->addMirror(sub->channel());
-        }
-        return sub;
+        return std::make_shared<Awaitable<void>>(hub_, SubscribeTag{});
     }
 
     /**
+     * @brief 查询自己这一路是否已关闭。
+     * @details 查的是本句柄独占的队列，而非整条流——订阅者关掉自己不影响别人。
+     * @return 自己这一路已关闭返回 true
+     * @code
+     * while(!a.isClosed()) produce(a);
+     * @endcode
+     */
+    bool isClosed() const { return queue_ && queue_->is_closed(); }
+
+    /**
      * @brief 设置内部队列的容量上限，超出时丢弃队首最旧的值。
-     * @details 透传给内部 FiberChannel::setCapacity()，详见其文档。
+     * @details 透传给内部 ChannelHub::setCapacity()，详见其文档。
      * @param capacity 新的容量上限，0 表示无限
      * @code
      * a.setCapacity(0);    // 取消丢弃限制
      * @endcode
      */
     void setCapacity(std::uint32_t capacity){
-        if(ch_) ch_->setCapacity(capacity);
+        if(hub_) hub_->setCapacity(capacity);
     }
     /**
      * @brief 查询内部队列当前的容量上限
@@ -338,7 +366,7 @@ public:
      * @endcode
      */
     std::uint32_t capacity() const {
-        return ch_ ? ch_->capacity() : 0;
+        return hub_ ? hub_->capacity() : 0;
     }
 
     /**
@@ -354,7 +382,7 @@ public:
      * @endcode
      */
     void setOnClose(std::function<void()> fn){
-        if(guard_) guard_->set(std::move(fn));
+        if(hub_) hub_->setOnClose(std::move(fn));
     }
 
     /**
@@ -368,13 +396,13 @@ public:
      * @endcode
      */
     Result<void, std::error_code> await(){
-        if(ch_){
-            int value;
-            auto status = ch_->pop(value);
+        if(queue_){
+            int value{};
+            auto status = queue_->pop(value);
             if(status == boost::fibers::channel_op_status::success){
                 return Result<void, std::error_code>();
             }
-            return ch_->close_error();
+            return queue_->close_error();
         }
         return std::make_error_code(std::errc::no_message);
     }
@@ -392,43 +420,43 @@ public:
      */
     template<typename Rep, typename Period>
     Result<void, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
-        if(ch_){
+        if(queue_){
             int value{};
-            auto status = ch_->pop_wait_for(value, timeout);
+            auto status = queue_->pop_wait_for(value, timeout);
             if(status == boost::fibers::channel_op_status::success){
                 return Result<void, std::error_code>();
             }
             if(status == boost::fibers::channel_op_status::timeout){
                 return std::make_error_code(std::errc::timed_out);
             }
-            return ch_->close_error();
+            return queue_->close_error();
         }
         return std::make_error_code(std::errc::timed_out);
     }
 
     /**
      * @brief 生产者侧发出一次"事件发生"信号
-     * @return 成功入队返回 true；队列不存在或已关闭返回 false
+     * @return 成功入队返回 true；数据流不存在或已关闭返回 false
      * @code
      * Coro::Awaitable<void> a;
      * a.resolve();          // 通知"事件发生一次"，等待方的 await() 随即返回成功
      * @endcode
      */
     bool resolve(void){
-        if(ch_){
-            if(ch_->is_closed()){
+        if(hub_){
+            if(hub_->is_closed()){
                 return false;
             }
-            // void 特化底层同样是有界 FiberChannel<int>（默认上限 kDefaultCapacity），
+            // void 特化底层同样是有界 ChannelHub<int>（默认上限 kDefaultCapacity），
             // 承载的是"事件发生一次"这种不可区分的标记，push 溢出时与其他类型一样会
             // 丢弃队首最旧的标记。标记彼此没有区别，丢掉一个只丢失一次计数，
             // 不会像 T 类型那样丢失"哪一次事件"的信息，因此这里不需要特殊处理。
-            return (boost::fibers::channel_op_status::success == ch_->push(1));
+            return (boost::fibers::channel_op_status::success == hub_->push(1));
         }
         return false;
     }
     /**
-     * @brief 关闭内部队列，唤醒并收敛所有等待者
+     * @brief 关闭自己这一路，唤醒本路的等待者
      * @code
      * a.close();       // 正常终止：已排队值仍先被消费，随后得到 no_message
      * @endcode
@@ -437,19 +465,17 @@ public:
         close(std::make_error_code(std::errc::no_message));
     }
     /**
-     * @brief 关闭内部队列并记录终止原因，唤醒并收敛所有等待者
-     * @details 只有首次关闭记录的终止原因可被消费者观察，后续关闭不会覆盖该错误。
+     * @brief 关闭自己这一路并记录终止原因，唤醒本路的等待者。
+     * @details 只作用于本句柄的队列，源与其他订阅者不受影响。若本路是最后一条
+     *          未关闭的消费者，hub 随之关闭并执行一次清理（断开上游）。
      * @param error 终止原因
      * @code
-     * // 异常终止：保留首个错误码，消费者据此区分正常结束与出错
      * a.close(std::make_error_code(std::errc::connection_reset));
      * @endcode
      */
     void close(std::error_code error){
-        if(ch_){
-            ch_->close(error);
-        }
-        if(guard_) guard_->run();
+        if(queue_) queue_->close(error);
+        if(hub_) hub_->notifyClosed(error);
     }
 };
 
