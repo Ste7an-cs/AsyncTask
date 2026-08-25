@@ -1388,12 +1388,13 @@ void TestFiberAwait::test_case_hub_cleanup_runs_outside_lock()
     QVERIFY(reentered);
 }
 
-/// @brief 固定 FiberChannel 的布局大小，防止新增字段静默跨过 glibc 分配桶。
-/// @details 168 是 x86-64 / libstdc++ 上的实测值；capacity_ 已用尽 closed_ 之后的
-///          全部 padding，再加字段就会涨到 176。移植到其他平台时应重新测量并更新此值。
+/// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。
+/// @details 两者都由 make_shared 创建，加 16 字节控制块后落入分配桶；体积跳变会
+///          悄悄增加每条流的堆占用，因此在这里钉死。换平台需重新测定。
 void TestFiberAwait::test_case_channel_layout_size()
 {
-    QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(168));
+    QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(160));
+    QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(160));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
