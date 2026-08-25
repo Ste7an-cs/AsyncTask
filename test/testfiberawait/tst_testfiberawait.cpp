@@ -1471,10 +1471,10 @@ void TestFiberAwait::test_case_channel_wait_peek_for_timeout()
 }
 
 /// @brief 验证一次 push 会唤醒**全部**挂在 wait_peek 上的等待者。
-/// @details 状态模式下 N 个消费者 peek 同一个状态格，谁都不消费，因此 notify_one
-///          只会唤醒其中一个、其余继续睡到下一次赋值——这是会静默漏唤醒的缺陷。
-///          本用例是该缺陷唯一的防线：改回 notify_one 时，两个等待者会超时而
-///          woken 只到 1。
+/// @details 多个协程可以 await 同一个 shared_ptr<Awaitable>，因而等在同一条队列上；
+///          wait_peek 又不消费，因此 notify_one 只会唤醒其中一个、其余继续睡到下一次
+///          赋值——这是会静默漏唤醒的缺陷。本用例是该缺陷唯一的防线：改回 notify_one
+///          时，两个等待者会超时而 woken 只到 1。
 void TestFiberAwait::test_case_channel_push_wakes_all_peekers()
 {
     auto cell = std::make_shared<Coro::FiberChannel<int>>();
@@ -1644,7 +1644,8 @@ void TestFiberAwait::test_case_state_latest_wins()
 }
 
 /// @brief 验证 shared() 自动继承状态模式，且新订阅者立刻读到当前值。
-/// @details 状态模式不需要 replay 机制——状态本就在共享的状态格上。
+/// @details 状态模式不需要 replay 机制——新订阅者的队列在 attach() 时即被 hub 的
+///          latest_ 播种副本写入当前值。
 void TestFiberAwait::test_case_state_shared_inherits_and_sees_current()
 {
     Coro::Awaitable<int> st{Coro::AwaitMode::State};
@@ -3384,16 +3385,20 @@ void TestFiberAwait::test_case_flat_void_source_handle_dropped_keeps_stream()
     QVERIFY(!subscriber->isClosed());
 }
 
-/// @brief 验证消费者关闭自己这一路后，来源析构时 discard_pending() 仍能触达该队列。
+/// @brief 验证消费者关闭 awaitable 后，来源析构时 discard_pending() 仍能触达其队列。
 /// @details corotcpserver.hpp 点名的场景：消费者先 close() 掉 awaitable、再 delete
-///          server，队列里已排队的 QTcpSocket* 即将悬空，必须被清掉。新语义下
-///          close() 只关自己这一路且**不摘表**，正是靠这条不变式，discard_pending()
-///          才能触达已关闭的 incoming 队列；若哪天改成 close() 即摘表，本用例会以
-///          取到野指针的形式在 ASan 下爆出来。
-///          audit 这一路虽未主动 close()，但 corotcpserver.hpp 的 closeStop 在
-///          server 的 destroyed 信号上无条件 channel->close() 整条 hub（与 incoming
-///          是否提前自关无关，见该文件 130-133/151 行），因此 server 析构后 audit
-///          同样以 no_message 收敛，与 test_case_broadcast_closed_stream_purges_mirror_on_destroy
+///          server，队列里已排队的 QTcpSocket* 即将悬空，必须被清掉。用例仍然通过、
+///          仍有判别力（await_for 走 pop_wait_for，若 discard_pending() 没清掉即将
+///          悬空的指针，它会把野指针交回来，ASan 会抓到），但成立的机制已经变了：
+///          incoming->close() 现在**终止整条 hub**（关闭 incoming 与 audit 两条队
+///          列并立即跑一次清理钩子），不再是"只关自己这一路、不摘表"——摘表仍然
+///          只发生在句柄析构。本用例之所以还能测到东西，唯一依靠的是
+///          corotcpserver.hpp 里那条**刻意注册在 scope 之外**的
+///          `destroyed → channel->discard_pending()` 连接（约 132-135 行）：它不随
+///          incoming->close() 触发的整组断连一起失效，server 析构时仍会跑一遍，把
+///          两条队列里即将悬空的 QTcpSocket* 清掉。
+///          audit 这一路同样以 no_message 收敛（此刻已由 incoming->close() 本身
+///          关闭，而非仅靠 closeStop），与 test_case_broadcast_closed_stream_purges_mirror_on_destroy
 ///          的镜像断言一致——这里同样断言明确的终止原因而非 !purged，否则「队列清空
 ///          但仍挂起」的回归会被 100ms 超时悄悄掩盖。
 void TestFiberAwait::test_case_flat_closed_consumer_still_purged_on_source_destroy()
@@ -3411,9 +3416,10 @@ void TestFiberAwait::test_case_flat_closed_consumer_still_purged_on_source_destr
     QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
     QVERIFY(!server->hasPendingConnections());   // 连接已被 drain 进两条队列
 
-    incoming->close();   // 只关自己这一路；队列仍留在 hub 的消费者表里
-    delete server;       // 子 QTcpSocket 被删除，两侧队列里的指针即将悬空；server 析构
-                          // 也会经 closeStop 无条件关闭整条 hub
+    incoming->close();   // 终止整条 hub（incoming 与 audit 都被关闭）；队列仍留在
+                          // hub 的消费者表里，摘表要等句柄析构
+    delete server;       // 子 QTcpSocket 被删除，两侧队列里的指针即将悬空；靠 scope 外
+                          // 那条 destroyed 连接的 discard_pending() 清掉
 
     // 已关闭的 incoming 队列必须也被清空，否则消费者仍能弹出已删除对象
     auto stale = Coro::await_for(incoming, 100ms);

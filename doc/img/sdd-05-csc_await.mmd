@@ -25,9 +25,9 @@ classDiagram
         +discard_pending()
         +setCapacity(n)
         +isState() bool
-        +stateCell() shared_ptr~FiberChannel~
         -consumers_ vector~weak_ptr~FiberChannel~~
-        -state_ shared_ptr~FiberChannel~
+        -stateMode_ bool
+        -latest_ unique_ptr~T~
         -guard_ AwaitableCloseGuard
     }
     class AwaitableCloseGuard {
@@ -95,8 +95,7 @@ classDiagram
 
     Awaitable --> ChannelHub
     Awaitable *-- FiberChannel
-    ChannelHub o-- FiberChannel : consumers_ 弱引用表
-    ChannelHub *-- FiberChannel : state_ 状态格(容量1，State 模式下非空)
+    ChannelHub o-- FiberChannel : consumers_ 弱引用表(State 模式下容量恒为1)
     ChannelHub *-- AwaitableCloseGuard
     ChannelHub ..> AwaitMode : 构造时确定模式
     Awaitable ..> Result : await 返回

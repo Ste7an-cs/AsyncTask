@@ -154,7 +154,7 @@ public:
 
     /**
      * @brief 查询自己这一路是否已关闭。
-     * @details 查的是本句柄独占的队列，而非整条流——订阅者关掉自己不影响别人。
+     * @details 查的是本句柄独占的队列，而非整条流。
      * @return 自己这一路已关闭返回 true
      * @code
      * while(!a.isClosed()) produce(a);
@@ -218,6 +218,8 @@ public:
      *          此后 await() 重新阻塞直到下一次赋值。**只作用于本句柄这一路**，
      *          其他消费者不受影响；要清空整条流请用 `channel()->discard_pending()`。
      *          本操作不改变关闭状态，也不修改已保留的终止原因。
+     *          状态模式下 hub 的 `latest_` 播种副本不受影响，此后新建的 shared() 订阅者
+     *          仍会被播种为那个值——而调用过本方法的句柄自己却读不到它。
      * @code
      * st.discardPending();     // 本句柄回到"无值"，await 重新挂起
      * @endcode
@@ -318,9 +320,12 @@ public:
         return false;
     }
     /**
-     * @brief 关闭自己这一路，唤醒本路的等待者
+     * @brief 关闭整条数据流，唤醒并收敛所有消费者。
+     * @details 等价于 `close(std::make_error_code(std::errc::no_message))`：关闭 hub 表里
+     *          **所有**消费者队列（含 shared() 得到的订阅者），随后跑一次清理（断开上游）。
+     *          **想只退订自己，请析构句柄而不要调本方法。**
      * @code
-     * a.close();       // 正常终止：已排队值仍先被消费，随后得到 no_message
+     * a.close();       // 全体收敛：各自取完已排队的余量后得到 no_message
      * @endcode
      */
     void close(){
@@ -466,7 +471,7 @@ public:
 
     /**
      * @brief 查询自己这一路是否已关闭。
-     * @details 查的是本句柄独占的队列，而非整条流——订阅者关掉自己不影响别人。
+     * @details 查的是本句柄独占的队列，而非整条流。
      * @return 自己这一路已关闭返回 true
      * @code
      * while(!a.isClosed()) produce(a);
@@ -524,6 +529,8 @@ public:
      *          此后 await() 重新阻塞直到下一次赋值。**只作用于本句柄这一路**，
      *          其他消费者不受影响；要清空整条流请用 `channel()->discard_pending()`。
      *          本操作不改变关闭状态，也不修改已保留的终止原因。
+     *          状态模式下 hub 的 `latest_` 播种副本不受影响，此后新建的 shared() 订阅者
+     *          仍会被播种为那个值——而调用过本方法的句柄自己却读不到它。
      * @code
      * ready.discardPending();     // 本句柄回到"未发生"，await 重新挂起
      * @endcode
@@ -618,9 +625,12 @@ public:
         return false;
     }
     /**
-     * @brief 关闭自己这一路，唤醒本路的等待者
+     * @brief 关闭整条数据流，唤醒并收敛所有消费者。
+     * @details 等价于 `close(std::make_error_code(std::errc::no_message))`：关闭 hub 表里
+     *          **所有**消费者队列（含 shared() 得到的订阅者），随后跑一次清理（断开上游）。
+     *          **想只退订自己，请析构句柄而不要调本方法。**
      * @code
-     * a.close();       // 正常终止：已排队值仍先被消费，随后得到 no_message
+     * a.close();       // 全体收敛：各自取完已排队的余量后得到 no_message
      * @endcode
      */
     void close(){
