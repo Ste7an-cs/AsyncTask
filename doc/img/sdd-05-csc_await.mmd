@@ -10,7 +10,13 @@ classDiagram
         +close()
         +close(error_code)
     }
+    class AwaitMode {
+        <<enum>>
+        Queue
+        State
+    }
     class ChannelHub~T~ {
+        +ChannelHub(mode AwaitMode)
         +push(v)
         +close(error_code)
         +attach(queue)
@@ -18,7 +24,10 @@ classDiagram
         +notifyClosed(reason)
         +discard_pending()
         +setCapacity(n)
+        +isState() bool
+        +stateCell() shared_ptr~FiberChannel~
         -consumers_ vector~weak_ptr~FiberChannel~~
+        -state_ shared_ptr~FiberChannel~
         -guard_ AwaitableCloseGuard
     }
     class AwaitableCloseGuard {
@@ -44,6 +53,8 @@ classDiagram
         +push(v) bool
         +pop() Result~T~
         +pop_wait_for(t) Result~T~
+        +wait_peek(out) status
+        +wait_peek_for(out, t) status
         +close()
         -q_ deque
         -mtx_ / cv_ / closed_
@@ -84,8 +95,10 @@ classDiagram
 
     Awaitable --> ChannelHub
     Awaitable *-- FiberChannel
-    ChannelHub o-- FiberChannel
+    ChannelHub o-- FiberChannel : consumers_ 弱引用表
+    ChannelHub *-- FiberChannel : state_ 状态格(容量1，State 模式下非空)
     ChannelHub *-- AwaitableCloseGuard
+    ChannelHub ..> AwaitMode : 构造时确定模式
     Awaitable ..> Result : await 返回
     Generator o-- Awaitable : generate 接管
     CoroAbstractSocket ..> Awaitable : 方法返回
