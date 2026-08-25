@@ -1,7 +1,7 @@
 classDiagram
     class Awaitable~T~ {
-        -ch_ shared_ptr~FiberChannel~
-        -guard_ shared_ptr~AwaitableCloseGuard~
+        -hub_ shared_ptr~ChannelHub~
+        -queue_ shared_ptr~FiberChannel~
         +channel() shared_ptr
         +setOnClose(fn)
         +await() Result~T~
@@ -9,6 +9,17 @@ classDiagram
         +resolve(v) bool
         +close()
         +close(error_code)
+    }
+    class ChannelHub~T~ {
+        +push(v)
+        +close(error_code)
+        +attach(queue)
+        +detach(queue)
+        +notifyClosed(reason)
+        +discard_pending()
+        +setCapacity(n)
+        -consumers_ vector~weak_ptr~FiberChannel~~
+        -guard_ AwaitableCloseGuard
     }
     class AwaitableCloseGuard {
         +set(fn)
@@ -71,8 +82,10 @@ classDiagram
         +connectToHostEncrypted(...) shared_ptr~Awaitable<void>~
     }
 
+    Awaitable --> ChannelHub
     Awaitable *-- FiberChannel
-    Awaitable *-- AwaitableCloseGuard
+    ChannelHub o-- FiberChannel
+    ChannelHub *-- AwaitableCloseGuard
     Awaitable ..> Result : await 返回
     Generator o-- Awaitable : generate 接管
     CoroAbstractSocket ..> Awaitable : 方法返回

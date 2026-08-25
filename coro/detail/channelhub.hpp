@@ -117,8 +117,8 @@ public:
      * @brief 挂载一条消费者队列，此后每次 push 都会向它投递一份。
      * @details hub 已关闭时不挂载，直接以 hub 记录的终止原因关闭该队列，避免消费者
      *          永久挂起。挂载时把 hub 当前的容量赋给该队列。
-     *          与旧的 FiberChannel::addMirror 不同，本方法无需 private + friend 保护：
-     *          hub 与队列是两个不同的类型层，结构上无法互相挂载成环。
+     *          本方法为 public 而非 private + friend：hub 与队列是两个不同的类型层，
+     *          结构上无法互相挂载成环，因此无需收口保护。
      * @param queue 待挂载的消费者队列
      * @code
      * hub->attach(queue);      // 由 Awaitable 的构造函数调用
@@ -195,7 +195,7 @@ public:
      * @brief 向每一条存活且未关闭的消费者队列投递一份 value。
      * @details 失效槽位（消费者句柄已析构）在遍历中以 swap-and-pop 剔除；已关闭的
      *          队列跳过投递但保留在表中。投递延后一拍：最后一个接收者直接 move 送达，
-     *          因此拷贝次数与旧的 FiberChannel 镜像实现持平。
+     *          n 个消费者恰好 n-1 次拷贝。
      * @param value 待投递的元素
      * @return hub 已关闭返回 closed，否则返回 success
      * @code
