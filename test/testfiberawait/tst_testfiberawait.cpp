@@ -253,6 +253,7 @@ private slots:
     void test_case_state_moved_from_shell();
     void test_case_state_close_wakes_blocked_await();
     void test_case_state_await_yields_to_same_thread();
+    void test_case_state_discard_is_handle_scoped();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -724,6 +725,10 @@ void TestFiberAwait::test_case_broadcast_closed_mirror_pruned()
     CopyCounted::copies = 0;
     QCOMPARE(hub->push(CopyCounted(1)), boost::fibers::channel_op_status::success);
     const int baseline = CopyCounted::copies;
+    // 此处 baseline 恒为 0：ChannelHub::push 延后一拍投递，最后一个接收者直接 move，
+    // 而单个存活消费者既是第一个也是最后一个。因此下面 baseline * 2 == 0，
+    // 断言的是"一存活一关闭、推两次，拷贝数恰好为 0"——已关闭那条只要收到任何
+    // 一次投递就会失败，判别力比 baseline > 0 的写法更强，不要"修复"成非零。
 
     auto closing = std::make_shared<Coro::FiberChannel<CopyCounted>>();
     hub->attach(closing);
@@ -1840,36 +1845,73 @@ void TestFiberAwait::test_case_state_close_wakes_blocked_await()
 
 /// @brief 验证状态模式的 await 在命中值时让出协程，不会饿死同线程的其它协程。
 /// @details 命中值时 wait_peek 的谓词立即为真、无竞争的 fiber mutex 也不挂起，
-///          若不主动 yield，满速读取的循环会让同线程的关闭者永远排不上队——
-///          实测可跑到五百万次而关闭者一次未被调度。去掉 await 里的 yield，
-///          本用例会因循环撞上兜底而失败。
+///          若不主动 yield，满速读取的循环会让同线程的关闭者永远排不上队。
+///          两个协程必须钉在**同一条**线程上本用例才有判别力——Affinity::sticky()
+///          每次调用各自探测，可能落到不同线程，那样有没有 yield 都会通过，
+///          因此这里先探出一个线程 id 再用 Affinity::fixed 把两者钉在一起。
+///          判别点是循环有没有撞上兜底：撞上即说明它不是被 close 收敛的。
 void TestFiberAwait::test_case_state_await_yields_to_same_thread()
 {
+    // 先探出一个可调度的线程 id
+    std::thread::id workerId{};
+    auto probe = Coro::makeTask([&workerId]{
+        workerId = std::this_thread::get_id();
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    probe.get();
+
     Coro::Awaitable<int> st{Coro::AwaitMode::State};
     QVERIFY(st.resolve(1));
 
     std::atomic_llong iters{0};
     std::atomic_bool hitCap{false};
+    std::atomic_bool closerRan{false};
+
     auto spinner = Coro::makeTask([&st, &iters, &hitCap]{
         while(auto v = st.await()){
             Q_UNUSED(v);
-            if(iters.fetch_add(1) > 2000000){      // 兜底：没让出协程就会撞到这里
+            if(iters.fetch_add(1) > 20000000){   // 兜底：没让出协程就会撞到这里
                 hitCap = true;
                 break;
             }
         }
         return 0;
-    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    }, Coro::Priority::Normal, Coro::Affinity::fixed(workerId));
 
-    auto closer = Coro::makeTask([&st]{
+    auto closer = Coro::makeTask([&st, &closerRan]{
         Coro::msleep(50);
+        closerRan = true;
         st.close();
         return 0;
-    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+    }, Coro::Priority::Normal, Coro::Affinity::fixed(workerId));
 
     closer.get();
     spinner.get();
-    QVERIFY2(!hitCap.load(), "await 未让出协程：同线程的关闭者被饿死");
+
+    QVERIFY2(!hitCap.load(),
+             "循环撞上兜底而非被 close 收敛：await 未让出协程，同线程的关闭者被饿死");
+    QVERIFY(closerRan.load());
+}
+
+/// @brief 验证 discardPending() 只作用于本句柄，其他消费者的当前值不受影响。
+/// @details 状态现在存在各消费者自己的队列里，因此"清空"天然是按句柄计的。
+///          要让整条流回到无值，用 channel()->discard_pending()。
+void TestFiberAwait::test_case_state_discard_is_handle_scoped()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> st{Coro::AwaitMode::State};
+    auto sub = st.shared();
+    QVERIFY(st.resolve(1));
+    QCOMPARE(st.await().value(), 1);
+    QCOMPARE(sub->await().value(), 1);
+
+    st.discardPending();                 // 只清自己这一路
+
+    auto mine = st.await_for(50ms);
+    QVERIFY(!mine);
+    QCOMPARE(mine.error(), std::make_error_code(std::errc::timed_out));
+
+    QCOMPARE(sub->await().value(), 1);   // 订阅者仍持有当前值，未受牵连
 }
 
 /// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。
@@ -1877,8 +1919,6 @@ void TestFiberAwait::test_case_state_await_yields_to_same_thread()
 ///          悄悄增加每条流的堆占用，因此在这里钉死。换平台需重新测定。
 void TestFiberAwait::test_case_channel_layout_size()
 {
-    qDebug() << "sizeof(FiberChannel<int>) =" << sizeof(Coro::FiberChannel<int>)
-             << "sizeof(ChannelHub<int>) =" << sizeof(Coro::ChannelHub<int>);
     QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(160));
     QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(176));
 }
@@ -3275,7 +3315,6 @@ void TestFiberAwait::test_case_flat_no_consumer_stops_buffering()
     QCOMPARE(producer->push(2), boost::fibers::channel_op_status::closed);
 }
 
-/// @brief 验证 close() 只作用于自己这一路，源与订阅者互不牵连。
 /// @brief 验证任一句柄调 close() 都会终止整条流，所有消费者一起收敛。
 /// @details 2026-08-25 推翻了"close() 只关自己这一路"：业务代码持句柄 close() 时
 ///          期望的是整条流终止，订阅者不知情会继续等一条已无生产者的流。
