@@ -236,6 +236,11 @@ private slots:
     void test_case_channel_wait_peek_closed_even_with_value();
     void test_case_channel_wait_peek_for_timeout();
     void test_case_channel_push_wakes_all_peekers();
+    void test_case_hub_state_keeps_latest();
+    void test_case_hub_state_no_fanout_to_queues();
+    void test_case_hub_state_capacity_is_fixed();
+    void test_case_hub_state_close_and_discard();
+    void test_case_hub_queue_mode_defaults_unchanged();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -1491,13 +1496,112 @@ void TestFiberAwait::test_case_channel_push_wakes_all_peekers()
     QCOMPARE(woken.load(), 3);
 }
 
+/// @brief 验证状态模式的 hub 只保留最新值，且可被反复读取。
+void TestFiberAwait::test_case_hub_state_keeps_latest()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+    QVERIFY(hub->isState());
+    QVERIFY(hub->stateCell() != nullptr);
+
+    QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
+    QCOMPARE(hub->push(2), boost::fibers::channel_op_status::success);
+    QCOMPARE(hub->push(3), boost::fibers::channel_op_status::success);
+
+    int v{};
+    QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 3);                      // 最新值覆盖
+    QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 3);                      // 反复读不变
+}
+
+/// @brief 验证状态模式下 push 不向消费者队列扇出——内存与消费者数量无关。
+void TestFiberAwait::test_case_hub_state_no_fanout_to_queues()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+    auto q1 = std::make_shared<Coro::FiberChannel<int>>();
+    auto q2 = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(q1);
+    hub->attach(q2);
+
+    for(int i = 0; i < 5; ++i){
+        QCOMPARE(hub->push(i), boost::fibers::channel_op_status::success);
+    }
+
+    // 消费者队列始终为空：状态模式只写状态格
+    int v{};
+    QCOMPARE(q1->wait_peek_for(v, std::chrono::milliseconds(20)),
+             boost::fibers::channel_op_status::timeout);
+    QCOMPARE(q2->wait_peek_for(v, std::chrono::milliseconds(20)),
+             boost::fibers::channel_op_status::timeout);
+}
+
+/// @brief 验证状态模式下容量固定为 1，setCapacity 无效。
+void TestFiberAwait::test_case_hub_state_capacity_is_fixed()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+    QCOMPARE(hub->capacity(), std::uint32_t(1));
+
+    hub->setCapacity(64);                // 状态天然容量 1，应被忽略
+    QCOMPARE(hub->capacity(), std::uint32_t(1));
+
+    QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
+    QCOMPARE(hub->push(2), boost::fibers::channel_op_status::success);
+    int v{};
+    QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 2);                      // 仍只保留一个
+}
+
+/// @brief 验证状态模式下 close 关闭状态格、discard_pending 清空状态格。
+void TestFiberAwait::test_case_hub_state_close_and_discard()
+{
+    // discard：值被清掉，状态格回到空但仍开放
+    {
+        auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+        QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
+        hub->discard_pending();
+        int v{};
+        QCOMPARE(hub->stateCell()->wait_peek_for(v, std::chrono::milliseconds(20)),
+                 boost::fibers::channel_op_status::timeout);
+        QVERIFY(!hub->stateCell()->is_closed());
+    }
+    // close：状态格随之关闭，且带上同一个终止原因
+    {
+        auto hub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+        QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
+        hub->close(std::make_error_code(std::errc::connection_reset));
+        QVERIFY(hub->stateCell()->is_closed());
+        QCOMPARE(hub->stateCell()->close_error(),
+                 std::make_error_code(std::errc::connection_reset));
+        int v{};
+        QCOMPARE(hub->stateCell()->wait_peek(v), boost::fibers::channel_op_status::closed);
+        QCOMPARE(hub->push(2), boost::fibers::channel_op_status::closed);
+    }
+}
+
+/// @brief 验证默认构造仍是队列模式，既有默认值不变。
+void TestFiberAwait::test_case_hub_queue_mode_defaults_unchanged()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    QVERIFY(!hub->isState());
+    QVERIFY(hub->stateCell() == nullptr);
+    QCOMPARE(hub->capacity(), Coro::FiberChannel<int>::kDefaultCapacity);
+
+    // 扇出照常
+    auto q = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(q);
+    QCOMPARE(hub->push(42), boost::fibers::channel_op_status::success);
+    int v{};
+    QCOMPARE(q->pop(v), boost::fibers::channel_op_status::success);
+    QCOMPARE(v, 42);
+}
+
 /// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。
 /// @details 两者都由 make_shared 创建，加 16 字节控制块后落入分配桶；体积跳变会
 ///          悄悄增加每条流的堆占用，因此在这里钉死。换平台需重新测定。
 void TestFiberAwait::test_case_channel_layout_size()
 {
     QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(160));
-    QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(160));
+    QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(176));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。

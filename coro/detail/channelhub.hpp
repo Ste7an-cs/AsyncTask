@@ -83,6 +83,18 @@ public:
 } // namespace detail
 
 /**
+ * @brief 数据流的语义模式，构造时确定、此后不可变。
+ * @warning **State 模式下 `await()` 不消费、立即返回当前值**，因此
+ *          `while(auto v = Coro::await(a))` 与 `Coro::generate(a)` 会满速空转，
+ *          直到流关闭才终止。这两种写法只适用于 Queue 模式；在 State 模式下
+ *          请改用一次性的读取。
+ */
+enum class AwaitMode {
+    Queue,   ///< 队列：破坏性消费，一个值只被取走一次（默认，与既有行为一致）
+    State,   ///< 状态：非破坏性读取，多次读取返回同一个最新值
+};
+
+/**
  * @brief 一条数据流的分发端：生产者投递一次，每个消费者队列各得一份。
  *
  * 生产者只捕获 hub（绝不捕获 Awaitable，否则成引用环），每个消费者由自己的
@@ -104,8 +116,24 @@ template<class T>
 class ChannelHub{
     using channel_status = boost::fibers::channel_op_status;
 public:
-    /** @brief 默认构造，创建一个没有任何消费者的分发端 */
-    ChannelHub() = default;
+    /**
+     * @brief 构造一个没有任何消费者的分发端。
+     * @details `AwaitMode::State` 时额外创建一条容量为 1 的"状态格"：赋值即
+     *          push（容量 1 自动丢旧留新，正是"最新值"语义），读取走
+     *          FiberChannel::wait_peek()（不消费）。队列模式下状态格为空指针，
+     *          不产生任何堆分配。模式此后不可变。
+     * @param mode 语义模式，默认为队列模式
+     * @code
+     * auto queueHub = std::make_shared<Coro::ChannelHub<int>>();
+     * auto stateHub = std::make_shared<Coro::ChannelHub<int>>(Coro::AwaitMode::State);
+     * @endcode
+     */
+    explicit ChannelHub(AwaitMode mode = AwaitMode::Queue){
+        if(mode == AwaitMode::State){
+            state_ = std::make_shared<FiberChannel<T>>();
+            state_->setCapacity(1);
+        }
+    }
     /** @brief 析构：guard_ 成员析构时兜底执行一次清理 */
     ~ChannelHub() = default;
     /** @brief 禁止拷贝构造 */
@@ -213,6 +241,12 @@ public:
         if(BOOST_UNLIKELY(closed_.load())){
             return channel_status::closed;
         }
+        if(state_){
+            // 状态模式：只写状态格（容量 1 自动丢旧留新），不向消费者队列扇出——
+            // 因此内存与消费者数量无关，也不随赋值次数增长。
+            state_->push(std::move(value));
+            return channel_status::success;
+        }
         std::shared_ptr<FiberChannel<T>> pending;
         for(std::size_t i = 0; i < consumers_.size(); ){
             auto queue = consumers_[i].lock();
@@ -277,6 +311,9 @@ public:
                 ? std::make_error_code(std::errc::no_message)
                 : error;
         closed_.store(true);
+        if(state_){
+            state_->close(close_error_);
+        }
         for(auto& weak : consumers_){
             if(auto queue = weak.lock()){
                 queue->close(close_error_);
@@ -306,6 +343,9 @@ public:
      */
     void discard_pending(){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        if(state_){
+            state_->discard_pending();
+        }
         for(std::size_t i = 0; i < consumers_.size(); ){
             auto queue = consumers_[i].lock();
             if(!queue){
@@ -324,12 +364,17 @@ public:
      *          代表资源的值（如 QTcpSocket*）的流应调大容量或传 0，否则丢弃意味着
      *          该资源永远得不到处理。
      * @param capacity 新的容量上限，0 表示无限
+     * @details 状态模式下容量固定为 1，setCapacity 为空操作。
      * @code
      * hub->setCapacity(0);     // 取消上限，恢复无界队列（谨慎使用）
      * @endcode
      */
     void setCapacity(std::uint32_t capacity){
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        if(state_){
+            // 状态天然容量 1，容量概念对它不适用，忽略本次设置
+            return;
+        }
         capacity_ = capacity;
         for(std::size_t i = 0; i < consumers_.size(); ){
             auto queue = consumers_[i].lock();
@@ -346,13 +391,14 @@ public:
     /**
      * @brief 查询当前的容量上限
      * @return 容量上限；0 表示无限
+     * @details 状态模式下容量固定为 1，setCapacity 为空操作。
      * @code
      * if(hub->capacity() == 0) qDebug() << "无界队列";
      * @endcode
      */
     std::uint32_t capacity() const {
         std::unique_lock<boost::fibers::mutex> lck{mtx_};
-        return capacity_;
+        return state_ ? std::uint32_t(1) : capacity_;
     }
 
     /**
@@ -366,12 +412,34 @@ public:
         guard_.set(std::move(fn));
     }
 
+    /**
+     * @brief 查询本流是否为状态模式
+     * @return 状态模式返回 true
+     * @code
+     * if(hub->isState()) qDebug() << "值可反复读取";
+     * @endcode
+     */
+    bool isState() const noexcept { return state_ != nullptr; }
+    /**
+     * @brief 取得状态格；队列模式下为空指针。
+     * @details 供 Awaitable 在状态模式下读取当前值。状态格的存活由本 hub 保证，
+     *          调用方持有 hub 即可安全地在格上长时间等待——等待发生在格自己的
+     *          锁上，不占用 hub 的锁。
+     * @return 状态格的 shared_ptr；队列模式下为空
+     * @code
+     * int v{};
+     * if(hub->isState()) hub->stateCell()->wait_peek(v);
+     * @endcode
+     */
+    const std::shared_ptr<FiberChannel<T>>& stateCell() const { return state_; }
+
 private:
     mutable boost::fibers::mutex mtx_;///< 保护消费者表与关闭状态的 fiber 互斥量
     std::vector<std::weak_ptr<FiberChannel<T>>> consumers_{};///< 消费者队列表，强引用在各 Awaitable 手里
     std::atomic_bool closed_{false};///< 关闭标志
     std::uint32_t capacity_{FiberChannel<T>::kDefaultCapacity};///< 容量上限，级联给队列并作为新挂载的默认值
     std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
+    std::shared_ptr<FiberChannel<T>> state_;///< 状态格：容量 1 的队列，非空即状态模式；队列模式下为空指针
     detail::AwaitableCloseGuard guard_;///< 消费者归零时执行一次的清理钩子；**必须声明在最后**——析构时最先销毁，此时 mtx_/consumers_ 仍存活，回调可安全重入 hub
 
     /**
