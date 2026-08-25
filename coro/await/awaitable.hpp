@@ -60,7 +60,13 @@ public:
      */
     Awaitable(std::shared_ptr<ChannelHub<T>> hub, SubscribeTag)
         : hub_(std::move(hub)){
-        if(hub_) hub_->attach(queue_);
+        if(hub_){
+            hub_->attach(queue_);
+        }else{
+            // 源句柄已被移走：没有 hub 可挂，立即关闭本路，避免消费者永久挂在 await 上。
+            // 与 "hub 已关闭时 attach" 的收敛路径保持一致——宁可给出错误码，也不给挂死。
+            queue_->close(std::make_error_code(std::errc::invalid_argument));
+        }
     }
     /** @brief 析构：摘除自己那条队列；若消费者就此归零，hub 会执行一次清理 */
     ~Awaitable(){
@@ -308,7 +314,13 @@ public:
      */
     Awaitable(std::shared_ptr<ChannelHub<int>> hub, SubscribeTag)
         : hub_(std::move(hub)){
-        if(hub_) hub_->attach(queue_);
+        if(hub_){
+            hub_->attach(queue_);
+        }else{
+            // 源句柄已被移走：没有 hub 可挂，立即关闭本路，避免消费者永久挂在 await 上。
+            // 与 "hub 已关闭时 attach" 的收敛路径保持一致——宁可给出错误码，也不给挂死。
+            queue_->close(std::make_error_code(std::errc::invalid_argument));
+        }
     }
     /** @brief 析构：摘除自己那条队列；若消费者就此归零，hub 会执行一次清理 */
     ~Awaitable(){

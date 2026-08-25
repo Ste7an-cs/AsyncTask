@@ -166,6 +166,8 @@ public:
             cleanup = markExhausted(std::make_error_code(std::errc::no_message));
         }
         if(cleanup){
+            // guard_.run() 之后不得再触碰任何成员：回调可能是本 hub 的最后一个持有者，
+            // 返回时 hub 可能已被析构。run() 内部已把回调 move 到栈上局部变量再调用。
             guard_.run();
         }
     }
@@ -187,6 +189,8 @@ public:
             cleanup = markExhausted(error);
         }
         if(cleanup){
+            // guard_.run() 之后不得再触碰任何成员：回调可能是本 hub 的最后一个持有者，
+            // 返回时 hub 可能已被析构。run() 内部已把回调 move 到栈上局部变量再调用。
             guard_.run();
         }
     }
@@ -368,13 +372,17 @@ private:
     std::atomic_bool closed_{false};///< 关闭标志
     std::uint32_t capacity_{FiberChannel<T>::kDefaultCapacity};///< 容量上限，级联给队列并作为新挂载的默认值
     std::error_code close_error_{std::make_error_code(std::errc::no_message)};///< 首次关闭时保留的终止原因
-    detail::AwaitableCloseGuard guard_;///< 消费者归零时执行一次的清理钩子
+    detail::AwaitableCloseGuard guard_;///< 消费者归零时执行一次的清理钩子；**必须声明在最后**——析构时最先销毁，此时 mtx_/consumers_ 仍存活，回调可安全重入 hub
 
     /**
      * @brief 判定消费者是否已归零；归零则关闭 hub 并返回 true（需持有 mtx_ 调用）。
      * @details 「归零」指表中不存在既存活又未关闭的队列。顺带以 swap-and-pop 剔除
      *          失效槽位。已关闭的 hub 不覆盖已记录的终止原因，但仍返回 true——
      *          清理钩子本身幂等，重复触发无害，而漏触发会导致 Qt 连接迟迟不断开。
+     *          与另外四处 swap-and-pop 循环不同：遇到第一条「存活且未关闭」的队列
+     *          即 return false 提前退出，排在它之后的失效槽位本次不会被剔除（无害，
+     *          下次 push/attach/... 遍历时会顺带清掉）。五处循环刻意保持展开写、
+     *          不收拢成公共 helper，此处提前返回是唯一的语义差异，故在此注明。
      * @param error 归零时采用的终止原因
      * @return 已归零返回 true
      */

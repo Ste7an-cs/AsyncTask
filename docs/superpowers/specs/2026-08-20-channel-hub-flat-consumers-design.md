@@ -87,7 +87,7 @@
 两条必须成立，否则会自毁或死锁：
 
 1. **清理必须在 hub 的 fiber mutex 之外执行。** 锁内只改表与判定，取出回调后出锁再调用。`AwaitableCloseGuard` 自身用独立的 `std::mutex`，与 hub 的 fiber mutex 无嵌套。
-2. **触发方必须是持有 `hub_` 的 `Awaitable`。** 清理会 `QObject::disconnect`，进而销毁生产者 lambda、释放它持有的那份 hub 引用。之所以不会在 hub 成员函数执行期间把 hub 自己析构掉，正是因为触发方（`~Awaitable` 体内，成员尚未释放；或 `close()`，句柄更是活着）还攥着另一份引用。hub 自身析构时兜底跑一次清理是安全的——此时引用计数已归零，不存在重入销毁。
+2. **回调返回时不得再触碰 hub 的任何成员。** 旧论证是"触发方必须是持有 `hub_` 的 `Awaitable`，所以调用期间还攥着另一份引用，hub 不会被自毁"——这个论证不成立：`attach` / `detach` / `notifyClosed` 都是 public，任何调用方都能在栈上的 `ChannelHub`、或在回调里丢掉最后一份 `shared_ptr<ChannelHub<T>>` 之后调用它们，前提"触发方还持有一份引用"并不普适。真正让代码安全的是结构性的两条：其一，`AwaitableCloseGuard::run()` 把回调 `std::move` 到栈上局部变量之后才调用，因此清理执行期间即便 hub 已被析构，回调本身仍完好；其二，`detach` / `notifyClosed` 在调用 `guard_.run()` 之后立即返回、不再访问 `this` 的任何成员，因此回调把 hub 析构掉也不会造成 use-after-free。这也是 `guard_` 必须声明在成员列表最后的原因——hub 析构时它最先被销毁，此时 `mtx_` / `consumers_` 仍存活，回调可安全重入 hub。
 
 ## 4. 接口
 

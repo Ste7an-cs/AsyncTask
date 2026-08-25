@@ -231,6 +231,7 @@ private slots:
     void test_case_flat_void_source_handle_dropped_keeps_stream();
     void test_case_flat_closed_consumer_still_purged_on_source_destroy();
     void test_case_flat_move_assign_detaches_old_queue();
+    void test_case_flat_shared_on_moved_from_converges();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -1236,7 +1237,8 @@ void TestFiberAwait::test_case_hub_fanout_basic()
     QCOMPARE(second->pop(value), boost::fibers::channel_op_status::success);
     QCOMPARE(value, 2);
 
-    // 队列消亡后 hub 不再投递，且失效槽位被剔除（不崩溃即通过）
+    // 队列消亡后 hub 不再向它投递；剔除本身不可观测（consumers_ 为私有），
+    // 此处只保证不崩溃且存活队列照常收到后续投递
     second.reset();
     QCOMPARE(hub->push(3), boost::fibers::channel_op_status::success);
     QCOMPARE(first->pop(value), boost::fibers::channel_op_status::success);
@@ -2792,7 +2794,9 @@ void TestFiberAwait::test_case_flat_close_scope_is_self_only()
     QVERIFY(source.resolve(1));
     QCOMPARE(source.await().value(), 1);
     QCOMPARE(second->await().value(), 1);
-    QVERIFY(!first->await());
+    auto firstEnded = Coro::await_for(first, 100ms);
+    QVERIFY(!firstEnded);
+    QCOMPARE(firstEnded.error(), std::make_error_code(std::errc::no_message));
 
     // 源关自己：两个订阅者不受影响
     source.close();
@@ -2918,6 +2922,27 @@ void TestFiberAwait::test_case_flat_move_assign_detaches_old_queue()
     // 摘掉它现在持有的队列 → newHub 归零关闭；原流的钩子不得重复执行
     QVERIFY(newHub->is_closed());
     QCOMPARE(cleanups, 1);
+}
+
+/// @brief 验证在被移动过的空壳句柄上调 shared()，返回的句柄立即收敛而非永久挂死。
+/// @details 空壳的 hub_ 为空，新句柄无处挂载。若不主动关闭它的队列，await() 会阻塞在
+///          条件变量上且永无唤醒者——协程静默挂死，既无错误码也无超时。本类其余方法
+///          都做了空指针降级，shared() 也必须。
+void TestFiberAwait::test_case_flat_shared_on_moved_from_converges()
+{
+    Coro::Awaitable<int> source;
+    Coro::Awaitable<int> moved(std::move(source));   // source 成为空壳
+
+    auto orphan = source.shared();                   // 在空壳上订阅
+    QVERIFY(orphan);
+    auto result = orphan->await();                   // 必须立即返回，不得阻塞
+    QVERIFY(!result);
+    QCOMPARE(result.error(), std::make_error_code(std::errc::invalid_argument));
+    QVERIFY(orphan->isClosed());
+
+    // 被移动方接管的一路不受影响
+    QVERIFY(moved.resolve(1));
+    QCOMPARE(moved.await().value(), 1);
 }
 
 void TestFiberAwait::cleanupTestCase()
