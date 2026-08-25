@@ -204,8 +204,8 @@ private slots:
     void test_case_broadcast_prune_preserves_later_mirror();
     void test_case_broadcast_closed_mirror_pruned();
     void test_case_broadcast_discard_prunes_without_skipping();
-    void test_case_broadcast_source_destroyed_converges_mirror();
-    void test_case_broadcast_source_destroyed_converges_chain();
+    void test_case_broadcast_source_destroyed_keeps_mirror_open();
+    void test_case_broadcast_source_destroyed_keeps_chain_open();
     void test_case_broadcast_generate();
     void test_case_capacity_drop_oldest();
     void test_case_capacity_unlimited();
@@ -216,6 +216,22 @@ private slots:
     void test_case_capacity_setcapacity_propagates_to_mirrors();
     void test_case_capacity_setcapacity_propagates_chained();
     void test_case_capacity_void_specialization();
+    void test_case_hub_fanout_basic();
+    void test_case_hub_attach_after_close();
+    void test_case_hub_capacity_defaults_and_propagates();
+    void test_case_hub_exhausted_runs_cleanup_once();
+    void test_case_hub_discard_reaches_closed_queue();
+    void test_case_hub_push_copy_parity();
+    void test_case_hub_cleanup_runs_outside_lock();
+    void test_case_flat_source_handle_dropped_keeps_stream();
+    void test_case_flat_source_queue_released_with_handle();
+    void test_case_flat_no_consumer_stops_buffering();
+    void test_case_flat_close_scope_is_self_only();
+    void test_case_flat_cleanup_runs_once_on_last_handle();
+    void test_case_flat_void_source_handle_dropped_keeps_stream();
+    void test_case_flat_closed_consumer_still_purged_on_source_destroy();
+    void test_case_flat_move_assign_detaches_old_queue();
+    void test_case_flat_shared_on_moved_from_converges();
     void test_case_channel_layout_size();
     void test_case_socket_error_conversion();
     void test_case_autodisconnect_until_expired();
@@ -557,21 +573,26 @@ void TestFiberAwait::test_case_broadcast_subscribe_after_close()
     QCOMPARE(result.error(), std::make_error_code(std::errc::connection_refused));
 }
 
-/// @brief 验证源关闭时终止原因传播给每个订阅者，且排队余量先于终止错误被消费。
+/// @brief 验证生产者侧关闭整条流时，终止原因传播到每个消费者且不被覆盖。
+/// @details 消费者侧的 close() 只关自己这一路（见 test_case_flat_close_scope_is_self_only），
+///          整流终止是生产者的职责，走 channel()（即 ChannelHub）上的 close。
 void TestFiberAwait::test_case_broadcast_terminal_error()
 {
     Coro::Awaitable<int> source;
     auto first = source.shared();
     auto second = source.shared();
+    auto producer = source.channel();
 
     QVERIFY(source.resolve(7));
-    source.close(std::make_error_code(std::errc::connection_reset));
-    source.close(std::make_error_code(std::errc::timed_out));   // 首次错误不得被覆盖
+    producer->close(std::make_error_code(std::errc::connection_reset));
+    producer->close(std::make_error_code(std::errc::timed_out));   // 首次错误不得被覆盖
 
     QCOMPARE(first->await().value(), 7);
     QCOMPARE(first->await().error(), std::make_error_code(std::errc::connection_reset));
     QCOMPARE(second->await().value(), 7);
     QCOMPARE(second->await().error(), std::make_error_code(std::errc::connection_reset));
+    QCOMPARE(source.await().value(), 7);
+    QCOMPARE(source.await().error(), std::make_error_code(std::errc::connection_reset));
 }
 
 /// @brief 验证单个订阅者关闭只终止自己，源与其他订阅者不受影响。
@@ -583,7 +604,7 @@ void TestFiberAwait::test_case_broadcast_mirror_close_isolated()
 
     first->close(std::make_error_code(std::errc::operation_canceled));
     QVERIFY(source.resolve(5));
-    source.close();
+    source.channel()->close();
 
     QCOMPARE(first->await().error(), std::make_error_code(std::errc::operation_canceled));
     QCOMPARE(second->await().value(), 5);
@@ -637,7 +658,7 @@ void TestFiberAwait::test_case_broadcast_closed_stream_purges_mirror_on_destroy(
     QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
     QVERIFY(!server->hasPendingConnections());
 
-    incoming->close();   // 消费者先关闭流：镜像被关闭，但两侧队列仍留有排队指针
+    incoming->channel()->close();   // 生产者侧终止整条流：两条消费者队列都被关闭，但仍留有排队指针
     delete server;       // 随后销毁服务器，子 QTcpSocket 被删除
 
     // 镜像队列必须已被清空，否则此处取出已删除对象；
@@ -723,8 +744,10 @@ void TestFiberAwait::test_case_broadcast_discard_prunes_without_skipping()
     QCOMPARE(afterDiscard.error(), std::make_error_code(std::errc::timed_out));
 }
 
-/// @brief 验证源句柄未 close 就析构时，订阅者以 connection_aborted 收敛而非永久阻塞。
-void TestFiberAwait::test_case_broadcast_source_destroyed_converges_mirror()
+/// @brief 验证源句柄析构后订阅者不再被强行收敛，而是继续等待上游。
+/// @details 旧实现下源 channel 析构会以 connection_aborted 关闭镜像；新结构里
+///          上游活到最后一个句柄消失为止，订阅者只是暂时无值可取。
+void TestFiberAwait::test_case_broadcast_source_destroyed_keeps_mirror_open()
 {
     using namespace std::chrono_literals;
     std::shared_ptr<Coro::Awaitable<int>> subscriber;
@@ -739,22 +762,26 @@ void TestFiberAwait::test_case_broadcast_source_destroyed_converges_mirror()
     QVERIFY(queued);
     QCOMPARE(queued.value(), 5);
 
-    // 随后必须收敛，而不是挂住
-    auto terminal = Coro::await_for(subscriber, 100ms);
-    QVERIFY(!terminal);
-    QCOMPARE(terminal.error(), std::make_error_code(std::errc::connection_aborted));
+    // 随后既不收敛也不崩溃，只是没有新值
+    auto pending = Coro::await_for(subscriber, 50ms);
+    QVERIFY(!pending);
+    QCOMPARE(pending.error(), std::make_error_code(std::errc::timed_out));
+    QVERIFY(!subscriber->isClosed());
 }
 
-/// @brief 验证源析构时，链式订阅（source → mirror → 二级镜像）逐级收敛。
-void TestFiberAwait::test_case_broadcast_source_destroyed_converges_chain()
+/// @brief 验证链式订阅在源句柄析构后同样保持开放。
+/// @details 链式订阅在新结构里就是同一个 hub 上的两条平级队列，不再是镜像树。
+void TestFiberAwait::test_case_broadcast_source_destroyed_keeps_chain_open()
 {
     using namespace std::chrono_literals;
     std::shared_ptr<Coro::Awaitable<int>> mirror;
     std::shared_ptr<Coro::Awaitable<int>> nested;
+    std::shared_ptr<Coro::ChannelHub<int>> producer;
     {
         Coro::Awaitable<int> source;
         mirror = source.shared();
         nested = mirror->shared();
+        producer = source.channel();
         QVERIFY(source.resolve(7));
     }   // 源析构，未 close()
 
@@ -762,13 +789,10 @@ void TestFiberAwait::test_case_broadcast_source_destroyed_converges_chain()
     QCOMPARE(Coro::await_for(mirror, 100ms).value(), 7);
     QCOMPARE(Coro::await_for(nested, 100ms).value(), 7);
 
-    // 随后两级都必须收敛
-    auto mirrorEnd = Coro::await_for(mirror, 100ms);
-    QVERIFY(!mirrorEnd);
-    QCOMPARE(mirrorEnd.error(), std::make_error_code(std::errc::connection_aborted));
-    auto nestedEnd = Coro::await_for(nested, 100ms);
-    QVERIFY(!nestedEnd);
-    QCOMPARE(nestedEnd.error(), std::make_error_code(std::errc::connection_aborted));
+    // 两级都仍然开放，且继续接收上游后续的值
+    QCOMPARE(producer->push(8), boost::fibers::channel_op_status::success);
+    QCOMPARE(Coro::await_for(mirror, 100ms).value(), 8);
+    QCOMPARE(Coro::await_for(nested, 100ms).value(), 8);
 }
 
 /// @brief 验证 Coro::generate() 可直接迭代 shared() 订阅句柄，源关闭后循环自然结束。
@@ -780,7 +804,7 @@ void TestFiberAwait::test_case_broadcast_generate()
     QVERIFY(source.resolve(1));
     QVERIFY(source.resolve(2));
     QVERIFY(source.resolve(3));
-    source.close();
+    source.channel()->close();
 
     int total = 0;
     for(int v : Coro::generate(audit)) total += v;
@@ -796,7 +820,7 @@ void TestFiberAwait::test_case_broadcast_void()
 
     QVERIFY(source.resolve());
     QVERIFY(source.resolve());
-    source.close(std::make_error_code(std::errc::connection_reset));
+    source.channel()->close(std::make_error_code(std::errc::connection_reset));
 
     QVERIFY(first->await().has_value());
     QVERIFY(first->await().has_value());
@@ -819,7 +843,7 @@ void TestFiberAwait::test_case_broadcast_coexists_with_competing_consumers()
             Coro::msleep(1);
             source.resolve(1);
         }
-        source.close();
+        source.channel()->close();
         return 0;
     }, Coro::Priority::Normal, Coro::Affinity::sticky());
 
@@ -916,7 +940,7 @@ void TestFiberAwait::test_case_broadcast_cross_thread_consumers()
             Coro::msleep(1);
             source.resolve(2);
         }
-        source.close();
+        source.channel()->close();
         return 0;
     }, Coro::Priority::Normal, Coro::Affinity::sticky());
 
@@ -1191,12 +1215,188 @@ void TestFiberAwait::test_case_capacity_void_specialization()
     QCOMPARE(successCount, 3);
 }
 
-/// @brief 固定 FiberChannel 的布局大小，防止新增字段静默跨过 glibc 分配桶。
-/// @details 168 是 x86-64 / libstdc++ 上的实测值；capacity_ 已用尽 closed_ 之后的
-///          全部 padding，再加字段就会涨到 176。移植到其他平台时应重新测量并更新此值。
+/// @brief 验证 ChannelHub 把每次 push 同步投递给每一条已挂载的队列。
+void TestFiberAwait::test_case_hub_fanout_basic()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    auto first = std::make_shared<Coro::FiberChannel<int>>();
+    auto second = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(first);
+    hub->attach(second);
+
+    QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
+    QCOMPARE(hub->push(2), boost::fibers::channel_op_status::success);
+
+    int value{};
+    QCOMPARE(first->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 1);
+    QCOMPARE(first->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 2);
+    QCOMPARE(second->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 1);
+    QCOMPARE(second->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 2);
+
+    // 队列消亡后 hub 不再向它投递；剔除本身不可观测（consumers_ 为私有），
+    // 此处只保证不崩溃且存活队列照常收到后续投递
+    second.reset();
+    QCOMPARE(hub->push(3), boost::fibers::channel_op_status::success);
+    QCOMPARE(first->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 3);
+}
+
+/// @brief 验证 hub 关闭后再挂载的队列立即以 hub 的终止原因收敛，且不入表。
+void TestFiberAwait::test_case_hub_attach_after_close()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    hub->close(std::make_error_code(std::errc::connection_refused));
+
+    auto late = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(late);
+
+    QVERIFY(late->is_closed());
+    QCOMPARE(late->close_error(), std::make_error_code(std::errc::connection_refused));
+    int value{};
+    QCOMPARE(late->pop(value), boost::fibers::channel_op_status::closed);
+    QCOMPARE(hub->push(1), boost::fibers::channel_op_status::closed);
+}
+
+/// @brief 验证 hub 的容量既作为新队列的默认值，也会级联到已挂载的队列。
+void TestFiberAwait::test_case_hub_capacity_defaults_and_propagates()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    QCOMPARE(hub->capacity(), Coro::FiberChannel<int>::kDefaultCapacity);
+
+    auto early = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(early);
+    hub->setCapacity(2);
+    QCOMPARE(hub->capacity(), std::uint32_t(2));
+    QCOMPARE(early->capacity(), std::uint32_t(2));      // 级联到已挂载的
+
+    auto late = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(late);
+    QCOMPARE(late->capacity(), std::uint32_t(2));       // 作为新挂载的默认值
+
+    for(int i = 1; i <= 4; ++i){
+        QCOMPARE(hub->push(i), boost::fibers::channel_op_status::success);
+    }
+    int value{};
+    QCOMPARE(late->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 3);                                  // 只剩最近两条
+    QCOMPARE(late->pop(value), boost::fibers::channel_op_status::success);
+    QCOMPARE(value, 4);
+}
+
+/// @brief 验证消费者归零时清理钩子恰好跑一次，且 hub 随之关闭。
+/// @details 覆盖两条触发路径：队列被关闭（notifyClosed）与队列被摘除（detach）。
+void TestFiberAwait::test_case_hub_exhausted_runs_cleanup_once()
+{
+    // 路径一：唯一消费者被关闭
+    {
+        auto hub = std::make_shared<Coro::ChannelHub<int>>();
+        auto queue = std::make_shared<Coro::FiberChannel<int>>();
+        hub->attach(queue);
+        int cleanups = 0;
+        hub->setOnClose([&cleanups]{ ++cleanups; });
+
+        queue->close(std::make_error_code(std::errc::connection_reset));
+        hub->notifyClosed(std::make_error_code(std::errc::connection_reset));
+        QCOMPARE(cleanups, 1);
+        QVERIFY(hub->is_closed());
+        // 终止原因必须被继承，而不是退回 no_message
+        QCOMPARE(hub->close_error(), std::make_error_code(std::errc::connection_reset));
+
+        hub->detach(queue.get());
+        QCOMPARE(cleanups, 1);                           // 幂等，不重复跑
+    }
+
+    // 路径二：还有别的存活消费者时不得跑清理
+    {
+        auto hub = std::make_shared<Coro::ChannelHub<int>>();
+        auto closing = std::make_shared<Coro::FiberChannel<int>>();
+        auto living = std::make_shared<Coro::FiberChannel<int>>();
+        hub->attach(closing);
+        hub->attach(living);
+        int cleanups = 0;
+        hub->setOnClose([&cleanups]{ ++cleanups; });
+
+        closing->close();
+        hub->notifyClosed(std::make_error_code(std::errc::no_message));
+        QCOMPARE(cleanups, 0);
+        QVERIFY(!hub->is_closed());
+        QCOMPARE(hub->push(9), boost::fibers::channel_op_status::success);
+
+        hub->detach(living.get());
+        QCOMPARE(cleanups, 1);
+        QVERIFY(hub->is_closed());
+    }
+}
+
+/// @brief 验证 discard_pending() 能触达已关闭但尚未摘除的队列。
+/// @details 这是 corotcpserver 的悬空指针防线：消费者先 close()、再销毁来源，
+///          来源析构时必须能清掉队列里即将悬空的值。
+void TestFiberAwait::test_case_hub_discard_reaches_closed_queue()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    auto queue = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(queue);
+
+    QCOMPARE(hub->push(1), boost::fibers::channel_op_status::success);
+    queue->close();                                      // 关闭但句柄仍在，未摘除
+    hub->discard_pending();
+
+    int value{};
+    QCOMPARE(queue->pop(value), boost::fibers::channel_op_status::closed);
+}
+
+/// @brief 验证 hub 的扇出拷贝次数与旧的 FiberChannel 镜像实现持平。
+/// @details 旧实现把值 move 进源队列、copy 给每条镜像。hub 必须同样把最后一个
+///          接收者用 move 送达，否则每次 push 都会比旧实现多一次 T 拷贝。
+void TestFiberAwait::test_case_hub_push_copy_parity()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<CopyCounted>>();
+    auto only = std::make_shared<Coro::FiberChannel<CopyCounted>>();
+    hub->attach(only);
+
+    CopyCounted::copies = 0;
+    QCOMPARE(hub->push(CopyCounted(1)), boost::fibers::channel_op_status::success);
+    QCOMPARE(CopyCounted::copies, 0);                    // 唯一接收者：全程 move
+
+    auto second = std::make_shared<Coro::FiberChannel<CopyCounted>>();
+    hub->attach(second);
+    CopyCounted::copies = 0;
+    QCOMPARE(hub->push(CopyCounted(2)), boost::fibers::channel_op_status::success);
+    QCOMPARE(CopyCounted::copies, 1);                    // 两个接收者：一拷一移
+}
+
+/// @brief 验证消费者归零时的清理钩子在 hub 的 fiber mutex 之外执行。
+/// @details boost::fibers::mutex 不可重入，因此回调里再取一次 hub 的锁，就把这条
+///          结构性不变式变成了可被测试捕获的行为：若将来有人把 guard_.run() 挪进
+///          锁作用域内，本用例会死锁挂住，而不是静默通过。
+void TestFiberAwait::test_case_hub_cleanup_runs_outside_lock()
+{
+    auto hub = std::make_shared<Coro::ChannelHub<int>>();
+    auto queue = std::make_shared<Coro::FiberChannel<int>>();
+    hub->attach(queue);
+
+    bool reentered = false;
+    Coro::ChannelHub<int>* raw = hub.get();
+    hub->setOnClose([raw, &reentered]{
+        raw->discard_pending();      // 需要取 hub 的锁；仍持锁调用本回调则死锁
+        reentered = true;
+    });
+
+    hub->detach(queue.get());        // 消费者归零，触发清理
+    QVERIFY(reentered);
+}
+
+/// @brief 固定队列与分发端的布局大小，防止新增字段静默跨过 glibc 分配桶。
+/// @details 两者都由 make_shared 创建，加 16 字节控制块后落入分配桶；体积跳变会
+///          悄悄增加每条流的堆占用，因此在这里钉死。换平台需重新测定。
 void TestFiberAwait::test_case_channel_layout_size()
 {
-    QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(168));
+    QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(160));
+    QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(160));
 }
 
 /// @brief 验证 TCP 与本地 socket 错误保留 Qt 类别、数值及可读信息。
@@ -2438,6 +2638,12 @@ void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
     using namespace std::chrono_literals;
     QUdpSocket receiver;
     QUdpSocket sender;
+    // 环境里若导出了 all_proxy（SOCKS5），Qt 会把 applicationProxy 设为 Socks5Proxy，
+    // 于是 bind() 走进代理引擎：bind 仍返回 true，但 localPort() 恒为 0，下面就会把
+    // 数据报发往端口 0 而无人接收。no_proxy 里的 127.* 救不了——bind 时没有目标主机
+    // 可供匹配。与本文件其余 socket 用例一致，显式禁用代理。
+    receiver.setProxy(QNetworkProxy::NoProxy);
+    sender.setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     QVERIFY(sender.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
 
@@ -2467,6 +2673,8 @@ void TestFiberAwait::test_case_udp_stream_direct_close()
 {
     QUdpSocket receiver;
     QUdpSocket sender;
+    receiver.setProxy(QNetworkProxy::NoProxy);
+    sender.setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     QVERIFY(sender.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     auto datagrams = Coro::coro(&receiver).receiveDatagram();
@@ -2488,6 +2696,7 @@ void TestFiberAwait::test_case_udp_close_ends_stream_and_releases()
 {
     using namespace std::chrono_literals;
     QUdpSocket receiver;
+    receiver.setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     auto datagrams = Coro::coro(&receiver).receiveDatagram();
     std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
@@ -2506,6 +2715,7 @@ void TestFiberAwait::test_case_udp_destruction_ends_stream_and_releases()
 {
     using namespace std::chrono_literals;
     auto receiver = new QUdpSocket;
+    receiver->setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver->bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     auto datagrams = Coro::coro(receiver).receiveDatagram();
     std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
@@ -2517,6 +2727,232 @@ void TestFiberAwait::test_case_udp_destruction_ends_stream_and_releases()
 
     datagrams.reset();
     QTRY_VERIFY_WITH_TIMEOUT(observed.expired(), 2000);
+}
+
+/// @brief 验证丢弃源句柄不再终止订阅者：上游继续活着，订阅者继续收数据。
+/// @details 这是本次改动的核心诉求——广播用法下调用方不必再攥着源句柄，
+///          因而源队列不会长期囤积无人消费的值。
+void TestFiberAwait::test_case_flat_source_handle_dropped_keeps_stream()
+{
+    using namespace std::chrono_literals;
+    std::shared_ptr<Coro::Awaitable<int>> subscriber;
+    std::shared_ptr<Coro::ChannelHub<int>> producer;
+    {
+        Coro::Awaitable<int> source;
+        subscriber = source.shared();
+        producer = source.channel();          // 生产者侧句柄，模拟 Qt 槽的捕获
+        QVERIFY(source.resolve(1));
+    }                                          // 源句柄析构
+
+    // 订阅者先收到丢源之前的值
+    QCOMPARE(Coro::await_for(subscriber, 100ms).value(), 1);
+
+    // 上游仍然活着：丢源之后生产的值照样送达
+    QCOMPARE(producer->push(2), boost::fibers::channel_op_status::success);
+    QCOMPARE(Coro::await_for(subscriber, 100ms).value(), 2);
+    QVERIFY(!producer->is_closed());
+}
+
+/// @brief 验证源句柄析构后，源那条队列连同排队的值一起释放，不再接收投递。
+void TestFiberAwait::test_case_flat_source_queue_released_with_handle()
+{
+    auto tracker = std::make_shared<int>(0);
+    std::weak_ptr<int> alive = tracker;
+    std::shared_ptr<Coro::Awaitable<std::shared_ptr<int>>> subscriber;
+    std::shared_ptr<Coro::ChannelHub<std::shared_ptr<int>>> producer;
+    {
+        Coro::Awaitable<std::shared_ptr<int>> source;
+        subscriber = source.shared();
+        producer = source.channel();
+        QVERIFY(source.resolve(tracker));      // 源队列与订阅者队列各持一份
+    }                                           // 源句柄析构：源队列连同它那份一起没了
+
+    tracker.reset();
+    QVERIFY(!alive.expired());                 // 订阅者队列里还排着一份
+
+    // 订阅者取走后，再没有任何队列持有它
+    auto received = subscriber->await();
+    QVERIFY(received);
+    received.value().reset();
+    QVERIFY(alive.expired());                  // 源队列确实没在偷偷囤着
+}
+
+/// @brief 验证所有消费者句柄消失后 push 直接失败，不再囤积任何值。
+void TestFiberAwait::test_case_flat_no_consumer_stops_buffering()
+{
+    std::shared_ptr<Coro::ChannelHub<int>> producer;
+    {
+        Coro::Awaitable<int> only;
+        producer = only.channel();
+        QVERIFY(only.resolve(1));
+    }                                           // 唯一消费者析构 → 消费者归零
+
+    QVERIFY(producer->is_closed());
+    QCOMPARE(producer->push(2), boost::fibers::channel_op_status::closed);
+}
+
+/// @brief 验证 close() 只作用于自己这一路，源与订阅者互不牵连。
+void TestFiberAwait::test_case_flat_close_scope_is_self_only()
+{
+    using namespace std::chrono_literals;
+    Coro::Awaitable<int> source;
+    auto first = source.shared();
+    auto second = source.shared();
+
+    // 订阅者关自己：源与另一个订阅者照常
+    first->close();
+    QVERIFY(source.resolve(1));
+    QCOMPARE(source.await().value(), 1);
+    QCOMPARE(second->await().value(), 1);
+    auto firstEnded = Coro::await_for(first, 100ms);
+    QVERIFY(!firstEnded);
+    QCOMPARE(firstEnded.error(), std::make_error_code(std::errc::no_message));
+
+    // 源关自己：两个订阅者不受影响
+    source.close();
+    QVERIFY(source.channel()->push(2) == boost::fibers::channel_op_status::success);
+    QCOMPARE(Coro::await_for(second, 100ms).value(), 2);
+    auto sourceEnded = source.await();
+    QVERIFY(!sourceEnded);
+    QCOMPARE(sourceEnded.error(), std::make_error_code(std::errc::no_message));
+}
+
+/// @brief 验证清理钩子在最后一个消费者消失时恰好跑一次。
+void TestFiberAwait::test_case_flat_cleanup_runs_once_on_last_handle()
+{
+    int cleanups = 0;
+    {
+        Coro::Awaitable<int> source;
+        source.setOnClose([&cleanups]{ ++cleanups; });
+        auto subscriber = source.shared();
+
+        source.close();                        // 还有订阅者在，不能跑清理
+        QCOMPARE(cleanups, 0);
+
+        subscriber->close();                   // 最后一路关闭，跑一次
+        QCOMPARE(cleanups, 1);
+    }                                           // 两个句柄析构，不得重复跑
+    QCOMPARE(cleanups, 1);
+}
+
+/// @brief 验证 void 特化同样享有平表语义：丢弃源句柄后订阅者继续收到事件。
+void TestFiberAwait::test_case_flat_void_source_handle_dropped_keeps_stream()
+{
+    using namespace std::chrono_literals;
+    std::shared_ptr<Coro::Awaitable<void>> subscriber;
+    std::shared_ptr<Coro::ChannelHub<int>> producer;   // void 特化底层承载 int
+    {
+        Coro::Awaitable<void> source;
+        subscriber = source.shared();
+        producer = source.channel();
+        QVERIFY(source.resolve());
+    }                                           // 源句柄析构
+
+    QVERIFY(Coro::await_for(subscriber, 100ms));           // 丢源之前的那次事件
+    QCOMPARE(producer->push(1), boost::fibers::channel_op_status::success);
+    QVERIFY(Coro::await_for(subscriber, 100ms));           // 丢源之后仍然送达
+    QVERIFY(!subscriber->isClosed());
+}
+
+/// @brief 验证消费者关闭自己这一路后，来源析构时 discard_pending() 仍能触达该队列。
+/// @details corotcpserver.hpp 点名的场景：消费者先 close() 掉 awaitable、再 delete
+///          server，队列里已排队的 QTcpSocket* 即将悬空，必须被清掉。新语义下
+///          close() 只关自己这一路且**不摘表**，正是靠这条不变式，discard_pending()
+///          才能触达已关闭的 incoming 队列；若哪天改成 close() 即摘表，本用例会以
+///          取到野指针的形式在 ASan 下爆出来。
+///          audit 这一路虽未主动 close()，但 corotcpserver.hpp 的 closeStop 在
+///          server 的 destroyed 信号上无条件 channel->close() 整条 hub（与 incoming
+///          是否提前自关无关，见该文件 130-133/151 行），因此 server 析构后 audit
+///          同样以 no_message 收敛，与 test_case_broadcast_closed_stream_purges_mirror_on_destroy
+///          的镜像断言一致——这里同样断言明确的终止原因而非 !purged，否则「队列清空
+///          但仍挂起」的回归会被 100ms 超时悄悄掩盖。
+void TestFiberAwait::test_case_flat_closed_consumer_still_purged_on_source_destroy()
+{
+    using namespace std::chrono_literals;
+    auto server = new QTcpServer;
+    QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+    auto incoming = Coro::coro(server).nextConnection();
+    auto audit = incoming->shared();
+    QSignalSpy connectionSignal(server, &QTcpServer::newConnection);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server->serverPort());
+    QTRY_COMPARE_WITH_TIMEOUT(client.state(), QAbstractSocket::ConnectedState, 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(connectionSignal.count() > 0, 2000);
+    QVERIFY(!server->hasPendingConnections());   // 连接已被 drain 进两条队列
+
+    incoming->close();   // 只关自己这一路；队列仍留在 hub 的消费者表里
+    delete server;       // 子 QTcpSocket 被删除，两侧队列里的指针即将悬空；server 析构
+                          // 也会经 closeStop 无条件关闭整条 hub
+
+    // 已关闭的 incoming 队列必须也被清空，否则消费者仍能弹出已删除对象
+    auto stale = Coro::await_for(incoming, 100ms);
+    QVERIFY(!stale);
+    QCOMPARE(stale.error(), std::make_error_code(std::errc::no_message));
+
+    // audit 随 server 析构一并终止（closeStop 整条 hub 关闭），队列已被清空 → 取不到野指针
+    auto purged = Coro::await_for(audit, 100ms);
+    QVERIFY(!purged);
+    QCOMPARE(purged.error(), std::make_error_code(std::errc::no_message));
+}
+
+/// @brief 验证移动赋值会摘除被覆盖句柄的队列，触发原数据流的归零清理。
+/// @details 仅释放 shared_ptr 不会触发 hub 的归零判定（归零只在 detach/notifyClosed
+///          里做）。若移动赋值漏掉 detach，原流的清理钩子永不执行、hub 永不关闭，
+///          生产者会继续 push 进一张空表还一路拿到 success。
+///          同时覆盖被移动方成为空壳后，其析构不得 detach、不得提前关闭新流。
+void TestFiberAwait::test_case_flat_move_assign_detaches_old_queue()
+{
+    int cleanups = 0;
+    std::shared_ptr<Coro::ChannelHub<int>> oldHub;
+    std::shared_ptr<Coro::ChannelHub<int>> newHub;
+    {
+        Coro::Awaitable<int> replaced;
+        replaced.setOnClose([&cleanups]{ ++cleanups; });
+        oldHub = replaced.channel();
+
+        Coro::Awaitable<int> incoming;
+        newHub = incoming.channel();
+
+        replaced = std::move(incoming);   // 覆盖：原数据流就此失去唯一消费者
+
+        QCOMPARE(cleanups, 1);
+        QVERIFY(oldHub->is_closed());
+        QCOMPARE(oldHub->push(1), boost::fibers::channel_op_status::closed);
+
+        // 被移动方成为空壳：await 立即返回，不阻塞
+        QVERIFY(!incoming.await());
+
+        // 接管的一路照常工作
+        QVERIFY(replaced.resolve(7));
+        QCOMPARE(replaced.await().value(), 7);
+        QVERIFY(!newHub->is_closed());
+    }
+    // 空壳 incoming 先析构（不得 detach、不得关闭 newHub），随后 replaced 析构
+    // 摘掉它现在持有的队列 → newHub 归零关闭；原流的钩子不得重复执行
+    QVERIFY(newHub->is_closed());
+    QCOMPARE(cleanups, 1);
+}
+
+/// @brief 验证在被移动过的空壳句柄上调 shared()，返回的句柄立即收敛而非永久挂死。
+/// @details 空壳的 hub_ 为空，新句柄无处挂载。若不主动关闭它的队列，await() 会阻塞在
+///          条件变量上且永无唤醒者——协程静默挂死，既无错误码也无超时。本类其余方法
+///          都做了空指针降级，shared() 也必须。
+void TestFiberAwait::test_case_flat_shared_on_moved_from_converges()
+{
+    Coro::Awaitable<int> source;
+    Coro::Awaitable<int> moved(std::move(source));   // source 成为空壳
+
+    auto orphan = source.shared();                   // 在空壳上订阅
+    QVERIFY(orphan);
+    auto result = orphan->await();                   // 必须立即返回，不得阻塞
+    QVERIFY(!result);
+    QCOMPARE(result.error(), std::make_error_code(std::errc::invalid_argument));
+    QVERIFY(orphan->isClosed());
+
+    // 被移动方接管的一路不受影响
+    QVERIFY(moved.resolve(1));
+    QCOMPARE(moved.await().value(), 1);
 }
 
 void TestFiberAwait::cleanupTestCase()

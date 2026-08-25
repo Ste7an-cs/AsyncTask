@@ -87,7 +87,7 @@
 两条必须成立，否则会自毁或死锁：
 
 1. **清理必须在 hub 的 fiber mutex 之外执行。** 锁内只改表与判定，取出回调后出锁再调用。`AwaitableCloseGuard` 自身用独立的 `std::mutex`，与 hub 的 fiber mutex 无嵌套。
-2. **触发方必须是持有 `hub_` 的 `Awaitable`。** 清理会 `QObject::disconnect`，进而销毁生产者 lambda、释放它持有的那份 hub 引用。之所以不会在 hub 成员函数执行期间把 hub 自己析构掉，正是因为触发方（`~Awaitable` 体内，成员尚未释放；或 `close()`，句柄更是活着）还攥着另一份引用。hub 自身析构时兜底跑一次清理是安全的——此时引用计数已归零，不存在重入销毁。
+2. **回调返回时不得再触碰 hub 的任何成员。** 旧论证是"触发方必须是持有 `hub_` 的 `Awaitable`，所以调用期间还攥着另一份引用，hub 不会被自毁"——这个论证不成立：`attach` / `detach` / `notifyClosed` 都是 public，任何调用方都能在栈上的 `ChannelHub`、或在回调里丢掉最后一份 `shared_ptr<ChannelHub<T>>` 之后调用它们，前提"触发方还持有一份引用"并不普适。真正让代码安全的是结构性的两条：其一，`AwaitableCloseGuard::run()` 把回调 `std::move` 到栈上局部变量之后才调用，因此清理执行期间即便 hub 已被析构，回调本身仍完好；其二，`detach` / `notifyClosed` 在调用 `guard_.run()` 之后立即返回、不再访问 `this` 的任何成员，因此回调把 hub 析构掉也不会造成 use-after-free。这也是 `guard_` 必须声明在成员列表最后的原因——hub 析构时它最先被销毁，此时 `mtx_` / `consumers_` 仍存活，回调可安全重入 hub。
 
 ## 4. 接口
 
@@ -118,12 +118,12 @@ public:
     std::uint32_t capacity() const;
     void setOnClose(std::function<void()> fn);
 
-private:
-    template<typename U> friend class Awaitable;
+    // Awaitable 内部调用：挂载/摘除自己的队列、通知归零判定
     void attach(const std::shared_ptr<FiberChannel<T>>& queue);
     void detach(const FiberChannel<T>* queue);       // Awaitable 析构时调用
     void notifyClosed(std::error_code error);        // Awaitable::close(ec) 后触发归零判定
 
+private:
     mutable boost::fibers::mutex mtx_;
     std::vector<std::weak_ptr<FiberChannel<T>>> consumers_;
     std::atomic_bool closed_{false};
@@ -132,6 +132,12 @@ private:
     detail::AwaitableCloseGuard guard_;
 };
 ```
+
+`attach`/`detach`/`notifyClosed` 是 public，而非 spec 早先设想的 private + friend：与旧的
+`FiberChannel::addMirror` 不同，这三个方法无需 private + friend 保护。`addMirror` 必须收口，
+是因为两个同类型的 channel 能互相注册为对方的镜像而成环；`ChannelHub` 与 `FiberChannel` 是
+两个不同的类型层，结构上无法互相挂载，环不可能构造出来。public 同时让 `ChannelHub` 可以脱离
+`Awaitable` 独立单测。
 
 各方法行为：
 
@@ -187,9 +193,9 @@ std::shared_ptr<FiberChannel<T>>  queue_;   // void 特化为 FiberChannel<int>
 
 ## 6. 存储与性能
 
-**存储。** 单消费者场景分配次数不变（今天 channel + guard 两次，改后 hub + queue 两次），但 hub 大于 guard，每个 `Awaitable` 净增几十字节。`FiberChannel` 卸下 `mirrors_` 后 `sizeof` 预计从 168 回落到 160。订阅者反而更省：今天每个订阅者是"完整 channel + 自己的 guard"，改后只是一条队列，hub 共用——订阅越多越划算。
+**存储。** 单消费者场景分配次数不变（今天 channel + guard 两次，改后 hub + queue 两次），但 hub 大于 guard，每个 `Awaitable` 净增几十字节。`FiberChannel` 卸下 `mirrors_` 后 `sizeof` 从 168 回落到 160。订阅者反而更省：今天每个订阅者是"完整 channel + 自己的 guard"，改后只是一条队列，hub 共用——订阅越多越划算。
 
-具体数字实测确定，沿用现有做法把新值钉进测试：`test/testfiberawait/tst_testfiberawait.cpp:1194` 的 `sizeof(FiberChannel<int>) == 168` 更新为实测值，并补一条 `sizeof(ChannelHub<int>)`。测试环境为 x86-64 / libstdc++ / glibc，换平台需重测。
+x86-64 / libstdc++ / glibc 实测数字：`sizeof(Coro::FiberChannel<int>)` = **160**（改动前 168，卸下镜像列表后回落）；`sizeof(Coro::ChannelHub<int>)` = **160**。每个 `Awaitable` 仍是两次 `make_shared` 分配（改动前是 channel + 独立 guard，改动后是 hub + queue），单消费者场景总字节由 168+guard 增至 160+160=320，净增几十字节；反过来订阅者更省——改动前每个订阅者是"完整 channel 168 + 自己的 guard"，改动后只是一条 160 的队列，hub 共用，订阅越多越划算。这两个数字由 `test/testfiberawait/tst_testfiberawait.cpp` 的 `test_case_channel_layout_size`（`QCOMPARE(sizeof(Coro::FiberChannel<int>), std::size_t(160))` / `QCOMPARE(sizeof(Coro::ChannelHub<int>), std::size_t(160))`）钉死，换平台需重测。
 
 **性能。** `push` 的临界区数量不变（今天源锁 + N 个镜像锁，改后 hub 锁 + N 个队列锁）。无存活消费者时 `push` 只做一次遍历即返回，省掉今天的 `push_back` 加到顶后的 `pop_front` 与一次 `T` 拷贝。链式 `shared()` 因锁层数从 3 降到 2 而变快。
 

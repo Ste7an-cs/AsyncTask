@@ -76,7 +76,7 @@ public:
          * });
          * @endcode
          */
-        bool is_closed() const{return p_awaiter_->channel()->is_closed();}
+        bool is_closed() const{return p_awaiter_->isClosed();}
     };
 
     /**
@@ -318,7 +318,7 @@ public:
          * });
          * @endcode
          */
-        bool is_closed() const{return p_awaiter_->channel()->is_closed();}
+        bool is_closed() const{return p_awaiter_->isClosed();}
     };
 
     /**
@@ -564,8 +564,7 @@ Generator<T> generate(std::shared_ptr<Awaitable<T>> a){
             Result<T> r = a->await_for(std::chrono::milliseconds(10));
             if(!r.has_value()){
                 if(r.error() == std::make_error_code(std::errc::timed_out)){
-                    auto channel = a->channel();
-                    if(channel && !channel->is_closed()){
+                    if(!a->isClosed()){
                         continue;
                     }
                 }
