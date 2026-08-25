@@ -2638,6 +2638,12 @@ void TestFiberAwait::test_case_udp_preserves_datagrams_and_sender_metadata()
     using namespace std::chrono_literals;
     QUdpSocket receiver;
     QUdpSocket sender;
+    // 环境里若导出了 all_proxy（SOCKS5），Qt 会把 applicationProxy 设为 Socks5Proxy，
+    // 于是 bind() 走进代理引擎：bind 仍返回 true，但 localPort() 恒为 0，下面就会把
+    // 数据报发往端口 0 而无人接收。no_proxy 里的 127.* 救不了——bind 时没有目标主机
+    // 可供匹配。与本文件其余 socket 用例一致，显式禁用代理。
+    receiver.setProxy(QNetworkProxy::NoProxy);
+    sender.setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     QVERIFY(sender.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
 
@@ -2667,6 +2673,8 @@ void TestFiberAwait::test_case_udp_stream_direct_close()
 {
     QUdpSocket receiver;
     QUdpSocket sender;
+    receiver.setProxy(QNetworkProxy::NoProxy);
+    sender.setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     QVERIFY(sender.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     auto datagrams = Coro::coro(&receiver).receiveDatagram();
@@ -2688,6 +2696,7 @@ void TestFiberAwait::test_case_udp_close_ends_stream_and_releases()
 {
     using namespace std::chrono_literals;
     QUdpSocket receiver;
+    receiver.setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     auto datagrams = Coro::coro(&receiver).receiveDatagram();
     std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
@@ -2706,6 +2715,7 @@ void TestFiberAwait::test_case_udp_destruction_ends_stream_and_releases()
 {
     using namespace std::chrono_literals;
     auto receiver = new QUdpSocket;
+    receiver->setProxy(QNetworkProxy::NoProxy);
     QVERIFY(receiver->bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     auto datagrams = Coro::coro(receiver).receiveDatagram();
     std::weak_ptr<Coro::Awaitable<QNetworkDatagram>> observed = datagrams;
