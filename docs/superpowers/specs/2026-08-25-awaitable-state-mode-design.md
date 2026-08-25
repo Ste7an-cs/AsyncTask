@@ -71,6 +71,7 @@
 | 清空操作 | 映射到"丢弃待消费值"，两种模式共用一个方法 | 底层本就是同一个 `discard_pending` |
 | 清空的调用方 | 生产者与句柄都可以 | 队列模式下句柄级只清自己那条队列；状态模式下没有"自己那一路"，只能清共享的状态格 |
 | 关闭且有值时的读取 | 返回 `closed`，**不返回值** | 这是状态模式下唯一可能的终止信号（见 §3.4） |
+| 关闭后 `await()` 的产出 | 失败的 `Result`，`error()` 为流的终止原因；最后的值不可再读 | 与队列模式的判空写法完全一致，`while(await(a))` 因此能退出 |
 
 ### 3.3 边界行为
 
@@ -160,14 +161,35 @@ void discardPending();
 `await()` / `await_for()` 按模式分派；两种模式都先检查本句柄是否已收尾：
 
 ```cpp
-if(queue_ && queue_->is_closed()){
-    return queue_->close_error();          // 本句柄已 close()，或整流已关闭
+Result<T, std::error_code> await(){
+    if(!queue_ || !hub_){
+        return std::make_error_code(std::errc::no_message);   // 移动后的空壳
+    }
+    if(queue_->is_closed()){
+        return queue_->close_error();      // 本句柄已 close()，或整流已关闭
+    }
+    T value{};
+    if(hub_->isState()){
+        const auto& cell = hub_->stateCell();
+        // 状态模式：读状态格，不消费。channel_status 到 Result 的映射必须显式写出——
+        // closed 时取的是**状态格自己**的终止原因，而非本句柄队列的。
+        auto status = cell->wait_peek(value);
+        if(status == boost::fibers::channel_op_status::success){
+            return value;
+        }
+        return cell->close_error();
+    }
+    auto status = queue_->pop(value);      // 队列模式：既有行为，逐字不变
+    if(status == boost::fibers::channel_op_status::success){
+        return value;
+    }
+    return queue_->close_error();
 }
-if(hub_ && hub_->isState()){
-    return hub_->stateCell()->wait_peek(value);   // 状态模式：读状态格，不消费
-}
-return queue_->pop(value);                 // 队列模式：既有行为，逐字不变
 ```
+
+`await_for(timeout)` 同构，只是分别改用 `wait_peek_for` / `pop_wait_for`，并把 `timeout` 状态映射为 `std::errc::timed_out`。
+
+**终止原因的来源**：整流关闭（`channel()->close(ec)`）会以同一个规范化后的 `ec` 同时关闭状态格与所有消费者队列，因此两条分支给出的错误码一致；句柄自己 `close(ec2)` 只关本句柄的队列，于是**只有该句柄**得到 `ec2`，其他消费者仍照常读到状态。
 
 `resolve(v)` 不变（仍是 `hub_->push(v)`，由 hub 按模式分派）。`shared()` 不变（复用 hub，自动继承模式）。`isClosed()` 不变（查自身队列）。
 
