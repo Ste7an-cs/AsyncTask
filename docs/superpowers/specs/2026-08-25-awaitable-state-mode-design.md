@@ -79,7 +79,7 @@
 - **最新值覆盖。** 连续赋值时，容量 1 使旧值被丢弃；此后读到的恒为最后一次赋的值。
 - **订阅继承。** `shared()` 复用同一个 hub，因而自动是状态模式，且新订阅者立刻读到当前值——不需要任何 replay 机制，因为状态本就在那儿。
 - **清空后重新挂起。** 清空使状态格回到空，此后 `await()` 重新阻塞；下一次赋值唤醒**所有**等待者（见 §3.5）。
-- **句柄自关只影响自己。** `close()` 关掉本句柄那条（状态模式下闲置的）队列；`await()` 先查它，因此本句柄此后一律得到终止错误，其他消费者不受影响。"句柄管自己、生产者管整流"这条既有规则在状态模式下依然成立。
+- **句柄自关只影响自己。** `close()` 关掉本句柄那条（状态模式下闲置的）队列；状态模式的 `await()` 先查它，因此本句柄此后一律得到终止错误，其他消费者不受影响。"句柄管自己、生产者管整流"这条既有规则在状态模式下依然成立。**该检查只存在于状态模式分支**——队列模式必须保留"已关闭但仍有余量时先取完余量"的既有语义，见 §4.3。
 - **无值时的容量语义。** 状态模式下 `setCapacity()` 是空操作（状态天然容量 1），`capacity()` 返回 1。
 
 ### 3.4 关闭即终止信号（`wait_peek` 与 `pop` 的刻意差异）
@@ -158,28 +158,32 @@ explicit Awaitable(AwaitMode mode);
 void discardPending();
 ```
 
-`await()` / `await_for()` 按模式分派；两种模式都先检查本句柄是否已收尾：
+`await()` / `await_for()` 按模式分派。**"本句柄已收尾"的早退检查只能放在状态模式分支内**——队列模式必须保持既有的"已关闭但仍有余量时先取完余量"语义（`test_case_broadcast_terminal_error` 正断言关闭后仍能取到排队值），若把该检查提到分派之前，余量将再也取不到，现有用例会成片失败：
 
 ```cpp
 Result<T, std::error_code> await(){
-    if(!queue_ || !hub_){
+    if(!queue_){
         return std::make_error_code(std::errc::no_message);   // 移动后的空壳
     }
-    if(queue_->is_closed()){
-        return queue_->close_error();      // 本句柄已 close()，或整流已关闭
-    }
     T value{};
-    if(hub_->isState()){
+    if(hub_ && hub_->isState()){
+        // ---- 状态模式 ----
+        if(queue_->is_closed()){
+            // 本句柄已 close()，或整流关闭时连带关掉了它。状态格不消费，
+            // 因此没有"余量"概念，直接以本句柄的终止原因收尾。
+            return queue_->close_error();
+        }
         const auto& cell = hub_->stateCell();
-        // 状态模式：读状态格，不消费。channel_status 到 Result 的映射必须显式写出——
-        // closed 时取的是**状态格自己**的终止原因，而非本句柄队列的。
+        // channel_status 到 Result 的映射必须显式写出；closed 时取的是
+        // **状态格自己**的终止原因，而非本句柄队列的。
         auto status = cell->wait_peek(value);
         if(status == boost::fibers::channel_op_status::success){
             return value;
         }
         return cell->close_error();
     }
-    auto status = queue_->pop(value);      // 队列模式：既有行为，逐字不变
+    // ---- 队列模式：以下与今天逐字相同，不得插入任何提前返回 ----
+    auto status = queue_->pop(value);
     if(status == boost::fibers::channel_op_status::success){
         return value;
     }
