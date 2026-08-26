@@ -1,32 +1,30 @@
 stateDiagram-v2
     direction TB
 
-    [*] --> 无值: 以 AwaitMode::State 构造<br/>（或 shared() 订阅但流中尚无值）
+    [*] --> 无值: 以 AwaitMode 的 State 构造<br/>或 shared 订阅但流中尚无值
 
-    无值 --> 有值: resolve(v) / hub->push(v)<br/>扇出到每条消费者队列（容量恒为 1）
+    无值 --> 有值: resolve(v)：经 hub 扇出到<br/>每条消费者队列（容量恒为 1）
     无值 --> 无值: await() 阻塞让出协程<br/>await_for() 到期返回 timed_out
 
-    有值 --> 有值: await() 立即返回当前值（不消费，可反复读）
-    有值 --> 有值: resolve(v2) 新值挤掉旧值<br/>此后读到的恒为最新
+    有值 --> 有值: await() 立即返回当前值<br/>不消费，可反复读
+    有值 --> 有值: resolve(v2) 新值挤掉旧值<br/>读到的恒为最新
     有值 --> 无值: discardPending()<br/>只清本句柄，其他消费者不受影响
 
-    有值 --> 已终止: close() / hub 关闭<br/>最后的值不再可读
-    无值 --> 已终止: close() / hub 关闭
+    有值 --> 已终止: close() 或 hub 关闭<br/>最后的值不再可读
+    无值 --> 已终止: close() 或 hub 关闭
 
     已终止 --> [*]
 
     note right of 有值
-        新 shared() 订阅者在 attach 时
-        由 hub 的 latest_ 副本播种，
-        因此一接上就能读到当前值
-        （不做 replay，接线前已存在的
-        状态需由生产者补投一次）
+        新 shared 订阅者在 attach 时由 hub 的
+        latest_ 副本播种，一接上就能读到当前值。
+        但状态模式不做 replay：接线之前就已存在的
+        状态，需要生产者自己补投一次。
     end note
 
     note right of 已终止
         关闭是状态模式唯一的终止信号：
-        await() 返回失败的 Result，
-        error() 给出终止原因。
-        没有这条规则，await() 将永远成功、
-        永不报错，消费者无从得知源头已消亡
+        await() 返回失败的 Result，error() 给出终止原因。
+        没有这条规则，await() 将永远成功、永不报错，
+        消费者无从得知源头已经消亡。
     end note
