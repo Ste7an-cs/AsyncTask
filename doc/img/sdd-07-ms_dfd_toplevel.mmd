@@ -9,7 +9,7 @@ flowchart TB
     P5["P5 应用与退出<br/>exec / quit"]
 
     D1[("D1 FiberGlobalQueue<br/>就绪协程 按亲和/优先级")]
-    D2[("D2 FiberChannel<br/>Awaitable 数据队列")]
+    D2[("D2 ChannelHub + 每消费者一条 FiberChannel<br/>分发端扇出，各消费者独占自己的队列")]
     D3[("D3 SharedState<br/>任务链计数/取消/回调")]
 
     User -->|"fn+属性"| P1
@@ -18,12 +18,12 @@ flowchart TB
     P2 -->|"resume 恢复"| P3
     P2 -->|"resume 恢复"| P4
     Src -->|"信号/数据"| P3
-    P3 -->|"push"| D2
-    D2 -->|"pop(让出后唤醒)"| P3
+    P3 -->|"push 到 hub → 扇出各队列"| D2
+    D2 -->|"从自己的队列 pop/peek(让出后唤醒)"| P3
     P3 -->|"Result / Generator"| User
     P4 -->|"add/done_nodes, is_runnable, finally_cbs"| D3
     D3 -->|"计数归零→回调, 取消→短路"| P4
     P4 -->|"Result"| User
     User -->|"quit"| P5
-    P5 -->|"close 广播"| D2
+    P5 -->|"close 广播(hub 关闭所有消费者队列)"| D2
     P5 -->|"停线程池/退出"| P2

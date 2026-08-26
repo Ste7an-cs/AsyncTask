@@ -3,23 +3,29 @@ sequenceDiagram
     participant U as 用户协程
     participant W as CoroAbstractSocket CSC_AWAIT
     participant A as Awaitable CSC_AWAIT
-    participant CH as FiberChannel CSC_DETAIL
+    participant H as ChannelHub CSC_DETAIL
+    participant Q as 本句柄的 FiberChannel CSC_DETAIL
     participant Sk as QAbstractSocket
 
     U->>W: coro(sock).readAll()
-    W->>A: 建 Awaitable，取 channel()
-    W->>Sk: connect(readyRead → ch.push(sock.readAll()))
-    W->>Sk: connect(disconnected/destroyed → ch.close())
+    W->>A: 建 Awaitable（构造即 attach 自己的队列到 hub）
+    W->>A: 取 channel() 得到 hub
+    W->>Sk: connect(readyRead → hub->push(sock.readAll()))
+    W->>Sk: connect(disconnected/destroyed → hub->close())
     alt 建连时已有缓冲数据
-        W->>CH: 立即 push（规避 check-then-wait 竞态）
+        W->>H: 立即 push（规避 check-then-wait 竞态）
     end
     W-->>U: 返回 shared_ptr<Awaitable>
     U->>A: generate(shared_ptr) → 建 Generator（强持有 Awaitable）
+
     loop 每轮迭代
-        U->>A: next() → CH.pop()（无数据则让出）
-        Sk-->>CH: readyRead → push(数据块)
-        CH-->>U: yield QByteArray
+        U->>Q: next() → 从自己的队列 pop（无数据则让出）
+        Sk-->>H: readyRead → hub->push(数据块)
+        H->>Q: 扇出到每条消费者队列（shared() 订阅者各得一份）
+        Q-->>U: yield QByteArray
     end
-    Sk-->>CH: disconnected → close()
-    CH-->>U: pop 得关闭 → 迭代结束
-    U->>A: close 或最终析构 → guard exactly-once disconnect
+
+    Sk-->>H: disconnected → hub->close()
+    H->>Q: 关闭所有消费者队列
+    Q-->>U: pop 取完余量后得关闭 → 迭代结束
+    U->>A: 最终析构 → detach 自己那条队列 → 消费者归零 → guard 恰好一次断连

@@ -2,13 +2,13 @@ sequenceDiagram
     autonumber
     participant U as 用户(协程/主流程)
     participant App as FiberApplication CSC_TASK
-    participant AW as 各 Awaitable D2
+    participant AW as 各数据流 ChannelHub D2
     participant Sch as 主线程调度器 CSC_SCHEDULER
     participant Pool as FibersPool CSC_EXECUTOR
 
     U->>App: Coro::quit()
-    App->>AW: invokeMethod(qApp,"aboutToQuit") → 各 Awaitable close(channel)
-    AW-->>Sch: 挂在 await() 的协程被唤醒（pop 得关闭）并收尾
+    App->>AW: invokeMethod(qApp,"aboutToQuit") → 各 hub->close()<br/>（扇出关闭该流的所有消费者队列）
+    AW-->>Sch: 挂在 await() 的协程各自被自己队列的 cv 唤醒（得关闭）并收尾
     App->>Sch: signalExit() 置全局退出标志
     Sch-->>Sch: 各线程常驻泵协程醒来看到标志 → 自行终止
     App->>Sch: drainUntilIdle(): processEvents + 处理 deleteLater + yield
