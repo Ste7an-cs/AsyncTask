@@ -1,6 +1,16 @@
 # Awaitable 状态模式：值可重复读取的"最新值"语义
 
-日期：2026-08-25
+日期：2026-08-25（2026-08-25 修订：见 §0）
+
+## 0. 修订记录
+
+本文档初版把状态存放在一个**全流共享的"状态格"**上，所有消费者一起阻塞在它的条件变量上。该设计在实现并通过全部任务评审之后被推翻，原因是它**违背了 `ChannelHub` 架构自身的核心不变式**（见 `2026-08-20-channel-hub-flat-consumers-design.md`）：hub 只负责分发，每个 `Awaitable`（含 `shared()` 得到的订阅者）独占自己的队列，**每次 `await` 都等在自己队列的条件变量上**。
+
+共享状态格使"谁在等"和"谁被唤醒"落在两个不同的对象上，由此直接导致最终评审发现的两个缺陷：句柄级 `close()` 唤不醒自己的等待者；消费者归零时 `markExhausted` 不关状态格，等待者永久挂死且无路可救。这两个后果不是可以打补丁的 bug，是错误结构的必然产物。
+
+本次修订取消共享状态格：**状态存放在各消费者自己的队列里**（容量 1），`await` 用非破坏性读取读自己的队列。上述两个缺陷随结构一并消失。
+
+同期还定下两项修改，见 §3.5 与 §3.6：状态读取命中值时必须让出协程；`Awaitable::close()` 改为终止整条流。
 
 ## 1. 背景与问题
 
@@ -11,7 +21,7 @@
 - `coro(std::future<T>&&)` / `coro(const QFuture<T>&)` —— 只 push 一次结果；
 - `CoroAbstractSocket::connectToHost()` / `waitForConnected()` —— 一次性等待。
 
-对这些来源 `await` 第二次会**永久阻塞**：值已被第一次消费取走，而生产者不会再产生第二个。这是一个今天就存在、只是没被触发的隐患。
+对这些来源 `await` 第二次会**永久阻塞**：值已被第一次消费取走，而生产者不会再产生第二个。
 
 ## 2. 目标与非目标
 
@@ -26,15 +36,15 @@
 
 ### 非目标
 
-- **不做变化通知。** 状态是拿来读的；想知道"变了"只能自行轮询。这是明确排除的能力，不是缺陷。
-- 不引入新类型：状态语义作为 `Awaitable` 的一个模式存在，而非独立的 `State<T>`。
+- **不做变化通知。** 状态是拿来读的；想知道"变了"只能自行轮询。
+- 不引入新类型：状态语义作为 `Awaitable` 的一个模式存在。
 - 不改变 `Awaitable` 的按值 move-only 语义，不引入虚函数、不引入常驻 fiber。
 
 ## 3. 语义规格
 
 ### 3.1 结构
 
-状态模式是**流一级的属性**，存在 `ChannelHub` 上——`shared()` 共享 hub，因此所有消费者必然读到同一份状态。
+状态模式是**流一级的属性**（存在 `ChannelHub` 上，`shared()` 共享 hub 故自动继承），但**状态本身存放在各消费者自己的队列里**：
 
 ```
                  ┌──────────────────────────────────────────┐
@@ -42,72 +52,101 @@
    捕获这一个 ──►│  关闭状态 / 终止原因 / 清理钩子             │
                  │  vector<weak_ptr<FiberChannel<T>>> 消费者表│
                  │                                          │
-                 │  队列模式：state_ == nullptr              │
-                 │  状态模式：state_ ──► FiberChannel<T>     │
-                 │              （容量 1 的状态格）           │
+                 │  队列模式：latest_ 为空                    │
+                 │  状态模式：latest_ ── 最新值的一份副本，    │
+                 │            仅用于给新订阅者播种，无人等待它 │
                  └───┬──────────┬──────────┬─────────────────┘
-                     │          │          │
+                     │ push 扇出 │          │
                  ┌───▼───┐  ┌───▼───┐  ┌───▼───┐
-                 │queue A│  │queue B│  │queue C│  仅记账用；状态模式下不投递
-                 └───────┘  └───────┘  └───────┘
-                     ▲          ▲          ▲
+                 │queue A│  │queue B│  │queue C│  状态模式下容量恒为 1
+                 └───▲───┘  └───▲───┘  └───▲───┘
+                     │          │          │
                 Awaitable   Awaitable   Awaitable
+                 各自等在自己队列的条件变量上
 ```
 
-**状态格就是一条容量为 1 的 `FiberChannel<T>`。** 赋值即 `push`——容量 1 的既有语义会自动丢弃旧值、保留新值，正是"最新值"。读取用新增的非破坏性 `wait_peek()`：拷贝队首但不弹出。所有消费者 peek 同一格，因此"多次读值不变"是**结构性保证**，不依赖任何约定。
+**状态模式 = 容量 1 的队列 + 非破坏性读取。** `push` 照常扇出到每条消费者队列，容量 1 的既有语义使新值自动挤掉旧值——每个消费者手里都是最新值。读取用 `FiberChannel::wait_peek()`：拷贝队首但不弹出，因此可反复读到同一个值。
 
-**模式不设单独的枚举成员**：`state_` 非空即状态模式。模式在构造时确定、此后不可变，杜绝"中途切模式"这种没人推得清楚的状态。
+**扇出逻辑与队列模式完全一致**，不存在"状态模式不扇出"这类特例；两种模式的唯一差别是**队列容量固定为 1** 与**读取方式为 peek 而非 pop**。
+
+**模式不设单独的枚举成员**：hub 的 `latest_` 是否启用（以一个 `std::unique_ptr<T>` 或等价物表示）即模式标志。模式在构造时确定、此后不可变。
 
 ### 3.2 已决策项
 
 | 决策点 | 结论 | 理由 |
 |---|---|---|
-| 状态形态 | 可变状态（最新值），非一次性 promise | 用户需求：值可反复更新 |
-| 放置方式 | `Awaitable` 上的模式开关，非独立类型 | 用户选择；用法统一 |
-| 重复 `await()` | 立即返回同一个值 | 用户选择；字面实现"多次消费值不变" |
-| 变化通知 | 不提供 | 用户明确不需要；换来 O(1) 内存与最简设计 |
-| 状态存储 | 复用容量 1 的 `FiberChannel<T>` | 不引入新类型；复用已被现有用例覆盖的机制 |
-| 状态模式下的闲置队列 | 照常分配并 attach | 生命周期记账（消费者归零即断上游）一行不改 |
-| 清空操作 | 映射到"丢弃待消费值"，两种模式共用一个方法 | 底层本就是同一个 `discard_pending` |
-| 清空的调用方 | 生产者与句柄都可以 | 队列模式下句柄级只清自己那条队列；状态模式下没有"自己那一路"，只能清共享的状态格 |
-| 关闭且有值时的读取 | 返回 `closed`，**不返回值** | 这是状态模式下唯一可能的终止信号（见 §3.4） |
-| 关闭后 `await()` 的产出 | 失败的 `Result`，`error()` 为流的终止原因；最后的值不可再读 | 与队列模式的判空写法完全一致，`while(await(a))` 因此能退出 |
+| 状态形态 | 可变状态（最新值），非一次性 promise | 值可反复更新 |
+| 放置方式 | `Awaitable` 上的模式开关，非独立类型 | 用法统一 |
+| 重复 `await()` | 立即返回同一个值 | 字面实现"多次消费值不变" |
+| 变化通知 | 不提供 | 换来最简设计 |
+| **状态存放位置** | **各消费者自己的队列（容量 1）**，hub 另存一份副本供新订阅者播种 | 守住"每次 await 都等在自己队列的 cv 上"这条架构不变式；见 §0 |
+| 状态模式下的扇出 | 与队列模式完全一致 | 不为状态模式开特例 |
+| 清空操作 | 映射到"丢弃待消费值"，两种模式共用一个方法 | 底层同为 `discard_pending` |
+| **`Awaitable::close()` 的作用域** | **终止整条流**（关闭 hub 表里所有消费者队列并跑一次清理） | 见 §3.6 |
+| 析构的作用域 | 只摘自己那条队列；表中再无存活且未关闭的队列时才收尾 | 想只退订自己就析构句柄 |
+| 关闭且有值时的读取 | 返回 `closed`，**不返回值** | 状态模式下唯一可能的终止信号；见 §3.4 |
+| 状态读取命中值时 | **必须让出协程** | 否则饿死同线程的一切；见 §3.5 |
 
 ### 3.3 边界行为
 
-- **首值等待。** 状态格为空且未关闭时，`await()` 让出协程等待；某次赋值后被唤醒并返回该值。
-- **最新值覆盖。** 连续赋值时，容量 1 使旧值被丢弃；此后读到的恒为最后一次赋的值。
-- **订阅继承。** `shared()` 复用同一个 hub，因而自动是状态模式，且新订阅者立刻读到当前值——不需要任何 replay 机制，因为状态本就在那儿。
-- **清空后重新挂起。** 清空使状态格回到空，此后 `await()` 重新阻塞；下一次赋值唤醒**所有**等待者（见 §3.5）。
-- **句柄自关只影响自己。** `close()` 关掉本句柄那条（状态模式下闲置的）队列；状态模式的 `await()` 先查它，因此本句柄此后一律得到终止错误，其他消费者不受影响。"句柄管自己、生产者管整流"这条既有规则在状态模式下依然成立。**该检查只存在于状态模式分支**——队列模式必须保留"已关闭但仍有余量时先取完余量"的既有语义，见 §4.3。
-- **无值时的容量语义。** 状态模式下 `setCapacity()` 是空操作（状态天然容量 1），`capacity()` 返回 1。
+- **首值等待。** 自己的队列为空且未关闭时，`await()` 让出协程等待；某次赋值扇出到本队列后被唤醒并返回该值。
+- **最新值覆盖。** 容量 1 使旧值被挤掉；此后读到的恒为最后一次赋的值。
+- **订阅继承与播种。** `shared()` 复用同一个 hub，因而自动是状态模式。`attach()` 时若 hub 的 `latest_` 有值，先把它播种进新队列——新订阅者因此立刻能读到当前值，不需要任何 replay 机制。
+- **清空后重新挂起。** 清空有两个入口，作用范围不同：`Awaitable::discardPending()`（见 §4.3）**只清调用者自己那条队列**，不碰 `latest_`，其他消费者不受影响；`hub_->discard_pending()`（即 `channel()->discard_pending()`）才是 hub 级的清空，**同时清掉 `latest_` 与所有消费者队列**。两个入口清空的队列此后 `await()` 都重新阻塞；下一次赋值扇出时唤醒各自的等待者。
+- **无值时的容量语义。** 状态模式下容量固定为 1：`setCapacity()` 为空操作，`capacity()` 返回 1。
+- **移动后的空壳。** `queue_` 为空时 `await()` 立即返回 `no_message`、`await_for()` 返回 `timed_out`，不触碰 `hub_`。
 
 ### 3.4 关闭即终止信号（`wait_peek` 与 `pop` 的刻意差异）
 
-`pop()` 的既有行为是"已关闭但仍有余量时先返回值，取空后才报 `closed`"。**`wait_peek()` 不同：只要 channel 已关闭就返回 `closed`，无论格中是否还有值，`out` 不写入。**
+`pop()` 的既有行为是"已关闭但仍有余量时先返回值，取空后才报 `closed`"。**`wait_peek()` 不同：只要 channel 已关闭就返回 `closed`，无论队列中是否还有值，`out` 不写入。**
 
-这个差异是刻意的，理由有两条：
+理由有两条：
 
 1. peek 不消费，"余量"这个概念对它不成立——一个已关闭的状态不再是活状态。
-2. 更重要的是，**这是状态模式下唯一可能的终止信号**。若关闭后仍返回值，`await()` 将永远返回成功、永不报错，消费者根本无从得知流已终止；生产者一旦消亡，所有消费者会对着一个陈旧的值空转下去。
+2. 更重要的是，**这是状态模式下唯一可能的终止信号**。若关闭后仍返回值，`await()` 将永远返回成功、永不报错，消费者根本无从得知流已终止。
 
-代价是最后一个值在关闭后不可再读。这是拿"最后的值"换"可检测的终止"，且它把 §8 的死循环限制从"永不终止"降级为"以流的寿命为界"。
+代价是最后一个值在关闭后不可再读。这是拿"最后的值"换"可检测的终止"。
 
 两个 `wait_peek` 重载的 Doxygen 必须写明这一差异，否则读代码的人会以为是抄漏了 `pop` 的逻辑。
 
-### 3.5 `push` 的唤醒方式必须改为 `notify_all`
+### 3.5 状态读取命中值时必须让出协程
 
-`FiberChannel::push()` 现在结尾是 `cv_consumer_.notify_one()`。队列模式下这是对的——一个值只应被一个消费者取走。
+状态模式命中值时，`wait_peek` 的 `cv.wait(lck, pred)` 谓词立即为真、无竞争的 `boost::fibers::mutex` 也不挂起——整个 `await()` **一次协程让出都不发生**。于是 `while(auto v = await(a))` 这类循环会**饿死同线程的一切**，包括关闭者、生产者与 Qt 泵协程；`makeTask` 默认粘连到创建线程、Qt 回调又由该线程的泵协程分发，因此"关闭者与消费者同线程"是默认情形而非特例。
 
-但状态模式下 N 个消费者都挂在同一个状态格上 peek，`notify_one` **只会唤醒其中一个**，其余继续睡到下一次赋值。这是会静默漏唤醒的缺陷，且"清空 → 全体重新阻塞 → 赋值唤醒"这条路径必然踩到。
+实测（单线程调度器，一个满速读取的协程 + 一个 50ms 后关流的协程）：
 
-因此 `push` 结尾改为 `notify_all()`。安全性无虞：`pop` / `pop_wait_for` / `value_pop` / `wait_peek` 全部使用带谓词的 `wait`，多余唤醒会自行重新等待。代价是队列模式下若某条队列确有多个竞争消费者（`test_case_broadcast_coexists_with_competing_consumers` 即是），一次 `push` 会唤醒全部而只有一个抢到值。以一次惊群换掉一个漏唤醒缺陷。
+| | 循环次数 | 关闭者被调度时的次数 | 结果 |
+|---|---|---|---|
+| 无 `yield` | 5,000,001（撞上兜底） | 5,000,001 | 关闭者全程未被调度 |
+| 有 `yield` | 628,716 | 628,716 | 正常被 `close` 收敛 |
+
+因此**状态分支在成功返回值之前必须 `boost::this_fiber::yield()` 一次**。代价是每次状态读取多一次协程切换（相对一次加锁加一次 `T` 拷贝并不夸张），且只影响状态模式。
+
+有了它，"忙循环以流的寿命为界"这一说法才真正成立。
+
+`yield()` 之所以能让同线程的其它协程（含低优先级者）获得调度，依赖 boost.fiber 在 `pick_next()` 之前才把让出者重新入队这一实现细节——本框架的就绪集是**严格优先级、无老化**的，若该顺序改变（例如让出者在入队前先被 `pick_next()` 考察，或让出者插队到高优先级者之前），高优先级的状态自旋协程将饿死低优先级协程。已实测当前行为成立（High/Normal、Normal/High、High/Low 各配置下循环均在两万次上下被关闭收敛，无一撞上兜底）。
+
+### 3.6 `Awaitable::close()` 终止整条流
+
+`Awaitable::close(ec)` 关闭 hub 表里**所有**消费者队列，并触发一次清理（断开上游）。实现上是 `hub_->close(ec)` 后接 `hub_->notifyClosed(ec)`——关闭之后表中已无未关闭的队列，归零判定自然成立，清理照跑。
+
+这**推翻**了 `2026-08-20-channel-hub-flat-consumers-design.md` §3.2 的"`Awaitable::close()` 只关自己这一路"。推翻的理由：业务代码持有源句柄调 `close()` 时，期望的是整条流终止；而订阅者对此毫不知情会导致它们继续等待一条已经没有生产者的流。
+
+**析构不受影响**：`~Awaitable` 仍只摘自己那条队列，只有当表中再无"存活且未关闭"的队列时才收尾。**想只退订自己，析构句柄即可，不要调 `close()`。**
+
+该语义对两种模式一视同仁——同一个方法在不同模式下作用域不同太容易记错。
+
+`ChannelHub::close(ec)` 的既有行为（关闭所有消费者队列、不清空消费者表、不直接跑清理钩子）不变；工厂层的全部关闭路径本就走它，因此上游关闭一直是传播到所有订阅者的。
+
+### 3.7 `push` 的唤醒方式为 `notify_all`
+
+`FiberChannel::push()` 结尾使用 `notify_all()` 而非 `notify_one()`。`wait_peek` 的等待者不消费元素，同一条队列上若有多个等待者（`shared_ptr<Awaitable>` 被多个协程同时 `await` 即是），`notify_one` 只会唤醒其中一个，其余继续睡到下一次赋值。
+
+安全性无虞：`pop` / `pop_wait_for` / `value_pop` / `wait_peek` 全部使用带谓词的 `wait`，多余唤醒会自行重新等待。代价仅是多消费者抢同一条队列时的一次惊群。
 
 ## 4. 接口
 
 ### 4.1 `Coro::FiberChannel<T>`（`coro/detail/fiberchannel.hpp`）
-
-新增两个非破坏性读取方法：
 
 ```cpp
 /// 阻塞至有值或已关闭；有值时把队首**拷贝**到 out 但不弹出。
@@ -119,9 +158,9 @@ template<typename Rep, typename Period>
 channel_status wait_peek_for(T& out, std::chrono::duration<Rep, Period> const& timeout_duration);
 ```
 
-`push()` 结尾由 `cv_consumer_.notify_one()` 改为 `cv_consumer_.notify_all()`。
+`push()` 结尾为 `cv_consumer_.notify_all()`（见 §3.7）。无新增数据成员，`sizeof(FiberChannel<T>)` 保持 160。
 
-其余成员与签名不变。无新增数据成员，`sizeof(FiberChannel<T>)` 保持 160。
+**本节内容已由前序任务实现完毕，本次修订不改动 `fiberchannel.hpp`。**
 
 ### 4.2 `Coro::ChannelHub<T>`（`coro/detail/channelhub.hpp`）
 
@@ -129,36 +168,35 @@ channel_status wait_peek_for(T& out, std::chrono::duration<Rep, Period> const& t
 enum class AwaitMode { Queue, State };   // 置于 namespace Coro
 
 explicit ChannelHub(AwaitMode mode = AwaitMode::Queue);
-bool isState() const noexcept;                                  // state_ != nullptr
-const std::shared_ptr<FiberChannel<T>>& stateCell() const;      // 状态格；队列模式下为空
+bool isState() const noexcept;
 ```
 
-新增数据成员 `std::shared_ptr<FiberChannel<T>> state_`（队列模式下为空指针）。
+新增数据成员：`std::unique_ptr<T> latest_`（队列模式下恒为空指针）与一个标记模式的 `bool`（或以"模式已启用"的等价表示；不得放在 `guard_` 之后）。
 
-各方法在状态模式下的行为差异：
+**注意**：`latest_` 是"最新值的一份副本"，**没有任何消费者等待在它上面**，它只在 `attach()` 时用于给新队列播种。
 
-- 构造：`AwaitMode::State` 时创建状态格并 `setCapacity(1)`。
-- `push(v)`：写状态格（容量 1 自动丢旧留新），**不向消费者队列扇出**。hub 已关闭时仍返回 `closed`。
-- `close(ec)`：同时关闭状态格与所有消费者队列，与队列模式一致。
-- `discard_pending()`：同时清空状态格与所有消费者队列。
-- `setCapacity(c)`：状态模式下为空操作；`capacity()` 返回 1。
-- `attach(q)` / `detach(q)` / `notifyClosed(ec)`：**一行不改**。状态模式下消费者队列虽不投递，仍照常入表，生命周期记账（消费者归零即执行一次清理）完全复用。
+各方法在状态模式下的行为：
+
+- 构造：`AwaitMode::State` 时记录模式。
+- `push(v)`：先更新 `latest_`，再**照常扇出到所有消费者队列**（与队列模式同一段代码，无特例）。hub 已关闭时返回 `closed`。
+- `attach(q)`：状态模式下先 `q->setCapacity(1)`；若 `latest_` 有值则 `q->push(*latest_)` 播种；随后照常入表。hub 已关闭时的既有处理不变。
+- `close(ec)`：不变（关闭所有消费者队列，不清空表，不跑清理钩子）。
+- `discard_pending()`：清空 `latest_`，并照常清空所有消费者队列。
+- `setCapacity(c)`：状态模式下为空操作；`capacity()` 状态模式下返回 1。
+- `detach(q)` / `notifyClosed(ec)` / `markExhausted`：**一行不改**。
 
 ### 4.3 `Coro::Awaitable<T>` / `Awaitable<void>`（`coro/await/awaitable.hpp`）
 
 ```cpp
-/// 以指定模式构造。默认构造仍为队列模式，行为不变。
+/// 以指定语义模式构造。默认构造仍为队列模式，行为不变。
 explicit Awaitable(AwaitMode mode);
 
-/// 丢弃待消费的值。
-/// 队列模式：只清空本句柄自己的队列，其他消费者不受影响。
-/// 状态模式：清空**共享的**状态格，此后所有消费者的 await 都重新阻塞——
-///   状态模式下不存在"自己那一路"，这是结构决定的，无法只清自己。
-/// 无论哪种模式，要显式影响整条流请用 channel()->discard_pending()。
+/// 丢弃待消费的值：状态模式下使其回到"无值"，此后 await 重新阻塞。
+/// 只作用于本句柄自己那条队列；要清空整条流请用 channel()->discard_pending()。
 void discardPending();
 ```
 
-`await()` / `await_for()` 按模式分派。**"本句柄已收尾"的早退检查只能放在状态模式分支内**——队列模式必须保持既有的"已关闭但仍有余量时先取完余量"语义（`test_case_broadcast_terminal_error` 正断言关闭后仍能取到排队值），若把该检查提到分派之前，余量将再也取不到，现有用例会成片失败：
+`await()` 按模式选择读取方式，**两种模式都等在自己队列的条件变量上**：
 
 ```cpp
 Result<T, std::error_code> await(){
@@ -166,38 +204,32 @@ Result<T, std::error_code> await(){
         return std::make_error_code(std::errc::no_message);   // 移动后的空壳
     }
     T value{};
-    if(hub_ && hub_->isState()){
-        // ---- 状态模式 ----
-        if(queue_->is_closed()){
-            // 本句柄已 close()，或整流关闭时连带关掉了它。状态格不消费，
-            // 因此没有"余量"概念，直接以本句柄的终止原因收尾。
-            return queue_->close_error();
-        }
-        const auto& cell = hub_->stateCell();
-        // channel_status 到 Result 的映射必须显式写出；closed 时取的是
-        // **状态格自己**的终止原因，而非本句柄队列的。
-        auto status = cell->wait_peek(value);
-        if(status == boost::fibers::channel_op_status::success){
-            return value;
-        }
-        return cell->close_error();
-    }
-    // ---- 队列模式：以下与今天逐字相同，不得插入任何提前返回 ----
-    auto status = queue_->pop(value);
+    const bool state = (hub_ && hub_->isState());
+    auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
     if(status == boost::fibers::channel_op_status::success){
+        if(state){
+            boost::this_fiber::yield();   // §3.5：否则饿死同线程的一切
+        }
         return value;
     }
     return queue_->close_error();
 }
 ```
 
-`await_for(timeout)` 同构，只是分别改用 `wait_peek_for` / `pop_wait_for`，并把 `timeout` 状态映射为 `std::errc::timed_out`。
+`await_for(timeout)` 同构，改用 `wait_peek_for` / `pop_wait_for`，`timeout` 映射为 `std::errc::timed_out`。
 
-**终止原因的来源**：整流关闭（`channel()->close(ec)`）会以同一个规范化后的 `ec` 同时关闭状态格与所有消费者队列，因此两条分支给出的错误码一致；句柄自己 `close(ec2)` 只关本句柄的队列，于是**只有该句柄**得到 `ec2`，其他消费者仍照常读到状态。
+`close(ec)` 改为终止整条流（§3.6）：
 
-`resolve(v)` 不变（仍是 `hub_->push(v)`，由 hub 按模式分派）。`shared()` 不变（复用 hub，自动继承模式）。`isClosed()` 不变（查自身队列）。
+```cpp
+void close(std::error_code error){
+    if(hub_){
+        hub_->close(error);          // 传播：关闭所有消费者队列
+        hub_->notifyClosed(error);   // 归零判定 -> 跑一次清理
+    }
+}
+```
 
-`Awaitable<void>` 同构：内部类型为 `ChannelHub<int>` / `FiberChannel<int>`，状态语义退化为"事件是否已发生"，同样支持清空使其回到未发生。
+`resolve(v)` / `shared()` / `isClosed()` / 析构不变。`Awaitable<void>` 同构（内部类型为 `ChannelHub<int>` / `FiberChannel<int>`）。
 
 ## 5. 实现要点
 
@@ -205,60 +237,72 @@ Result<T, std::error_code> await(){
 
 | 文件 | 改动 |
 |---|---|
-| `coro/detail/fiberchannel.hpp` | 新增 `wait_peek` / `wait_peek_for`；`push` 的 `notify_one` 改 `notify_all` |
-| `coro/detail/channelhub.hpp` | 新增 `AwaitMode` 枚举、`state_` 成员、模式构造函数、`isState()` / `stateCell()`；`push` / `close` / `discard_pending` / `setCapacity` 分派状态模式 |
-| `coro/await/awaitable.hpp` | 两个特化各新增模式构造函数与 `discardPending()`；`await` / `await_for` 分派状态模式 |
-| `test/testfiberawait/tst_testfiberawait.cpp` | 新增状态模式用例；更新 `sizeof` 钉死值 |
+| `coro/detail/fiberchannel.hpp` | **不改**（`wait_peek` 系列与 `notify_all` 已就位） |
+| `coro/detail/channelhub.hpp` | 状态存储由"共享状态格"改为"`latest_` 播种副本"；`push` 取消状态特例、照常扇出；`attach` 增加设容量与播种 |
+| `coro/await/awaitable.hpp` | `await` / `await_for` 改为读自己的队列并在状态成功路径 `yield`；`close` 改为终止整条流 |
+| `test/testfiberawait/tst_testfiberawait.cpp` | 见 §7 |
 
-各 `coro*` 工厂**不改动**：它们默认构造 `Awaitable`，即队列模式，行为逐条不变。
+各 `coro*` 工厂**不改动**。
 
 ### 5.2 锁顺序
 
-不变，仍恒为 hub → queue：状态模式下 `push` 在持 hub 锁时取状态格的锁，与既有扇出同向。`await()` 读状态格时**不持 hub 锁**——它经 `stateCell()` 取到 `shared_ptr` 后即在格自己的锁上等待，因此长时间阻塞不会占住 hub。状态格的存活由 hub 保证（`Awaitable` 持 `hub_`，hub 持状态格）。
+不变，恒为 hub → queue。状态模式下 `push` 与 `attach` 在持 hub 锁时取消费者队列的锁，与既有扇出同向。`await()` 等待发生在**自己队列**的锁上，不持有 hub 锁。共享状态格取消后，不再存在"多个消费者阻塞于同一对象"的情形。
 
 ## 6. 存储与性能
 
-**存储**：`FiberChannel` 只加方法，`sizeof` 保持 160。`ChannelHub` 多一个 `shared_ptr`，`sizeof` 由 160 预计增至 176——实测确定并重新钉死（沿用 `test_case_channel_layout_size` 的做法，测试环境 x86-64 / libstdc++ / glibc，换平台需重测）。每个 `Awaitable` 的开销不变。
+`sizeof(FiberChannel<T>)` 保持 160。`sizeof(ChannelHub<T>)` 因 `latest_` 与模式标记而变化，**实测确定并重新钉死**（沿用 `test_case_channel_layout_size` 的做法；x86-64 / libstdc++ / glibc，换平台需重测）。
 
-**状态模式内存为 O(1)**：状态格最多持有一个值，与消费者数量、赋值次数均无关。代价是每个句柄仍分配一条闲置队列（160 字节），换取生命周期机制零改动。
+**状态模式内存为 O(N)**：N 个消费者各持有一份当前值的拷贝，加 hub 的一份播种副本，共 N+1 份。这与容量 1 的队列模式一致。初版设计曾宣称 O(1)，那是共享状态格的产物，随该结构一并作废。
 
-**性能**：状态模式的赋值是一次容量 1 的入队加一次 `notify_all`，读取是一次加锁加一次 `T` 拷贝，**完全没有扇出**——消费者越多越比队列模式便宜。队列模式唯一的变化是 `notify_one` → `notify_all`（见 §3.5）。
+性能：状态模式的赋值与队列模式同为一次扇出；读取是一次加锁、一次 `T` 拷贝、一次协程让出（§3.5）。
 
 ## 7. 已知限制
 
-1. **状态模式下 `while(auto v = await(a))` 是满速空转循环**，`generate(a)` 同理会不断产出同一个值，直到流关闭才终止。这是"重复 `await` 立即返回同一个值"这一决策的直接后果，项目负责人已知悉并明确接受。`await()` 与 `AwaitMode` 的 Doxygen 必须显著标注，使人在写下这种循环之前就看见。
-2. **无变化通知。** 想知道状态何时改变只能轮询。属既定非目标。
-3. **关闭后最后一个值不可再读**（§3.4）。这是换取可检测终止的代价。
-4. **状态模式下每个句柄仍分配一条闲置队列。** 属既定取舍。
+1. **状态模式下 `while(auto v = await(a))` 是忙循环**，`generate(a)` 同理会不断产出同一个值，直到流关闭才终止。有了 §3.5 的 `yield()`，它不再饿死同线程的其它协程，但仍会持续占用 CPU。`await()` 与 `AwaitMode` 的 Doxygen 必须显著标注。项目负责人已知悉并接受，且明确选择不让 `generate()` 对状态模式硬拒绝，仅以文档劝阻。
+2. **无变化通知。** 想知道状态何时改变只能轮询。
+3. **关闭后最后一个值不可再读**（§3.4）。
+4. **任何句柄调 `close()` 都会终止整条流**（§3.6）。想只退订自己请析构句柄。
+5. 状态模式内存为 O(N)，非 O(1)。
 
 ## 8. 测试计划
 
-位置：`test/testfiberawait`。现有 101 条用例即为队列模式的回归基线，必须逐条通过。
+位置：`test/testfiberawait`。
+
+### 需要改写的既有用例（因 §3.6 的 `close` 语义反转）
+
+| 用例 | 改写方向 |
+|---|---|
+| `test_case_flat_close_scope_is_self_only` | 断言的正是被推翻的语义，改写为"任一句柄 `close()` 即全体收敛"，并相应改名 |
+| `test_case_broadcast_mirror_close_isolated` | 其中的 `first->close()` 现在会终止整条流，重新设计断言或改用析构来表达"退订自己" |
+| `test_case_broadcast_prune_preserves_later_mirror` | 同上 |
+| `test_case_broadcast_closed_mirror_pruned` | 同上 |
+
+上次改写中把 `source.close()` 换成 `source.channel()->close()` 的那几条**保持不动**——生产者侧关闭本就传播，语义未变。
+
+### 需要改写的状态模式用例（因 §0 的结构修订）
+
+| 用例 | 改写方向 |
+|---|---|
+| `test_case_hub_state_no_fanout_to_queues` | **作废**：状态模式现在就是要扇出的 |
+| `test_case_hub_state_keeps_latest` | 改为经消费者队列观测最新值 |
+| `test_case_state_memory_is_constant` | 改为验证"每个消费者各一份、且各自只保留一份"（O(N) 而非 O(1)） |
+| `test_case_state_handle_close_isolated` | 反转为"句柄 `close()` 终止整条流" |
+| `test_case_channel_layout_size` | 按实测更新 `ChannelHub` 的值 |
+
+### 新增用例
 
 | 用例 | 验证内容 |
 |---|---|
-| `wait_peek` 单测 | 空→阻塞；有值→返回且**不弹出**（连读两次仍得同值）；关闭且空→`closed`；**关闭且有值→`closed`**（§3.4 的刻意差异） |
-| `wait_peek_for` 超时 | 空且未关闭时到期返回 `timeout`，channel 仍开放 |
-| 状态基本读取 | 赋值后多次 `await` 返回同一值且不阻塞 |
-| 首值等待 | 无值时 `await_for` 超时；赋值后再 `await` 立即返回 |
-| 最新值覆盖 | 连续赋值三次，读到最后一个；且格中始终只存一个值 |
-| 订阅继承 | `shared()` 得到的句柄是状态模式，且立刻读到当前值 |
-| **清空后全员唤醒** | 清空后多个消费者重新阻塞，一次赋值必须唤醒**全部**——专钉 §3.5 的 `notify_all`，是本设计最关键的防线 |
-| 关闭即终止 | 有值时关闭 → `await` 返回终止错误而非值；`while(await(a))` 因此能退出 |
-| 句柄自关 | 本句柄得到终止错误，其他消费者照常读到状态 |
-| 内存 O(1) | N 个消费者、M 次赋值后，只有一个值被持有（`weak_ptr` 观测） |
-| 容量无效 | 状态模式下 `setCapacity` 无效、`capacity()` 返回 1 |
-| `void` 特化 | 上述关键路径在 `Awaitable<void>` 上重跑 |
-| 竞争消费者回归 | `notify_all` 改动后，同一队列上多个竞争消费者仍不重不漏（现有 `test_case_broadcast_coexists_with_competing_consumers`） |
-| `sizeof` 钉死 | 更新 `ChannelHub` 实测值；确认 `FiberChannel` 仍为 160 |
+| 阻塞中被 close 唤醒 | 一个协程阻塞在状态模式的 `await()` 上，另一协程对同一句柄 `close(ec)`，前者必须**当场返回** `ec` 而非继续阻塞（这是共享状态格时代无法做到、也是本次结构修订的直接收益） |
+| 让出协程 | 同线程上一个满速 `while(await(a))` 与一个延时关流的协程，循环必须能被关闭收敛而不是饿死对方（钉死 §3.5 的 `yield`） |
+| 订阅播种 | 赋值之后再 `shared()`，新订阅者立刻读到当前值 |
+| 清空后重新挂起 | 清空后各消费者重新阻塞，下一次赋值各自被唤醒 |
+| `void` 特化 | 上述关键路径在 `Awaitable<void>` 上重跑，含 `shared()` 继承与关闭终止 |
+
+其余既有状态模式用例（重复读取、首值等待、最新值覆盖、容量固定、空壳句柄）语义不变，保留。
 
 回归范围：`test/testfiberawait`、`test/testfibertask`、`test/testexecutor`、`test/test_scheduler` 全部通过。
 
-**运行时须清除代理环境变量**，否则 UDP 用例会因 Qt 把 `bind()` 路由进 SOCKS5 代理引擎而误报失败（见 `.superpowers/sdd/progress.md` 的调查记录）；相关用例已加 `setProxy(NoProxy)`，但新增用例若涉及 socket 需比照处理。
-
 ## 9. 文档更新
 
-- `doc/使用说明.md`：新增"状态模式"小节，说明用法、与队列模式的差异、以及 §7.1 的死循环警告。
-- `doc/软件设计说明.md`：在 `Awaitable` / `ChannelHub` 的单元设计中补充状态格与模式分派。
-- `doc/架构设计.md`、`doc/类图与时序图.md`：类图补充状态格。
-- `doc/需求规格说明.md`：新增状态语义的需求项。
+`doc/使用说明.md`、`doc/软件设计说明.md`、`doc/架构设计.md`、`doc/类图与时序图.md`、`doc/img/sdd-05-csc_await.mmd` 中关于状态模式的描述需按本次修订同步；特别是"共享状态格"与"内存 O(1)"两处失效表述必须改写，以及 `close()` 作用域反转须在两份 spec 与使用说明中一致。

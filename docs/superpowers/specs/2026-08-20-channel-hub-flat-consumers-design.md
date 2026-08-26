@@ -2,6 +2,16 @@
 
 日期：2026-08-20
 
+## 0-2026-08-25. 订正：`Awaitable::close()` 改为终止整条流
+
+本文档 §3.2 决策表与 §7 行为变化第 1 条原定"`Awaitable::close()` 只关自己这一路，整流终止归生产者侧"。该决策于 2026-08-25 被推翻。
+
+**推翻理由**：业务代码持有源句柄调 `close()` 时，期望的是整条流终止；而 `shared()` 得到的订阅者对此毫不知情，会继续等待一条已经没有生产者的流。工厂层的全部关闭路径本就走生产者侧的 `channel()->close()`（已核实：`lifecycle.hpp` 的 `bind_close`、socket 族的断连/出错/析构处理，无一处调用 `Awaitable::close()`），因此上游关闭一直是传播到所有订阅者的；缺口只在业务代码主动关闭句柄这一条路径上。
+
+**订正后**：`Awaitable::close(ec)` 关闭 hub 表里所有消费者队列并跑一次清理（`hub_->close(ec)` 后接 `hub_->notifyClosed(ec)`）。**析构不受影响**，仍只摘自己那条队列——想只退订自己，析构句柄即可。
+
+受影响的用例改写见 `2026-08-25-awaitable-state-mode-design.md` §8。下面两处保留原文（加删除线）并给出订正，而不是静默改写。
+
 ## 1. 背景与问题
 
 `Awaitable<T>` 内部持有一个 `FiberChannel<T>`，`shared()` 通过 `FiberChannel::addMirror()` 把订阅者的 channel 注册为源 channel 的镜像。扇出发生在 `FiberChannel` 的 `push` / `close(error)` / `discard_pending` / `setCapacity` 四处，外加析构时的镜像收敛。设计依据见 `docs/superpowers/specs/2026-08-11-shared-awaitable-design.md` §3.2：生产者按约定只捕获 `channel()`、绝不持有 `Awaitable`，因此生产者能触达的只有 channel，广播只能由 channel 自己实现。
@@ -67,7 +77,7 @@
 | 生产者捕获的对象 | `ChannelHub<T>`，方法名与签名同今天 `FiberChannel` 的生产者侧 | 工厂里全是 `auto ch = a.channel()`，一个字不用改 |
 | 源队列归属 | 归源 `Awaitable` 独占，与订阅者队列完全对称 | 句柄析构即释放队列与其中的值，正面解决囤积 |
 | 上游存活 | 由全部句柄共同决定，最后一条未关闭的消费者队列消失时终止 | 使"丢掉 `src`、只留订阅者"成为合法用法；推翻 2026-08-11 §3.2 的"由源句柄持有" |
-| `Awaitable::close()` 作用域 | 只关自己这一路 | 平表下无"源"身份可依；整流终止归生产者侧 `ch->close(ec)` |
+| `Awaitable::close()` 作用域 | ~~只关自己这一路~~ **已被推翻（见 §0-2026-08-25）：终止整条流** | ~~平表下无"源"身份可依；整流终止归生产者侧~~ 业务代码持源句柄 `close()` 时期望整条流终止，订阅者不知情会继续等一条已无生产者的流 |
 | 清理钩子位置 | 内联进 `ChannelHub` | "消费者归零即终止上游"收敛为单一实现点 |
 | 退订方式 | 纯 RAII（`Awaitable` 析构时 detach，`weak_ptr` 兜底） | 无需 `unsubscribe()` |
 | 扇出时机 | 生产者线程同步完成 | 与今天一致，避免常驻泵 fiber |
@@ -201,7 +211,7 @@ x86-64 / libstdc++ / glibc 实测数字：`sizeof(Coro::FiberChannel<int>)` = **
 
 ## 7. 行为变化
 
-1. **源句柄 `close()` 不再终止订阅者。** 只关自己这一路。整条流的终止归生产者侧 `ch->close(ec)`（socket 出错、来源析构），该路径仍扇出到所有消费者。
+1. ~~**源句柄 `close()` 不再终止订阅者。** 只关自己这一路。~~ **本条已于 2026-08-25 被推翻（见 §0-2026-08-25）：任何句柄 `close()` 均终止整条流。** 生产者侧 `ch->close(ec)`（socket 出错、来源析构）一直是扇出到所有消费者的，未变。
 2. **丢掉源句柄不再终止上游。** 广播场景下这正是目的。代价是订阅者全部消失时上游会断开且不可恢复——2026-08-11 §3.2 当初回避的正是这个风险，本次明确接受。
 3. **消费者归零后 `push` 返回 `closed`。** 今天最后一个 `Awaitable` 析构后，channel 仍被 lambda 持有且未关闭，`push` 返回 `success` 并把值存进无人取的队列；改后 hub 置为关闭，明确告知生产者已无接收方。
 4. **`channel()` 返回类型变更**为 `shared_ptr<ChannelHub<T>>`。调用点均用 `auto`，不需改动；显式写出该类型的代码需要跟进。

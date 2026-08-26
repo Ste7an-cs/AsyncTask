@@ -1,5 +1,9 @@
 flowchart LR
-    Sig["obj 发射信号"] -->|"参数"| Slot["工厂注入的槽<br/>[ch]{ ch->push(打包参数) }"]
-    Slot -->|"打包为 T"| CH[("FiberChannel(Awaitable)")]
-    CH -->|"pop 唤醒协程"| Await["await(a)"]
-    Await -->|"Result<T>"| U["用户协程"]
+    Sig["obj 发射信号"] -->|"参数"| Slot["工厂注入的槽<br/>[hub]{ hub->push(打包参数) }"]
+    Slot -->|"打包为 T"| HUB[("ChannelHub&lt;T&gt;<br/>分发端")]
+    HUB -->|"扇出：每个消费者各一份"| Q1[("消费者队列 A<br/>FiberChannel&lt;T&gt;")]
+    HUB -->|"扇出"| Q2[("消费者队列 B<br/>（shared() 订阅者）")]
+    Q1 -->|"pop 唤醒协程<br/>(状态模式为 wait_peek，不消费)"| Await["await(a)"]
+    Q2 -.->|"各读各的，互不抢占"| Await2["await(sub)"]
+    Await -->|"Result&lt;T&gt;"| U["用户协程"]
+    Await2 -->|"Result&lt;T&gt;"| U2["另一个用户协程"]

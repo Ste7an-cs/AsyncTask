@@ -51,6 +51,8 @@ public:
      * @details 队列有容量上限（默认 kDefaultCapacity，见 setCapacity()）；push 使队列
      *          超出上限时，先丢弃队首最旧的值再追加新值，净大小停留在上限，不会阻塞
      *          生产者也不会返回失败。
+     *          唤醒采用 notify_all：非破坏性的 wait_peek() 等待者不消费元素，
+     *          必须全部唤醒。
      * @param value 待入队的元素
      * @return 成功返回 success；如果 channel 已关闭返回 closed
      * @code
@@ -70,7 +72,11 @@ public:
         while(capacity_ != 0 && queue_.size() > capacity_){
             queue_.pop_front();
         }
-        cv_consumer_.notify_one();
+        // notify_all 而非 notify_one：wait_peek 的等待者不消费元素，一次 push 必须
+        // 唤醒全部，否则挂在同一条 channel 上的多个 peek 只会醒来一个（静默漏唤醒）。
+        // 对 pop 一侧是安全的——pop/pop_wait_for/value_pop 均使用带谓词的 wait，
+        // 多余唤醒会自行重新等待；代价仅是多消费者抢同一条队列时的一次惊群。
+        cv_consumer_.notify_all();
         return channel_status::success;
     }
     /**
@@ -125,6 +131,63 @@ public:
         }
         out = std::move(queue_.front());
         queue_.pop_front();
+        return channel_status::success;
+    }
+    /**
+     * @brief 读取队首元素但**不弹出**，无可用值时阻塞/协程等待。
+     * @details 与 pop() 有一处**刻意的差异**：只要 channel 已关闭就返回 closed，
+     *          无论队列中是否仍有值，`out` 也不被写入。pop() 的"已关闭但仍有余量时
+     *          先取完余量"对 peek 不成立——peek 不消费，"余量"概念无从谈起；而且
+     *          这正是"状态"类用法唯一可能的终止信号：若关闭后仍返回值，读取方将
+     *          永远成功、永不报错，无从得知来源已经终止。
+     *          取到的是队首的**拷贝**，元素仍留在队列中，可被反复读取。
+     * @param out 输出参数，队首元素的拷贝
+     * @return 成功返回 success；channel 已关闭返回 closed
+     * @code
+     * int v{};
+     * // 反复读同一个值：适合把 channel 当"状态格"用（配合 setCapacity(1)）
+     * if(cell->wait_peek(v) == boost::fibers::channel_op_status::success) use(v);
+     * @endcode
+     */
+    channel_status wait_peek(T& out){
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        cv_consumer_.wait(lck, [this](){return !queue_.empty() || closed_.load();});
+        if(closed_.load()){
+            return channel_status::closed;
+        }
+        out = queue_.front();
+        return channel_status::success;
+    }
+    /**
+     * @brief 读取队首元素但不弹出，无可用值则等待，最长等待 timeout_duration。
+     * @details 终止语义同 wait_peek()：channel 已关闭即返回 closed，不论是否仍有值。
+     *          超时仅表示本次等待到期，channel 仍可保持开放。
+     * @tparam Rep 时长的计数类型
+     * @tparam Period 时长的周期类型
+     * @param out 输出参数，队首元素的拷贝
+     * @param timeout_duration 超时时间
+     * @return 成功返回 success；超时返回 timeout；channel 已关闭返回 closed
+     * @code
+     * int v{};
+     * auto st = cell->wait_peek_for(v, std::chrono::milliseconds(100));
+     * if(st == boost::fibers::channel_op_status::timeout){
+     *     // 仅本次等待到期，channel 仍开放
+     * }
+     * @endcode
+     */
+    template< typename Rep, typename Period >
+    channel_status wait_peek_for( T & out,
+                                  std::chrono::duration< Rep, Period > const& timeout_duration){
+        std::unique_lock<boost::fibers::mutex> lck{mtx_};
+        const bool ready = cv_consumer_.wait_for(
+                    lck, timeout_duration, [this](){return !queue_.empty() || closed_.load();});
+        if(!ready){
+            return channel_status::timeout;
+        }
+        if(closed_.load()){
+            return channel_status::closed;
+        }
+        out = queue_.front();
         return channel_status::success;
     }
     /**

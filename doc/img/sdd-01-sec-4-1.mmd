@@ -21,13 +21,16 @@ flowchart TB
     end
     subgraph DETAIL["CSC_DETAIL detail 层"]
         Result["Result&lt;T,E&gt;"]
-        FiberChannel["FiberChannel&lt;T&gt;"]
+        ChannelHub["ChannelHub&lt;T&gt;<br/>分发端"]
+        FiberChannel["FiberChannel&lt;T&gt;<br/>通用队列"]
         launch["launch_properties()"]
     end
 
     coro --> Awaitable
     Generator --> Awaitable
-    Awaitable --> FiberChannel
+    Awaitable -->|"生产者侧 channel()"| ChannelHub
+    Awaitable -->|"独占自己的消费队列"| FiberChannel
+    ChannelHub -->|"push 扇出到每条队列"| FiberChannel
     coro -.退出广播.-> FiberApplication
     FiberTask --> Result
     FiberTask --> launch
