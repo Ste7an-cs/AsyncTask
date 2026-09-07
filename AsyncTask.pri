@@ -33,6 +33,7 @@ HEADERS += \
     $$PWD/coro/await/coroudpsocket.hpp \
     $$PWD/coro/await/detail/signalpack.hpp \
     $$PWD/coro/await/detail/lifecycle.hpp \
+    $$PWD/coro/await/detail/autodisconnect.hpp \
     $$PWD/coro/await/detail/socketawait.hpp \
     $$PWD/coro/await/detail/socketerror.hpp
 SOURCES += \

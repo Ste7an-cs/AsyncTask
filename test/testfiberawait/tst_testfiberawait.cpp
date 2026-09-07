@@ -264,6 +264,7 @@ private slots:
     void test_case_signal_generate();
     void test_case_iodevice_await();
     void test_case_iodevice_generate();
+    void test_case_iodevice_read_on_device_thread();
     void test_case_tcp_ping_pong();
     void test_case_tcp_connection_refused();
     void test_case_tcp_retry_after_refusal();
@@ -2224,6 +2225,37 @@ void TestFiberAwait::test_case_iodevice_generate()
     task1.get();
     task2.get();
     TQVERIFY(k == 100);
+}
+
+/// @brief 验证设备位于其它线程时，建立读取流不会在调用线程直接触碰设备缓冲。
+/// @details 线程尚未启动，建立等待器时的同步探测只被排队；读位置保持为 0 即证明
+///          没有跨线程读取。线程启动后排队的探测执行，数据才到达消费者。
+void TestFiberAwait::test_case_iodevice_read_on_device_thread()
+{
+    using namespace std::chrono_literals;
+    QThread worker;
+    auto dev = new QBuffer;
+    dev->open(QBuffer::ReadWrite);
+    dev->write("aaaaaaaa");
+    dev->seek(0);
+    dev->moveToThread(&worker);
+
+    auto stream = Coro::coro(dev).readAll();
+    QCOMPARE(dev->pos(), qint64(0));   // 同步探测被投递，未在调用线程消费
+
+    worker.start();
+    auto res = Coro::await_for(stream, 2s);
+    QVERIFY(res.has_value());
+    QCOMPARE(res.value(), QByteArray("aaaaaaaa"));
+
+    const bool closed = QMetaObject::invokeMethod(dev, [dev]{
+        dev->close();
+        delete dev;
+    }, Qt::BlockingQueuedConnection);
+    worker.quit();
+    const bool stopped = worker.wait(2000);
+    QVERIFY(closed);
+    QVERIFY(stopped);
 }
 
 /// @brief 验证 TCP 连接、双向 ping-pong 和共享 awaitable 的类型契约。
