@@ -5,6 +5,7 @@
 #include "executor/scheduler/fibertaskqueue.h"
 #include <QEventLoop>
 #include <QElapsedTimer>
+#include <QThread>
 #include <boost/fiber/operations.hpp>
 
 namespace {
@@ -51,10 +52,23 @@ int Coro::FiberApplication::exec()
 
 /**
  * @brief 安全退出：广播 aboutToQuit → 排空 → 停线程池 → 退出
+ *
+ * 允许在任意线程调用：非主线程调用时先投递回主线程再执行。
+ * 收尾必须在主线程完成——signalExit() 一置位主线程的泵协程就停摆，而
+ * drainUntilIdle() 里的 processEvents/sendPostedEvents 只作用于调用线程的
+ * 事件队列。若就地在工作线程收尾，主线程上 pending 的 deleteLater 无人冲刷、
+ * 投递给主线程对象的 aboutToQuit 槽也永远不会被执行（进程仍以 0 退出，
+ * 问题被静默吞掉）。此处投递时尚未 signalExit()，主线程泵仍在跑，投递必达。
  */
 void Coro::FiberApplication::quit()
 {
-    QMetaObject::invokeMethod(QCoreApplication::instance(), "aboutToQuit", Qt::DirectConnection);
+    QCoreApplication* app = QCoreApplication::instance();
+    if(app != nullptr && QThread::currentThread() != app->thread()){
+        QMetaObject::invokeMethod(app, []{ Coro::quit(); }, Qt::QueuedConnection);
+        return;
+    }
+
+    QMetaObject::invokeMethod(app, "aboutToQuit", Qt::DirectConnection);
     QtFiberScheduler::signalExit();
     drainUntilIdle();
     block.close();
