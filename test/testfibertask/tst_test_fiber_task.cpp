@@ -5,6 +5,10 @@
 #include "detail/asyncdefine.h"
 #include "task/fibertask.h"
 #include "task/fiberapplication.h"
+#include <vector>
+#include <array>
+#include <map>
+#include <future>
 
 #define TQVERIFY(statement) \
 do {\
@@ -39,6 +43,7 @@ private slots:
     void begin();
     void test_case_chain_task();
     void test_case_chain_task_execpt();
+    void test_case_default_construct_task();
     void end();
 
 };
@@ -166,6 +171,58 @@ void test_fiber_task::test_case_chain_task_execpt()
     TQVERIFY(cnt[3] == 5);
     TQVERIFY(cnt[4] == 5);
 
+}
+
+/**
+ * @brief 默认构造的空任务：可放进需要值初始化的容器，且在其上操作不崩
+ *
+ * get() 返回 no_state 失败结果，then() 返回同样失败的后继任务（不启动协程），
+ * cancel() 安全空转；被真实任务赋值后恢复正常语义。
+ */
+void test_fiber_task::test_case_default_construct_task()
+{
+    const std::error_code no_state = std::make_error_code(std::future_errc::no_state);
+
+    // 1) 需要值初始化的容器操作可以编译并运行
+    std::vector<Coro::FiberTask<int>> vec;
+    vec.resize(3);
+    QCOMPARE(int(vec.size()), 3);
+
+    // 2) 空任务 get() 返回失败，错误码为 no_state
+    for(auto& t : vec){
+        auto r = t.get();
+        QVERIFY(!r);
+        QCOMPARE(r.error(), no_state);
+    }
+
+    // 3) void 特化同样成立
+    Coro::FiberTask<void> empty_void;
+    auto rv = empty_void.get();
+    QVERIFY(!rv);
+    QCOMPARE(rv.error(), no_state);
+
+    // 4) 空任务上 then() 不崩，后继同样是失败任务
+    Coro::FiberTask<int> empty_int;
+    auto chained = empty_int.then([](int v){ return v + 1; });
+    auto rc = chained.get();
+    QVERIFY(!rc);
+    QCOMPARE(rc.error(), no_state);
+
+    // 5) 空任务上 cancel() / on_finally() 安全空转
+    empty_int.cancel();
+    empty_int.on_finally([]{});
+
+    // 6) 被真实任务赋值后恢复正常语义
+    vec[0] = Coro::makeTask([]{ return 42; });
+    auto r0 = vec[0].get();
+    QVERIFY(r0);
+    QCOMPARE(r0.value(), 42);
+
+    // 7) std::array / map::operator[] 也依赖默认构造
+    std::array<Coro::FiberTask<int>, 2> arr;
+    QVERIFY(!arr[0].get());
+    std::map<int, Coro::FiberTask<int>> m;
+    QVERIFY(!m[7].get());
 }
 
 void test_fiber_task::end()

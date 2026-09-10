@@ -1,10 +1,27 @@
 #ifndef FIBERTASK_H
 #define FIBERTASK_H
 #include <boost/fiber/all.hpp>
+#include <future>
 #include "detail/asyncdefine.h"
 #include "detail/result.hpp"
 
 namespace Coro {
+
+/**
+ * @brief 空任务句柄的错误码（无关联任务状态）
+ *
+ * 默认构造的 FiberTask 未关联任何任务，其 get() 与 then() 均以此错误码失败，
+ * 与被中断任务的 interrupted 区分开。
+ * @code
+ * Coro::FiberTask<int> empty;                 // 容器值初始化产生的空句柄
+ * auto r = empty.get();
+ * if(!r && r.error() == Coro::no_task_state()) qDebug() << "空任务";
+ * @endcode
+ * @return no_state 错误码
+ */
+inline std::error_code no_task_state(){
+    return std::make_error_code(std::future_errc::no_state);
+}
 
 /**
  * @brief 每个 Task 共享的状态，用于记录在途节点数、取消标志与结束回调。
@@ -129,6 +146,20 @@ public:
         : future_ptr_(f), state_ptr_(s), pri_(pri), affine_(affine){}
 
     /**
+     * @brief 默认构造：不关联任何任务的空句柄
+     *
+     * 供 std::vector::resize、std::array、std::map::operator[] 等需要值初始化的
+     * 容器操作使用。空句柄上 get()/then() 以 no_task_state() 失败，cancel() 与
+     * on_finally() 安全空转；可由真实任务赋值后恢复正常语义。
+     * @code
+     * std::vector<Coro::FiberTask<int>> v;
+     * v.resize(3);                             // 需要默认构造
+     * v[0] = Coro::makeTask([]{ return 42; }); // 赋值后正常使用
+     * @endcode
+     */
+    FiberTask() = default;
+
+    /**
      * @brief 取消任务链（尚未开始的后继在启动前短路）
      * @code
      * auto task = Coro::makeTask(step1).then(step2);
@@ -180,6 +211,11 @@ public:
         auto f_ptr = future_ptr_;
         auto promise_ptr = std::make_shared<promise<Result<ReturnType>>>();
         auto next_future_ptr = std::make_shared<future<Result<ReturnType>>>(promise_ptr->get_future());
+        if(!f_ptr || !state_ptr_){
+            // 空句柄：不启动协程，直接返回一个已失败的后继任务
+            promise_ptr->set_value(Result<ReturnType>(no_task_state()));
+            return FiberTask<ReturnType>(next_future_ptr, state_ptr_, pri, affine);
+        }
         if(state_ptr_){// 调用链计数+1
             state_ptr_->add_nodes();
         }
@@ -241,9 +277,12 @@ public:
      *     return 0;
      * });
      * @endcode
-     * @return 任务结果；异常/取消时返回 interrupted 错误
+     * @return 任务结果；空句柄返回 no_state，异常/取消时返回 interrupted 错误
      */
     Result<T> get() {
+        if(!future_ptr_){
+            return no_task_state();
+        }
         try {
             return future_ptr_->get();
         } catch(...) {
@@ -285,6 +324,18 @@ public:
      */
     explicit FiberTask(std::shared_ptr<boost::fibers::future<Result<void>>> f, std::shared_ptr<SharedState> s, Priority pri=Priority::Normal, Affinity affine=Affinity::shared())
         : future_ptr_(f), state_ptr_(s), pri_(pri), affine_(affine){}
+
+    /**
+     * @brief 默认构造：不关联任何任务的空句柄
+     *
+     * 语义同 FiberTask<T>：供需要值初始化的容器操作使用，空句柄上
+     * get()/then() 以 no_task_state() 失败。
+     * @code
+     * std::vector<Coro::FiberTask<void>> v;
+     * v.resize(3);
+     * @endcode
+     */
+    FiberTask() = default;
     /**
      * @brief 取消任务链（尚未开始的后继在启动前短路）
      * @code
@@ -338,6 +389,11 @@ public:
         auto f_ptr = future_ptr_;
         auto promise_ptr = std::make_shared<promise<Result<ReturnType>>>();
         auto next_future_ptr = std::make_shared<future<Result<ReturnType>>>(promise_ptr->get_future());
+        if(!f_ptr || !state_ptr_){
+            // 空句柄：不启动协程，直接返回一个已失败的后继任务
+            promise_ptr->set_value(Result<ReturnType>(no_task_state()));
+            return FiberTask<ReturnType>(next_future_ptr, state_ptr_, pri, affine);
+        }
         boost::fibers::fiber fiber = launch_properties(
                     [f_ptr, s_ptr = state_ptr_,
                      func = std::forward<Func>(func),
@@ -395,6 +451,9 @@ public:
      * @return 任务结果；异常/取消时返回 interrupted 错误
      */
     Result<void> get() {
+        if(!future_ptr_){
+            return no_task_state();
+        }
         try {
             return future_ptr_->get();
         } catch(...) {
