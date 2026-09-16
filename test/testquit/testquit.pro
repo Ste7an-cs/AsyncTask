@@ -1,5 +1,5 @@
 QT += testlib
-QT -= gui
+QT += gui widgets      # helper 的 window 档要真窗口，验证关窗退出
 
 CONFIG += qt console warn_on depend_includepath testcase
 CONFIG -= app_bundle

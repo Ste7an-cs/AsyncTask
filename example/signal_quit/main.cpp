@@ -13,15 +13,16 @@
 ///      正确做法：handler 里只做 write() 这类 async-signal-safe 的动作，把
 ///      真正的退出动作交回普通上下文执行（self-pipe + QSocketNotifier）。
 ///
-///   2. 触发退出用 Coro::quit()，不要用 qApp->quit()。
-///      本框架用 Coro::exec() 取代 QCoreApplication::exec()，Qt 自己那套
-///      「exec() 返回时 emit aboutToQuit」的收尾路径根本不会执行，
-///      qApp->quit() 只会让程序挂死。
+///   2. 触发退出用 Coro::quit() 或 qApp->quit() 均可，两者等价。
+///      Coro::exec() 内部真正进入了 QCoreApplication::exec()，Qt 原生的
+///      「exec() 返回时 emit aboutToQuit」收尾路径完好，所以 qApp->quit()、
+///      关闭最后一个窗口、平台退出请求与 Coro::quit() 汇合到同一条路径。
+///      差别只在于 Coro::quit() 可在任意线程调用（自动投递回主线程）。
 ///
 ///   3. 不要把 Coro::quit() 挂到 QCoreApplication::aboutToQuit 上。
-///      aboutToQuit 是 quit() 的输出而不是输入 —— Coro::quit() 的第一句就是
-///      广播 aboutToQuit（各 channel 靠它收敛），挂回去就成了无限递归，
-///      协程栈几百层就溢出崩溃。aboutToQuit 槽里只做清理（存配置、关文件）。
+///      aboutToQuit 是退出流程的输出而不是输入 —— 它由 Qt 在主循环返回时发出，
+///      各 channel 靠它收敛；挂回去只是在已经退出的循环上再请求一次退出，
+///      毫无意义。aboutToQuit 槽里只做清理（存配置、关文件）。
 ///
 /// 另外：协程必须响应 channel 关闭（await 返回 false）并返回。aboutToQuit 只
 /// 广播一次，若协程无视它继续 await 一个新 channel，就会永久挂起，导致
@@ -114,5 +115,5 @@ int main(int argc, char* argv[])
         return 0;
     });
 
-    return exec();                            // 用 Coro::exec()，不是 app.exec()
+    return exec();                            // 用 Coro::exec()，它内部会进入 app.exec()
 }
