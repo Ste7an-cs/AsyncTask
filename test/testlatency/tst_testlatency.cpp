@@ -81,13 +81,27 @@ void test_latency::test_case_loopback_rtt()
             timer.start();
             sock.write(payload);
             sock.flush();
-            auto echo = Coro::await_for(stream, 2s);
-            if(!echo){
-                qCritical() << "echo timeout at sample" << i;
+
+            // readAll() 只交付「已到达」的字节；回显若被拆成多个 TCP 分段，
+            // 单次 await 可能只拿到残片。累积到完整 payload 长度再停表，
+            // 否则会记下虚低的往返值，还会把剩余分段留给下一轮误判为新样本。
+            QByteArray received;
+            while(received.size() < payload.size()){
+                auto echo = Coro::await_for(stream, 2s);
+                if(!echo){
+                    qCritical() << "echo timeout at sample" << i;
+                    Coro::quit();
+                    return 1;
+                }
+                received += echo.value();
+            }
+            const long long ns = timer.nsecsElapsed();
+            if(received != payload){
+                qCritical() << "echo mismatch at sample" << i
+                            << "got" << received << "expected" << payload;
                 Coro::quit();
                 return 1;
             }
-            const long long ns = timer.nsecsElapsed();
             long long prev = minNs.load(std::memory_order_relaxed);
             while(ns < prev
                   && !minNs.compare_exchange_weak(prev, ns,
