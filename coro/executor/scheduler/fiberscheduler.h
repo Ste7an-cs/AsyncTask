@@ -132,6 +132,20 @@ public:
      * @endcode
      */
     static void stopCurrentThreadPump(void);
+    /**
+     * @brief 让本线程与它的平台事件分发器彻底解绑（线程收尾的最后一步）
+     * @code
+     * // FiberThreadBlock::wait() 在停泵并让出之后调用；使用方一般无需手动调用
+     * Coro::FiberScheduler::detachCurrentThreadDispatcher();
+     * @endcode
+     * @details Qt 实现注入的钩子会注销本线程的唤醒回调、并丢弃缓存的
+     *          QAbstractEventDispatcher 裸指针。必须排在 stopCurrentThreadPump()
+     *          和随后的让出之后：解绑之后本线程就再也叫不醒了，提前调用会把还有
+     *          活干的协程永远睡死在这条线程上。
+     * @warning 只覆盖走 FiberThreadBlock::wait() 收尾的线程（框架创建的线程都走）。
+     *          用户自建、装了调度器又不经 wait() 就返回的线程仍有残留窗口。
+     */
+    static void detachCurrentThreadDispatcher(void);
 
     // —— 阻塞唤醒登记表 ——
     /// @brief 唤醒回调类型（Qt 实现注入 QAbstractEventDispatcher::wakeUp）
@@ -190,6 +204,13 @@ protected:
      *          stopCurrentThreadPump() 的读构成数据竞争。
      */
     static std::atomic<void(*)(void)> local_unpark_hook_;
+
+    /**
+     * @brief 线程收尾时与本线程事件分发器解绑的钩子（Qt 实现注入）
+     * @details 与 local_unpark_hook_ 同样用原子函数指针存放，基类因此不必认识
+     *          任何 Qt 类型；钩子内部靠 thread_local 自己找到本线程的调度器实例。
+     */
+    static std::atomic<void(*)(void)> local_detach_hook_;
 };
 
 }

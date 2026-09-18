@@ -40,6 +40,8 @@ public:
      * boost::fibers::use_scheduling_algorithm<Coro::QtFiberScheduler>();
      * block.wait();
      * @endcode
+     * @details 返回前会停掉本线程的常驻泵协程、短暂让出、最后与本线程的事件分
+     *          发器解绑，因此线程函数应当在 wait() 返回后立刻收尾。
      */
     void wait();
     /**

@@ -13,6 +13,7 @@ std::mutex FiberScheduler::waker_mtx_{};
 std::unordered_map<void*, FiberScheduler::WakeFn> FiberScheduler::wakers_{};
 std::atomic_int FiberScheduler::s_blocked_count_{ 0 };
 std::atomic<void(*)(void)> FiberScheduler::local_unpark_hook_{ nullptr };
+std::atomic<void(*)(void)> FiberScheduler::local_detach_hook_{ nullptr };
 
 /**
  * @brief 构造
@@ -47,6 +48,15 @@ void FiberScheduler::stopCurrentThreadPump(void)
     void (*unpark)(void) = local_unpark_hook_.load(std::memory_order_acquire);
     if(unpark != nullptr) unpark();                ///< 放出挂在 park 上的泵协程
     wakeAllBlocked();
+}
+
+/**
+ * @brief 让本线程与它的平台事件分发器彻底解绑
+ */
+void FiberScheduler::detachCurrentThreadDispatcher(void)
+{
+    void (*detach)(void) = local_detach_hook_.load(std::memory_order_acquire);
+    if(detach != nullptr) detach();
 }
 
 /**

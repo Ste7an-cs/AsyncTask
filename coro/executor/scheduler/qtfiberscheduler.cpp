@@ -1,5 +1,6 @@
 #include "qtfiberscheduler.h"
 #include <QCoreApplication>
+#include <QDebug>
 #include <QThread>
 #include <thread>
 #include "detail/asyncdefine.h"
@@ -27,8 +28,13 @@ Coro::QtFiberScheduler::QtFiberScheduler(void):FiberScheduler()
         /// @details 再挂一道 qApp：主线程的分发器是 QCoreApplication 的子对象，
         /// 由 ~QObject 的 deleteChildren() 删除，而那时分发器的派生析构已经跑完 ——
         /// destroyed 挂得太晚。qApp 的 destroyed 发在 ~QObject 的开头、deleteChildren
-        /// 之前，此刻分发器还完好，解绑才是真正没有窗口的。只有主线程调度器挂这道，
-        /// 免得工作线程去连一个别的线程的对象。
+        /// 之前，此刻分发器对象还完好，因此主线程这条路**没有 use-after-free 窗口**。
+        /// 但不是「零窗口」：~QCoreApplication 自己的函数体在 emit destroyed 之前就
+        /// 调过 eventDispatcher->closingDown() 并清掉了 threadData->eventDispatcher，
+        /// 落在这段区间里的跨线程 wakeUp() 戳的是一个 Qt 已经关停的分发器。该调用在
+        /// Linux/Qt 5.15 上是 g_main_context_wakeup 或往 eventfd 写一字节，对象内存
+        /// 尚在、不涉及 Qt 状态机，所以只是白戳一下，安全且无副作用。
+        /// 只有主线程调度器挂这道，免得工作线程去连一个别的线程的对象。
         QCoreApplication* app = QCoreApplication::instance();
         if(app != nullptr && app->thread() == QThread::currentThread()){
             app_conn_ = QObject::connect(app, &QObject::destroyed, app,
@@ -37,10 +43,20 @@ Coro::QtFiberScheduler::QtFiberScheduler(void):FiberScheduler()
         }
         // wakeUp() 是 Qt 明确保证线程安全的少数函数之一；指针取用见 wakeDispatcher()。
         FiberScheduler::registerWaker(this, [this]{ wakeDispatcher(); });
+    }else{
+        /// @details 取不到分发器意味着本线程既不登记唤醒回调、notify() 里戳分发器
+        /// 也永远是空操作：远端就绪捅不破本线程的 poll()，事件泵只能靠保险丝
+        /// （maxEventBlockMs）到点自醒，表现为「莫名其妙的固定延迟」。这条路没有
+        /// 自动恢复的机会，必须让人看见。
+        qWarning("QtFiberScheduler: 本线程取不到 QAbstractEventDispatcher，"
+                 "跨线程唤醒将失效，事件分发退化为按 maxEventBlockMs 轮询。");
     }
-    /// @details 钩子是无捕获的静态函数，每个线程装调度器时都会写一次同样的值；
-    /// 用原子函数指针存放，重复写与 stopCurrentThreadPump() 的读都不构成竞争。
+    /// @details 两个钩子都是无捕获的静态函数，每个线程装调度器时都会写一次同样的
+    /// 值；用原子函数指针存放，重复写与 stopCurrentThreadPump() /
+    /// detachCurrentThreadDispatcher() 的读都不构成竞争。
     FiberScheduler::local_unpark_hook_.store(&QtFiberScheduler::unparkLocal,
+                                            std::memory_order_release);
+    FiberScheduler::local_detach_hook_.store(&QtFiberScheduler::detachLocal,
                                             std::memory_order_release);
 }
 
@@ -82,6 +98,18 @@ void Coro::QtFiberScheduler::detachDispatcher(void) noexcept
 }
 
 /**
+ * @brief 与本线程的事件分发器解绑（线程收尾时经基类钩子调用）
+ */
+void Coro::QtFiberScheduler::detachLocal(void)
+{
+    QtFiberScheduler* self = t_self_;
+    if(self == nullptr){
+        return;         ///< 本线程装的是非 Qt 调度器，无事可做
+    }
+    self->detachDispatcher();
+}
+
+/**
  * @brief 挂起调用协程，返回可安全阻塞至的时刻
  */
 std::chrono::steady_clock::time_point Coro::QtFiberScheduler::parkUntilIdle(void)
@@ -91,7 +119,14 @@ std::chrono::steady_clock::time_point Coro::QtFiberScheduler::parkUntilIdle(void
         return std::chrono::steady_clock::now();
     }
     /// @details Qt 持有者只有一席。撞上说明有两个协程都想当持有者，属实现错误。
-    Q_ASSERT(!self->parked_.load(std::memory_order_acquire));
+    /// 这里不能用 Q_ASSERT：release 构建里它整条编译掉，第二个 park 会覆盖
+    /// qt_waker_，而 create_waker() 同时作废了前一个协程的 epoch —— 那个协程
+    /// 从此叫不醒，表现为一次没有任何提示的挂死。宁可拒绝第二个 park。
+    if(self->parked_.load(std::memory_order_acquire)){
+        qWarning("QtFiberScheduler::parkUntilIdle: 本线程已有协程持有 Qt 事件循环，"
+                 "拒绝重复挂起（重复挂起会让先到的协程永远醒不来）。");
+        return std::chrono::steady_clock::now();
+    }
 
     boost::fibers::context* ctx = boost::fibers::context::active();
     self->qt_waker_ = ctx->create_waker();

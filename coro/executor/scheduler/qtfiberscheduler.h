@@ -52,7 +52,13 @@ public:
      * if(ms > 0) eventloop.processEvents(QEventLoop::AllEvents
      *                                  | QEventLoop::WaitForMoreEvents);
      * @endcode
-     * @return 可安全阻塞至的时刻；无任何定时协程时为 time_point::max()
+     * @return 三种出口：<br>
+     *         1. 正常交棒 —— suspend_until 交回来的「最近一个协程截止时刻」；
+     *            本线程无任何定时协程时 boost.fiber 给的就是 time_point::max()；<br>
+     *         2. 本线程没装 QtFiberScheduler（t_self_ 为空）—— 不挂起，直接返回
+     *            now()，调用方据此算出的可阻塞时长为 0，退化为不阻塞的轮询；<br>
+     *         3. 挂起期间被 unparkLocal() 放出（本线程正在交出 Qt 持有权）——
+     *            返回 now()，同样表示「立刻返回，别再阻塞」。
      */
     static std::chrono::steady_clock::time_point parkUntilIdle(void);
 
@@ -60,7 +66,6 @@ public:
      * @brief 唤醒挂起的调度器线程，并戳破本线程可能正在进行的 poll()
      * @details 可能被 boost.fiber 从任意线程回调（远端就绪走 notify），因此戳
      *          分发器这一步必须走 wakeDispatcher() 的加锁路径。
-     * @param 无
      */
     void notify(void) noexcept override;
 
@@ -72,10 +77,26 @@ public:
      */
     static void unparkLocal(void);
 
+    /**
+     * @brief 与本线程的事件分发器解绑（线程收尾时经基类钩子调用）
+     * @details 注入 FiberScheduler::local_detach_hook_，由
+     *          FiberThreadBlock::wait() 在停泵并让出之后调用。靠 thread_local
+     *          t_self_ 找到本线程的调度器实例；本线程没装本调度器时是空操作。
+     * @warning 调用之后本线程不再登记唤醒回调，也不再持有分发器指针 ——
+     *          远端唤醒对它彻底失效，只能用在线程即将返回的最后一步。
+     */
+    static void detachLocal(void);
+
 protected:
     QEventLoop eventloop;                    ///< 本线程 Qt 事件循环
     std::once_flag pump_once_;               ///< 每线程一次
-    void pumpLoop(void);                     ///< 常驻事件泵协程主体
+
+    /**
+     * @brief 常驻事件泵协程主体
+     * @details 绑定创建它的线程（Fixed 亲和），循环分发 Qt 事件直到全局退出标志
+     *          或本线程停止标志置位。
+     */
+    void pumpLoop(void);
 
     /**
      * @brief 戳醒本线程的 Qt 事件分发器（可跨线程调用）
