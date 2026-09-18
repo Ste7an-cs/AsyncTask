@@ -9,6 +9,10 @@ std::mutex FiberScheduler::global_mtx{};
 std::atomic_bool FiberScheduler::s_exit_{ false };
 thread_local std::atomic_bool FiberScheduler::t_stop_{ false };
 
+std::mutex FiberScheduler::waker_mtx_{};
+std::unordered_map<void*, FiberScheduler::WakeFn> FiberScheduler::wakers_{};
+std::atomic_int FiberScheduler::s_blocked_count_{ 0 };
+
 /**
  * @brief 构造
  */
@@ -30,6 +34,7 @@ FiberScheduler::~FiberScheduler()
 void FiberScheduler::signalExit(void)
 {
     s_exit_.store(true, std::memory_order_release);
+    wakeAllBlocked();   ///< 否则各线程会一直睡在 poll() 里，关机挂死
 }
 
 /**
@@ -38,6 +43,63 @@ void FiberScheduler::signalExit(void)
 void FiberScheduler::stopCurrentThreadPump(void)
 {
     t_stop_.store(true, std::memory_order_release);
+    wakeAllBlocked();
+}
+
+/**
+ * @brief 登记本线程的唤醒回调
+ */
+void FiberScheduler::registerWaker(void* key, WakeFn wake)
+{
+    std::lock_guard<std::mutex> guard(waker_mtx_);
+    wakers_[key] = std::move(wake);
+}
+
+/**
+ * @brief 注销唤醒回调
+ */
+void FiberScheduler::unregisterWaker(void* key)
+{
+    std::lock_guard<std::mutex> guard(waker_mtx_);
+    wakers_.erase(key);
+}
+
+/**
+ * @brief 叫醒所有阻塞中的线程（无人阻塞时直接返回，避免惊群）
+ */
+void FiberScheduler::wakeAllBlocked(void)
+{
+    if(s_blocked_count_.load(std::memory_order_acquire) <= 0){
+        return;
+    }
+    std::lock_guard<std::mutex> guard(waker_mtx_);
+    for(auto& entry : wakers_){
+        entry.second();
+    }
+}
+
+/**
+ * @brief 进入阻塞前计数 +1
+ */
+void FiberScheduler::enterBlocked(void)
+{
+    s_blocked_count_.fetch_add(1, std::memory_order_release);
+}
+
+/**
+ * @brief 离开阻塞后计数 -1
+ */
+void FiberScheduler::leaveBlocked(void)
+{
+    s_blocked_count_.fetch_sub(1, std::memory_order_release);
+}
+
+/**
+ * @brief 当前阻塞中的线程数
+ */
+int FiberScheduler::blockedCount(void)
+{
+    return s_blocked_count_.load(std::memory_order_acquire);
 }
 
 /**
@@ -52,12 +114,22 @@ void Coro::FiberScheduler::awakened(boost::fibers::context *ctx, Coro::MetaConte
             queue
         >*/
         main_queue_.push(ctx);
-    } else {
-        // 根据协程的属性分配队列
-        ctx->detach();
-
+        return;
+    }
+    // 根据协程的属性分配队列
+    ctx->detach();
+    bool need_wake{ false };
+    {
         std::lock_guard<std::mutex> guard(global_mtx);
+        // 目标就是本线程时无需叫人；此判断必须在锁内完成——一旦解锁，另一线程可能
+        // 立刻从队列取走并跑完这个协程，props 引用的属性对象随之被释放，
+        // 解锁后再访问 props 就是 use-after-free。
+        need_wake = !(props.affinity() == Affinity::fixed(std::this_thread::get_id()));
         FiberGlobalQueue::instance()->emplace_back(props);
+    }
+    /// @details 广播必须在释放 global_mtx 之后，避免持全局锁回调进 Qt 造成锁序问题。
+    if(need_wake){
+        wakeAllBlocked();
     }
 }
 

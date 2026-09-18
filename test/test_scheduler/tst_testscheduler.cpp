@@ -29,6 +29,7 @@ private slots:
     void test_case_thread_block();
     void test_case_properties_change();
     void test_case_qtfiber_scheduler();
+    void test_case_waker_registry();
 
 };
 
@@ -472,6 +473,38 @@ void TestScheduler::test_case_qtfiber_scheduler()
     /// 若每个定时器的累计误差为50ms，100个定时器的误差上限为5000
     QVERIFY( div_time_tick < 5000);
     QVERIFY(cnt.load() == 100);
+}
+
+///
+/// \brief TestScheduler::test_case_waker_registry 测试跨线程唤醒登记表的限流广播
+///     无线程阻塞时不得广播（避免惊群）；有线程阻塞时才真正广播；注销后不得再被调用。
+///
+void TestScheduler::test_case_waker_registry()
+{
+    int calls = 0;
+    int key = 0;
+    Coro::FiberScheduler::registerWaker(&key, [&calls]{ ++calls; });
+
+    // 没有线程睡在 poll 里时不得广播：避免惊群，这正是本机制的限流闸。
+    QCOMPARE(Coro::FiberScheduler::blockedCount(), 0);
+    Coro::FiberScheduler::wakeAllBlocked();
+    QCOMPARE(calls, 0);
+
+    // 有线程阻塞时才真正广播。
+    Coro::FiberScheduler::enterBlocked();
+    QCOMPARE(Coro::FiberScheduler::blockedCount(), 1);
+    Coro::FiberScheduler::wakeAllBlocked();
+    QCOMPARE(calls, 1);
+
+    Coro::FiberScheduler::leaveBlocked();
+    QCOMPARE(Coro::FiberScheduler::blockedCount(), 0);
+
+    // 注销之后不得再被调用。
+    Coro::FiberScheduler::enterBlocked();
+    Coro::FiberScheduler::unregisterWaker(&key);
+    Coro::FiberScheduler::wakeAllBlocked();
+    QCOMPARE(calls, 1);
+    Coro::FiberScheduler::leaveBlocked();
 }
 
 QTEST_GUILESS_MAIN(TestScheduler)

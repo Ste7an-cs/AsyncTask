@@ -8,7 +8,9 @@
 #include <boost/thread/mutex.hpp>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <queue>
+#include <unordered_map>
 #include "fiberproperty.h"
 #include "fibertaskqueue.h"
 
@@ -131,6 +133,37 @@ public:
      */
     static void stopCurrentThreadPump(void);
 
+    // —— 阻塞唤醒登记表 ——
+    /// @brief 唤醒回调类型（Qt 实现注入 QAbstractEventDispatcher::wakeUp）
+    using WakeFn = std::function<void()>;
+    /**
+     * @brief 登记本线程的唤醒回调
+     * @code
+     * // QtFiberScheduler 构造时注入 Qt 的线程安全唤醒函数
+     * FiberScheduler::registerWaker(this, [disp]{ disp->wakeUp(); });
+     * @endcode
+     * @param key 登记键（用调度器实例地址），注销时用同一个键
+     * @param wake 可跨线程调用的唤醒回调
+     */
+    static void registerWaker(void* key, WakeFn wake);
+    /**
+     * @brief 注销唤醒回调（调度器析构时调用）
+     * @param key 登记时用的键
+     */
+    static void unregisterWaker(void* key);
+    /**
+     * @brief 叫醒所有阻塞中的线程
+     * @details 仅在确有线程阻塞时才遍历登记表。无条件广播会造成惊群 ——
+     *          每次协程就绪都叫醒全部工作线程，正是本次要消除的 CPU 浪费。
+     */
+    static void wakeAllBlocked(void);
+    /** @brief 进入阻塞前调用（阻塞线程计数 +1） */
+    static void enterBlocked(void);
+    /** @brief 离开阻塞后调用（阻塞线程计数 -1） */
+    static void leaveBlocked(void);
+    /** @brief 当前阻塞中的线程数（供测试断言） */
+    static int  blockedCount(void);
+
 protected://全局
     static std::mutex                       global_mtx;///< 全局锁，串行化全局队列的跨线程访问
 protected:
@@ -142,6 +175,10 @@ protected:
     // 退出控制（static，所有调度器实例共享；子类可直接用）
     static std::atomic_bool s_exit_;         ///< 全局退出标志
     static thread_local std::atomic_bool t_stop_;///< 当前线程退出标志
+
+    static std::mutex                        waker_mtx_;   ///< 保护登记表
+    static std::unordered_map<void*, WakeFn> wakers_;      ///< 各线程的唤醒回调
+    static std::atomic_int                   s_blocked_count_;///< 阻塞中的线程数
 };
 
 }
