@@ -38,6 +38,23 @@ void msleep(unsigned long mescs);
 void sleep(unsigned long secs);
 
 /**
+ * @brief 设置事件阻塞的安全上限（毫秒）
+ * @details 这**不是**事件分发间隔 —— 分发已改为按需唤醒，没有间隔了。它是
+ *          跨线程唤醒广播万一失效时的保险丝：让症状退化成「慢」而不是「死锁」。
+ *          默认 10ms。传入非正值会被夹到 1。
+ * @code
+ * Coro::setMaxEventBlockMs(50);   // 更省电，但唤醒漏路径更难察觉
+ * @endcode
+ * @param ms 上限毫秒数
+ */
+void setMaxEventBlockMs(int ms);
+/**
+ * @brief 读取事件阻塞的安全上限（毫秒）
+ * @return 当前上限
+ */
+int maxEventBlockMs(void);
+
+/**
  * @brief 以指定调度属性启动一个协程（带调度属性启动协程的统一低层入口）。
  *
  * 以 MetaContext(pri, affine, name) 作为 fiber 属性创建 boost fiber 执行 func。

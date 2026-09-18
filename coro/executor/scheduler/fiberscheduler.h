@@ -144,6 +144,9 @@ public:
      * @endcode
      * @param key 登记键（用调度器实例地址），注销时用同一个键
      * @param wake 可跨线程调用的唤醒回调
+     * @warning wakeAllBlocked() 在持有 waker_mtx_（非递归 std::mutex）期间调用
+     *          登记的回调。回调绝不能在同一线程上再入 registerWaker /
+     *          unregisterWaker / wakeAllBlocked，否则会自锁死锁。
      */
     static void registerWaker(void* key, WakeFn wake);
     /**
@@ -179,6 +182,14 @@ protected:
     static std::mutex                        waker_mtx_;   ///< 保护登记表
     static std::unordered_map<void*, WakeFn> wakers_;      ///< 各线程的唤醒回调
     static std::atomic_int                   s_blocked_count_;///< 阻塞中的线程数
+
+    /**
+     * @brief 交出 Qt 持有权前解除本线程挂起协程的钩子（Qt 实现注入）
+     * @details 存的是无捕获静态函数的指针而非 std::function：每个线程装调度器时
+     *          都会注入一次，std::function 的赋值不是原子操作，多线程并发写会与
+     *          stopCurrentThreadPump() 的读构成数据竞争。
+     */
+    static std::atomic<void(*)(void)> local_unpark_hook_;
 };
 
 }

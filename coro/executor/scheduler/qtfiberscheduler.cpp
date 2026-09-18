@@ -1,30 +1,166 @@
 #include "qtfiberscheduler.h"
+#include <QCoreApplication>
+#include <QThread>
 #include <thread>
 #include "detail/asyncdefine.h"
 #include <boost/fiber/all.hpp>
+#include <boost/fiber/context.hpp>
+
+thread_local Coro::QtFiberScheduler* Coro::QtFiberScheduler::t_self_{ nullptr };
 
 Coro::QtFiberScheduler::QtFiberScheduler(void):FiberScheduler()
 {
+    t_self_ = this;
+    deadline_timer_.setSingleShot(true);
+    /// @details 事件分发器必须在 eventloop 成员构造之后取：QEventLoop 的构造会
+    /// 为本线程 ensureEventDispatcher()，在那之前 instance() 可能是空。
+    disp_ = QAbstractEventDispatcher::instance();
+    if(disp_ != nullptr){
+        /// @details 本调度器由 boost.fiber 的 thread_local scheduler 持有，活得比
+        /// 事件分发器久：主线程的分发器是 QCoreApplication 的子对象，~QCoreApplication
+        /// 就把它删了，而本对象要到进程退出阶段的 thread_local 析构才走。缓存裸指针
+        /// 必须挂到 destroyed 上及时失效，否则收尾期的 notify() 就是 use-after-free。
+        /// 连接强制 DirectConnection：接收方正在析构，排队投递永远等不到执行。
+        disp_conn_ = QObject::connect(disp_, &QObject::destroyed, disp_,
+                                      [this]{ detachDispatcher(); },
+                                      Qt::DirectConnection);
+        /// @details 再挂一道 qApp：主线程的分发器是 QCoreApplication 的子对象，
+        /// 由 ~QObject 的 deleteChildren() 删除，而那时分发器的派生析构已经跑完 ——
+        /// destroyed 挂得太晚。qApp 的 destroyed 发在 ~QObject 的开头、deleteChildren
+        /// 之前，此刻分发器还完好，解绑才是真正没有窗口的。只有主线程调度器挂这道，
+        /// 免得工作线程去连一个别的线程的对象。
+        QCoreApplication* app = QCoreApplication::instance();
+        if(app != nullptr && app->thread() == QThread::currentThread()){
+            app_conn_ = QObject::connect(app, &QObject::destroyed, app,
+                                         [this]{ detachDispatcher(); },
+                                         Qt::DirectConnection);
+        }
+        // wakeUp() 是 Qt 明确保证线程安全的少数函数之一；指针取用见 wakeDispatcher()。
+        FiberScheduler::registerWaker(this, [this]{ wakeDispatcher(); });
+    }
+    /// @details 钩子是无捕获的静态函数，每个线程装调度器时都会写一次同样的值；
+    /// 用原子函数指针存放，重复写与 stopCurrentThreadPump() 的读都不构成竞争。
+    FiberScheduler::local_unpark_hook_.store(&QtFiberScheduler::unparkLocal,
+                                            std::memory_order_release);
 }
 
 Coro::QtFiberScheduler::~QtFiberScheduler(void)
 {
+    detachDispatcher();
+    t_self_ = nullptr;
+}
+
+/**
+ * @brief 戳醒本线程的 Qt 事件分发器
+ */
+void Coro::QtFiberScheduler::wakeDispatcher(void) noexcept
+{
+    std::lock_guard<std::mutex> guard(disp_mtx_);
+    if(disp_ != nullptr){
+        disp_->wakeUp();
+    }
+}
+
+/**
+ * @brief 与本线程的事件分发器解绑
+ */
+void Coro::QtFiberScheduler::detachDispatcher(void) noexcept
+{
+    /// @details 先注销唤醒回调：unregisterWaker 要拿 waker_mtx_，而 wakeAllBlocked()
+    /// 整轮回调都持着它，所以它返回时在途的那一轮已经跑完，之后不会再有新回调。
+    FiberScheduler::unregisterWaker(this);
+    /// @details 再拿 disp_mtx_ 置空：等 notify() 里在途的 wakeUp() 收尾。两步不嵌套，
+    /// 否则会与回调路径的 waker_mtx_ → disp_mtx_ 锁序相反而死锁。
+    std::lock_guard<std::mutex> guard(disp_mtx_);
+    if(disp_ != nullptr){
+        QObject::disconnect(disp_conn_);
+        QObject::disconnect(app_conn_);
+        disp_conn_ = QMetaObject::Connection{};
+        app_conn_  = QMetaObject::Connection{};
+        disp_ = nullptr;
+    }
+}
+
+/**
+ * @brief 挂起调用协程，返回可安全阻塞至的时刻
+ */
+std::chrono::steady_clock::time_point Coro::QtFiberScheduler::parkUntilIdle(void)
+{
+    QtFiberScheduler* self = t_self_;
+    if(self == nullptr){
+        return std::chrono::steady_clock::now();
+    }
+    /// @details Qt 持有者只有一席。撞上说明有两个协程都想当持有者，属实现错误。
+    Q_ASSERT(!self->parked_.load(std::memory_order_acquire));
+
+    boost::fibers::context* ctx = boost::fibers::context::active();
+    self->qt_waker_ = ctx->create_waker();
+    self->next_deadline_ = std::chrono::steady_clock::now();
+    self->parked_.store(true, std::memory_order_release);
+    /// @details store 与 suspend 之间没有让出点（同线程、无抢占），而 suspend_until
+    /// 只在本协程挂起之后才拿得到控制权，故不会丢唤醒。
+    ctx->suspend();
+    return self->next_deadline_;
+}
+
+/**
+ * @brief 解除本线程 Qt 持有者协程的挂起
+ */
+void Coro::QtFiberScheduler::unparkLocal(void)
+{
+    QtFiberScheduler* self = t_self_;
+    if(self == nullptr){
+        return;
+    }
+    if(self->parked_.exchange(false, std::memory_order_acq_rel)){
+        self->next_deadline_ = std::chrono::steady_clock::now();
+        self->qt_waker_.wake();
+    }
+}
+
+/**
+ * @brief 唤醒挂起的调度器线程，并戳破本线程可能正在进行的 poll()
+ */
+void Coro::QtFiberScheduler::notify(void) noexcept
+{
+    FiberScheduler::notify();
+    wakeDispatcher();
 }
 
 void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time_point &time_point) noexcept
 {
+    /// @details 有 Qt 持有者挂在 parkUntilIdle() 上时，本回调是唯一知道「最近一个
+    /// 协程截止时刻」的地方。交棒给它、立即返回，真正的阻塞发生在它自己的协程栈
+    /// 上 —— 那里执行 Qt 槽才是合法的；本回调跑在 dispatcher context，切栈会崩。
+    if(parked_.exchange(false, std::memory_order_acq_rel)){
+        next_deadline_ = time_point;
+        qt_waker_.wake();       // 只入队，不切栈
+        return;
+    }
+
     bool startedPump = false;
     std::call_once(pump_once_, [this, &startedPump]{
+        if(FiberScheduler::s_exit_.load(std::memory_order_acquire)
+           || FiberScheduler::t_stop_.load(std::memory_order_acquire)){
+            return;             // 已在退出，不必再起泵
+        }
         startedPump = true;
         boost::fibers::fiber(launch_properties([this]{
-            while (!FiberScheduler::s_exit_.load(std::memory_order_acquire)
-                   && !FiberScheduler::t_stop_.load(std::memory_order_acquire)) {
-                eventloop.processEvents(QEventLoop::AllEvents);
-                Coro::msleep(pump_interval_ms_);
-            }
+            pumpLoop();
         }, Priority::High, Affinity::fixed(std::this_thread::get_id()))).detach();
     });
-    /// @brief 首次调用只启动 Qt 事件泵并立即返回，避免事件泵尚未运行时进入基类休眠。
     if(startedPump) return;
     FiberScheduler::suspend_until(time_point);
+}
+
+/**
+ * @brief 常驻事件泵协程主体
+ */
+void Coro::QtFiberScheduler::pumpLoop(void)
+{
+    while (!FiberScheduler::s_exit_.load(std::memory_order_acquire)
+           && !FiberScheduler::t_stop_.load(std::memory_order_acquire)) {
+        eventloop.processEvents(QEventLoop::AllEvents);
+        Coro::msleep(1);
+    }
 }

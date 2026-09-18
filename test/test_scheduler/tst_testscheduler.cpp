@@ -30,6 +30,7 @@ private slots:
     void test_case_properties_change();
     void test_case_qtfiber_scheduler();
     void test_case_waker_registry();
+    void test_case_max_event_block_ms();
 
 };
 
@@ -505,6 +506,19 @@ void TestScheduler::test_case_waker_registry()
     Coro::FiberScheduler::wakeAllBlocked();
     QCOMPARE(calls, 1);
     Coro::FiberScheduler::leaveBlocked();
+}
+
+///
+/// \brief TestScheduler::test_case_max_event_block_ms 测试事件阻塞安全上限的读写与夹紧
+///
+void TestScheduler::test_case_max_event_block_ms()
+{
+    QCOMPARE(Coro::maxEventBlockMs(), 10);       // 默认 10ms 保险丝
+    Coro::setMaxEventBlockMs(25);
+    QCOMPARE(Coro::maxEventBlockMs(), 25);
+    Coro::setMaxEventBlockMs(0);                 // 非正值应被夹到 1
+    QCOMPARE(Coro::maxEventBlockMs(), 1);
+    Coro::setMaxEventBlockMs(10);                // 复原，免得影响别的用例
 }
 
 QTEST_GUILESS_MAIN(TestScheduler)

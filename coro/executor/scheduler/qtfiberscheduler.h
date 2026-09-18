@@ -3,6 +3,11 @@
 
 #include "fiberscheduler.h"
 #include <QEventLoop>
+#include <QTimer>
+#include <QAbstractEventDispatcher>
+#include <boost/fiber/waker.hpp>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 
 namespace Coro {
@@ -35,10 +40,66 @@ public:
      */
     void suspend_until(std::chrono::steady_clock::time_point const& time_point) noexcept override;
 
+    /**
+     * @brief 挂起调用协程，直到本线程再无就绪协程；返回可安全阻塞至的时刻
+     * @details 由**持有 Qt 事件循环的那个协程**调用：工作线程是泵协程，主线程是
+     *          Coro::exec() 的 qt-loop 协程在 aboutToBlock 中。挂起之后调度器才
+     *          会回调 suspend_until，那里是唯一能拿到「最近一个协程截止时刻」的
+     *          地方，它把该时刻交棒回来并唤醒本协程。
+     * @code
+     * auto tp = Coro::QtFiberScheduler::parkUntilIdle();
+     * int ms = 可阻塞毫秒数(tp);
+     * if(ms > 0) eventloop.processEvents(QEventLoop::AllEvents
+     *                                  | QEventLoop::WaitForMoreEvents);
+     * @endcode
+     * @return 可安全阻塞至的时刻；无任何定时协程时为 time_point::max()
+     */
+    static std::chrono::steady_clock::time_point parkUntilIdle(void);
+
+    /**
+     * @brief 唤醒挂起的调度器线程，并戳破本线程可能正在进行的 poll()
+     * @details 可能被 boost.fiber 从任意线程回调（远端就绪走 notify），因此戳
+     *          分发器这一步必须走 wakeDispatcher() 的加锁路径。
+     * @param 无
+     */
+    void notify(void) noexcept override;
+
+    /**
+     * @brief 解除本线程 Qt 持有者协程的挂起（交出 Qt 持有权前调用）
+     * @details Coro::exec() 会先 stopCurrentThreadPump() 停掉泵协程、再让
+     *          qt-loop 协程接手。若此刻泵正挂在 parkUntilIdle() 上，不先把它放
+     *          出来，Qt 持有者这个唯一席位就会被一个永远不会醒的协程占死。
+     */
+    static void unparkLocal(void);
+
 protected:
     QEventLoop eventloop;                    ///< 本线程 Qt 事件循环
     std::once_flag pump_once_;               ///< 每线程一次
-    int pump_interval_ms_{ 1 };              ///< 事件分发间隔（ms）
+    void pumpLoop(void);                     ///< 常驻事件泵协程主体
+
+    /**
+     * @brief 戳醒本线程的 Qt 事件分发器（可跨线程调用）
+     * @details 全程持 disp_mtx_：这把锁把「读 disp_ + 调 wakeUp()」和
+     *          detachDispatcher() 里的「置空 disp_」串成互斥的两段，否则分发器
+     *          在自己线程上被销毁时，别的线程手里的裸指针就是 use-after-free。
+     */
+    void wakeDispatcher(void) noexcept;
+    /**
+     * @brief 与本线程的事件分发器解绑，此后不再碰它
+     * @details 幂等，三个触发点都在本调度器自己的线程上：QCoreApplication 析构
+     *          （主线程分发器是它的子对象）、分发器自身析构、本调度器析构。
+     */
+    void detachDispatcher(void) noexcept;
+
+    static thread_local QtFiberScheduler* t_self_;///< 本线程的调度器实例
+    boost::fibers::waker  qt_waker_{};            ///< 挂起中的 Qt 持有者协程
+    std::atomic_bool      parked_{ false };       ///< Qt 持有者是否正挂起
+    std::chrono::steady_clock::time_point next_deadline_{};///< 交棒过来的截止时刻
+    std::mutex            disp_mtx_{};            ///< 串行化 disp_ 的取用与失效
+    QAbstractEventDispatcher* disp_{ nullptr };   ///< 本线程的事件分发器（disp_mtx_ 保护）
+    QMetaObject::Connection disp_conn_{};         ///< disp_ 的 destroyed 连接（仅本线程用）
+    QMetaObject::Connection app_conn_{};          ///< qApp 的 destroyed 连接（仅主线程调度器有）
+    QTimer                deadline_timer_{};      ///< 单次定时器，用于打断 poll()
 };
 
 }

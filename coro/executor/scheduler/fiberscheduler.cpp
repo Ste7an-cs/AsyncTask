@@ -12,6 +12,7 @@ thread_local std::atomic_bool FiberScheduler::t_stop_{ false };
 std::mutex FiberScheduler::waker_mtx_{};
 std::unordered_map<void*, FiberScheduler::WakeFn> FiberScheduler::wakers_{};
 std::atomic_int FiberScheduler::s_blocked_count_{ 0 };
+std::atomic<void(*)(void)> FiberScheduler::local_unpark_hook_{ nullptr };
 
 /**
  * @brief 构造
@@ -43,6 +44,8 @@ void FiberScheduler::signalExit(void)
 void FiberScheduler::stopCurrentThreadPump(void)
 {
     t_stop_.store(true, std::memory_order_release);
+    void (*unpark)(void) = local_unpark_hook_.load(std::memory_order_acquire);
+    if(unpark != nullptr) unpark();                ///< 放出挂在 park 上的泵协程
     wakeAllBlocked();
 }
 
