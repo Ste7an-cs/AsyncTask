@@ -443,17 +443,25 @@ void Coro::FiberScheduler::awakened(boost::fibers::context *ctx, Coro::MetaConte
     }
     // 根据协程的属性分配队列
     ctx->detach();
+    bool need_wake{ false };
     {
         std::lock_guard<std::mutex> guard(global_mtx);
+        // 目标就是本线程时无需叫人；此判断必须在锁内完成——一旦解锁，另一线程可能
+        // 立刻从队列取走并跑完这个协程，props 引用的属性对象随之被释放，
+        // 解锁后再访问 props 就是 use-after-free。
+        need_wake = !(props.affinity() == Affinity::fixed(std::this_thread::get_id()));
         FiberGlobalQueue::instance()->emplace_back(props);
     }
-    /// @details 目标就是本线程时无需叫人；否则可能有别的线程正睡在 poll() 里等这个
-    /// 协程。广播必须在释放 global_mtx 之后，避免持全局锁回调进 Qt 造成锁序问题。
-    if(!(props.affinity() == Affinity::fixed(std::this_thread::get_id()))){
+    /// @details 广播必须在释放 global_mtx 之后，避免持全局锁回调进 Qt 造成锁序问题。
+    if(need_wake){
         wakeAllBlocked();
     }
 }
 ```
+
+**⚠️ 此处曾是计划缺陷（Task 2 实施时发现并订正）**：原稿把 `props.affinity()` 读在
+解锁之后。`emplace_back` 一旦发布该协程，另一线程可以立刻取走、跑完并释放其属性
+对象，解锁后再读 `props` 就是 use-after-free（ASan 实证）。判断必须在锁内完成。
 
 两处易踩的坑，已核实过：`MetaContext::affinity_` 是**私有**成员，只能走公开访问器
 `affinity()`（`fiberproperty.h:329`）；`Affinity` 只定义了 `operator==`（`:104`），**没有
