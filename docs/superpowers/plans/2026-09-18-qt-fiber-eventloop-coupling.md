@@ -898,9 +898,19 @@ void Coro::QtFiberScheduler::pumpLoop(void)
         const auto tp = parkUntilIdle();                  // 交出线程，等交棒
         if(stopping()) break;
 
+        /// @details 顺序不可颠倒：必须**先**计数、**后**复查就绪队列。若反过来，
+        /// 复查到入队之间有个窗口 —— 别的线程此刻投递协程并调 wakeAllBlocked()，
+        /// 采样到 s_blocked_count_ 为 0 便跳过广播，这次唤醒就丢了，只能靠
+        /// maxEventBlockMs 兜底（症状是偶尔慢 10ms，极难定位）。先计数则该窗口内
+        /// 的广播一定会打到我们身上：Qt 的 wakeUp() 是粘性的，随后的 poll() 立即返回。
+        FiberScheduler::enterBlocked();
+
         /// @details 交棒之后、本协程真正被调度之前，可能又有协程被远端投递进来。
         /// 此时不能再去睡，否则手上有活却阻塞在 poll() 里。
-        if(has_ready_fibers()) continue;
+        if(has_ready_fibers() || stopping()){
+            FiberScheduler::leaveBlocked();
+            continue;
+        }
 
         const auto now = std::chrono::steady_clock::now();
         long long ms = 0;
@@ -908,10 +918,12 @@ void Coro::QtFiberScheduler::pumpLoop(void)
             ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
         }
         ms = std::min<long long>(ms, Coro::maxEventBlockMs());
-        if(ms <= 0) continue;
+        if(ms <= 0){
+            FiberScheduler::leaveBlocked();
+            continue;
+        }
 
         deadline_timer_.start(static_cast<int>(ms));
-        FiberScheduler::enterBlocked();
         eventloop.processEvents(QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents);
         FiberScheduler::leaveBlocked();
         deadline_timer_.stop();
@@ -920,6 +932,12 @@ void Coro::QtFiberScheduler::pumpLoop(void)
 ```
 
 顶部若缺 `#include <algorithm>` 则补上。
+
+**每一条 `continue` 路径都必须配对 `leaveBlocked()`** —— 漏掉一条，计数就会单调上涨，
+`wakeAllBlocked()` 的限流闸从此永远打开，退化成无条件惊群广播。
+
+**⚠️ 此处曾是计划缺陷（Task 2 评审提出，Task 4 派发前订正）**：原稿是先
+`has_ready_fibers()` 复查、后 `enterBlocked()`，存在上述丢唤醒窗口。
 
 - [ ] **Step 2: 跑时延测试，确认工作线程路径已改善**
 
