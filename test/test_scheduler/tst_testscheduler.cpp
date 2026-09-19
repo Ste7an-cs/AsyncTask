@@ -23,6 +23,7 @@ public:
 private slots:
 
     void initTestCase();
+    void cleanupTestCase();
     void test_case_taskqueue();
     void test_case_global_taskqueue();
     void test_case_thread_affine1();
@@ -45,6 +46,21 @@ private slots:
 void TestScheduler::initTestCase()
 {
     QCOMPARE(Coro::maxEventBlockMs(), 10);       // 出厂默认 10ms 保险丝
+}
+
+///
+/// \brief TestScheduler::cleanupTestCase 收尾 test_case_qtfiber_scheduler 在主线程起的事件泵
+/// \details 这两行原来跟在 test_case_qtfiber_scheduler 末尾的断言之后：一旦前面
+///     的 QVERIFY 提前 return，它们就执行不到，主线程的泵协程永远跑着，
+///     boost.fiber 的 ~scheduler 会等它，进程整体挂死在退出阶段（实测 10/10）。
+///     搬到 cleanupTestCase() 后，Qt Test 保证不论前面哪个用例的断言是否失败都
+///     会跑到这里；同时也去掉了"停泵这一步夹在用例中间执行、影响同一进程里后续
+///     用例"的顺序依赖——停泵放到最后一步，不会再有"后续用例"了。
+///
+void TestScheduler::cleanupTestCase()
+{
+    Coro::FiberScheduler::stopCurrentThreadPump();
+    boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
 }
 
 TestScheduler::TestScheduler()
@@ -415,7 +431,6 @@ void TestScheduler::test_case_qtfiber_scheduler()
     /// 验证工作线程也能正常分发 Qt 事件，用例因此重新纳入回归。
     boost::fibers::use_scheduling_algorithm<Coro::QtFiberScheduler>();
     std::vector<std::thread> vec_th;
-    std::vector<Coro::FiberThreadBlock> vec_block;
     Coro::FiberThreadBlock block;
     //开启20个线程用于接收协程任务
     for(int i=0; i<20; i++){
@@ -463,16 +478,43 @@ void TestScheduler::test_case_qtfiber_scheduler()
     qDebug() << "100 个定时器的累计误差(ms)" << div_time_tick;
     /// 功能断言：100 个定时器每个都要在 2s 内触发满 10 次。
     QVERIFY(cnt.load() == 100);
-    /// 100个定时器，每个延时100ms触发10次、共1000ms；这里累加的是每个定时器的
-    /// 总误差。上限放到 10000（人均 100ms）：本仓库的事件泵目前是 1ms 轮询，
-    /// 本机 ASan 构建实测 400~4900 波动近一个数量级，卡在原来的 5000 会变成
-    /// 一个看机器负载脸色的测试。真正的延迟闸门是 testlatency（Task 5 转绿），
-    /// 这里只负责"没有整体性地卡死或漏触发"。
+    /// d_time 是 100 个定时器各自"累计误差"之和：每个定时器延时 100ms、触发
+    /// 10 次、标称共 1000ms，累加的是每次到 1000ms 的绝对偏差。默认 QTimer 是
+    /// Qt::CoarseTimer，Qt 允许它每次触发有多达 5% 区间的漂移——5ms/次 × 10 次
+    /// × 100 个定时器 = 5000ms，这是 Qt 自己就"合规"的抖动预算，不是本框架的
+    /// 债。上一轮把界限从 5000 松到 10000，理由写的是"实测已经贴着旧上限"，那
+    /// 不是正确的记录：10000 在数值上就是 Qt 自身抖动预算的整整两倍，这条断言
+    /// 从来都不是一个能抓回归的闸门——真正的闸门是下面的 cnt==100，和转绿后的
+    /// testlatency（Task 5）。
+    /// 还要记两件事：① 这是一个"和"，100 个定时器里哪怕 99 个很健康、1 个卡死，
+    /// 总和照样可能落在界内——真正值得要的断言是"每个定时器的最大偏差"而不是
+    /// 总和；② Task 4 重写事件泵之后这个数字应当明显下降，届时这里的上限要
+    /// 跟着收紧，而不是把 10000 当成永久天花板留着。
     QVERIFY( div_time_tick < 10000);
-    /// 主线程的事件泵协程没人停：boost.fiber 的 ~scheduler 会等它，进程就再也
-    /// 退不出去（实测 10/10 挂死在退出阶段）。按框架的收尾方式停泵并让出。
-    Coro::FiberScheduler::stopCurrentThreadPump();
-    boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
+}
+
+///
+/// \brief waitDoneOrFail 有限等待完成标志，超时则记一次失败而不是无限期挂起
+/// \details park/unpark 交棒路径一旦回归，持有者协程可能再也醒不来，之后的
+///     th.join() 会把整条测试队列一起拖死。这里改成先限时等一个"线程体已跑到
+///     终点"的标志，超时就 QTest::qFail 报错并 detach 线程（它可能真的永远
+///     醒不来，detach 而非 join 是为了不让 std::thread 在 joinable 状态下被
+///     析构从而 std::terminate）。调用方应在返回 false 时直接 return，跳过
+///     后续的 th.join()。
+/// \return 标志在超时前置位返回 true；调用方仍需自行 th.join()
+///
+static bool waitDoneOrFail(std::thread& th, std::atomic_bool& done, const char* what)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while(!done.load() && std::chrono::steady_clock::now() < deadline){
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if(!done.load()){
+        th.detach();
+        QTest::qFail(what, __FILE__, __LINE__);
+        return false;
+    }
+    return true;
 }
 
 ///
@@ -484,9 +526,10 @@ void TestScheduler::test_case_qtfiber_scheduler()
 void TestScheduler::test_case_park_until_idle_deadline()
 {
     std::atomic_bool resumed{ false };
-    std::atomic_int  handoff_ms{ 0 };
+    std::atomic<qint64> handoff_ms{ 0 };
+    std::atomic_bool done{ false };
 
-    std::thread th([&resumed, &handoff_ms](){
+    std::thread th([&resumed, &handoff_ms, &done](){
         boost::fibers::use_scheduling_algorithm<Coro::QtFiberScheduler>();
         auto self = std::this_thread::get_id();
 
@@ -503,7 +546,7 @@ void TestScheduler::test_case_park_until_idle_deadline()
                 auto t0 = std::chrono::steady_clock::now();
                 auto tp = Coro::QtFiberScheduler::parkUntilIdle();
                 resumed.store(true);
-                handoff_ms.store((int)std::chrono::duration_cast<std::chrono::milliseconds>(tp - t0).count());
+                handoff_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(tp - t0).count());
             },
             Coro::Priority::High, Coro::Affinity::fixed(self)));
 
@@ -514,7 +557,11 @@ void TestScheduler::test_case_park_until_idle_deadline()
         Coro::FiberScheduler::stopCurrentThreadPump();
         boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
         Coro::FiberScheduler::detachCurrentThreadDispatcher();
+        done.store(true);
     });
+    if(!waitDoneOrFail(th, done, "超时：交棒（deadline）线程 5s 内未完成，parkUntilIdle 可能挂死")){
+        return;
+    }
     th.join();
 
     qDebug() << "parkUntilIdle 交回的截止时刻在" << handoff_ms.load() << "ms 之后（期望约 50）";
@@ -534,10 +581,11 @@ void TestScheduler::test_case_park_until_idle_deadline()
 void TestScheduler::test_case_park_until_idle_unpark()
 {
     std::atomic_bool resumed{ false };
-    std::atomic_int  parked_ms{ -1 };            // park 到被放出之间的耗时
-    std::atomic_int  remain_ms{ 1 };             // 返回时刻相对 now() 的余量
+    std::atomic<qint64> parked_ms{ -1 };         // park 到被放出之间的耗时
+    std::atomic<qint64> remain_ms{ 1 };          // 返回时刻相对 now() 的余量
+    std::atomic_bool done{ false };
 
-    std::thread th([&resumed, &parked_ms, &remain_ms](){
+    std::thread th([&resumed, &parked_ms, &remain_ms, &done](){
         boost::fibers::use_scheduling_algorithm<Coro::QtFiberScheduler>();
         auto self = std::this_thread::get_id();
         std::atomic_bool parked{ false };
@@ -551,8 +599,8 @@ void TestScheduler::test_case_park_until_idle_unpark()
                 auto tp = Coro::QtFiberScheduler::parkUntilIdle();
                 auto now = std::chrono::steady_clock::now();
                 resumed.store(true);
-                parked_ms.store((int)std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count());
-                remain_ms.store((int)std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count());
+                parked_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count());
+                remain_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count());
             },
             Coro::Priority::High, Coro::Affinity::fixed(self)));
 
@@ -567,7 +615,11 @@ void TestScheduler::test_case_park_until_idle_unpark()
         holder.join();
         boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
         Coro::FiberScheduler::detachCurrentThreadDispatcher();
+        done.store(true);
     });
+    if(!waitDoneOrFail(th, done, "超时：解挂（unpark）线程 5s 内未完成，unparkLocal 可能挂死")){
+        return;
+    }
     th.join();
 
     qDebug() << "unpark 后 park 耗时" << parked_ms.load() << "ms，返回时刻余量"
@@ -575,8 +627,9 @@ void TestScheduler::test_case_park_until_idle_unpark()
     QVERIFY(resumed.load());                     // 被 unpark 放出来了
     /// 返回的是 now()：可阻塞时长不为正，调用方据此立刻返回而不是再睡一觉。
     QVERIFY(remain_ms.load() <= 0);
-    /// 同时证明走的不是交棒那条路（那条会给出一个未来时刻）：几乎是立刻回来的。
-    QVERIFY(parked_ms.load() >= 0);
+    /// 真正的判据是上面 remain_ms<=0（走的是 unpark 而非交棒，那条会给出一个未来
+    /// 时刻）。parked_ms>=0 对单调时钟恒真，不构成断言，这里只保留上界，确认
+    /// 确实是"几乎立刻回来"而不是拖了很久才被放出。
     QVERIFY(parked_ms.load() <= 200);
 }
 

@@ -140,8 +140,9 @@ public:
      * @endcode
      * @details Qt 实现注入的钩子会注销本线程的唤醒回调、并丢弃缓存的
      *          QAbstractEventDispatcher 裸指针。必须排在 stopCurrentThreadPump()
-     *          和随后的让出之后：解绑之后本线程就再也叫不醒了，提前调用会把还有
-     *          活干的协程永远睡死在这条线程上。
+     *          和随后的让出之后：解绑之后本线程就再也叫不醒了，远端就绪的唤醒
+     *          彻底失效，提前调用只能靠 suspend_until 的定时轮询自醒，代价是
+     *          最坏 200µs 的延迟，不是永久睡死。
      * @warning 只覆盖走 FiberThreadBlock::wait() 收尾的线程（框架创建的线程都走）。
      *          用户自建、装了调度器又不经 wait() 就返回的线程仍有残留窗口。
      */

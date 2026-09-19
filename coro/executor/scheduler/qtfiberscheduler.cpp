@@ -63,7 +63,15 @@ Coro::QtFiberScheduler::QtFiberScheduler(void):FiberScheduler()
 Coro::QtFiberScheduler::~QtFiberScheduler(void)
 {
     detachDispatcher();
-    t_self_ = nullptr;
+    /// @details 不能无条件清空：boost.fiber 在同线程二次安装调度器时，先构造新
+    /// 实例（此时 t_self_ 已指向新对象），再析构旧实例。若这里无条件置空，析构
+    /// 旧实例会把刚装好的 t_self_ 抹掉，导致新实例活着的这段时间里
+    /// detachCurrentThreadDispatcher() / parkUntilIdle() / unparkLocal() 全部
+    /// 静默退化为空操作（实测对 boost 1.89 成立；testexecutor 里主线程二次装
+    /// 调度器正是这个场景）。只清自己名下的那一份。
+    if(t_self_ == this){
+        t_self_ = nullptr;
+    }
 }
 
 /**

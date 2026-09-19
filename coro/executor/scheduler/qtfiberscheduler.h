@@ -52,13 +52,15 @@ public:
      * if(ms > 0) eventloop.processEvents(QEventLoop::AllEvents
      *                                  | QEventLoop::WaitForMoreEvents);
      * @endcode
-     * @return 三种出口：<br>
+     * @return 四种出口：<br>
      *         1. 正常交棒 —— suspend_until 交回来的「最近一个协程截止时刻」；
      *            本线程无任何定时协程时 boost.fiber 给的就是 time_point::max()；<br>
      *         2. 本线程没装 QtFiberScheduler（t_self_ 为空）—— 不挂起，直接返回
      *            now()，调用方据此算出的可阻塞时长为 0，退化为不阻塞的轮询；<br>
      *         3. 挂起期间被 unparkLocal() 放出（本线程正在交出 Qt 持有权）——
-     *            返回 now()，同样表示「立刻返回，别再阻塞」。
+     *            返回 now()，同样表示「立刻返回，别再阻塞」；<br>
+     *         4. 本线程已有协程持有 Qt 事件循环（重复 park）—— 拒绝挂起，
+     *            qWarning 提示后同样返回 now()。
      */
     static std::chrono::steady_clock::time_point parkUntilIdle(void);
 
