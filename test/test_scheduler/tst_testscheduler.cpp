@@ -3,6 +3,9 @@
 // add necessary includes here
 #include <vector>
 #include <tuple>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <boost/fiber/all.hpp>
 #include <executor/scheduler/fiberscheduler.h>
 #include <executor/scheduler/fiberthreadblock.h>
@@ -688,6 +691,53 @@ void TestScheduler::test_case_waker_registry()
     Coro::FiberScheduler::wakeAllBlocked();
     QCOMPARE(calls, 1);
     Coro::FiberScheduler::leaveBlocked();
+
+    /// —— 第二道闸：只戳**确实阻塞着**的线程，不戳正忙的线程 ——
+    /// 这条是本机制的要害，而且**常规用例照不到**：它不影响任何功能，只影响
+    /// 系统调用量。实测 testProfile 上，第二道闸缺失时 ~1.9 万次广播/秒 × 17 个
+    /// 登记线程 = 32.4 万次 wakeUp()/秒，而真正阻塞的只有 0~4 个线程，进程 CPU
+    /// 从 266s 涨到 1805s。没有这条断言，回归只会表现为"变慢了"，没人能定位。
+    int self_calls = 0;
+    int other_calls = 0;
+    int self_key = 0;
+    int other_key = 0;
+    std::mutex m;
+    std::condition_variable cv;
+    bool registered = false;
+    bool release = false;
+    /// 另起一个线程登记唤醒回调，并且**始终不调 enterBlocked()**——模拟"正忙着
+    /// 跑协程、根本不在 poll() 里"的工作线程。阻塞标志按线程存放，所以必须真的
+    /// 在另一个线程上登记，在本线程登记是照不到这条路径的。
+    std::thread other([&]{
+        Coro::FiberScheduler::registerWaker(&other_key, [&other_calls]{ ++other_calls; });
+        {
+            std::unique_lock<std::mutex> lk(m);
+            registered = true;
+            cv.notify_all();
+            cv.wait(lk, [&]{ return release; });
+        }
+        Coro::FiberScheduler::unregisterWaker(&other_key);
+    });
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&]{ return registered; });
+    }
+
+    Coro::FiberScheduler::registerWaker(&self_key, [&self_calls]{ ++self_calls; });
+    Coro::FiberScheduler::enterBlocked();          // 只有本线程阻塞
+    Coro::FiberScheduler::wakeAllBlocked();
+    Coro::FiberScheduler::leaveBlocked();
+    Coro::FiberScheduler::unregisterWaker(&self_key);
+
+    {
+        std::unique_lock<std::mutex> lk(m);
+        release = true;
+        cv.notify_all();
+    }
+    other.join();
+
+    QCOMPARE(self_calls, 1);                       // 阻塞着的线程要叫醒
+    QCOMPARE(other_calls, 0);                      // 正忙的线程一下都不许戳
 }
 
 ///

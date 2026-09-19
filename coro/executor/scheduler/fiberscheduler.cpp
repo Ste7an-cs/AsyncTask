@@ -10,7 +10,8 @@ std::atomic_bool FiberScheduler::s_exit_{ false };
 thread_local std::atomic_bool FiberScheduler::t_stop_{ false };
 
 std::mutex FiberScheduler::waker_mtx_{};
-std::unordered_map<void*, FiberScheduler::WakeFn> FiberScheduler::wakers_{};
+std::unordered_map<void*, FiberScheduler::WakerEntry> FiberScheduler::wakers_{};
+thread_local std::shared_ptr<std::atomic_bool> FiberScheduler::t_blocked_flag_{};
 std::atomic_int FiberScheduler::s_blocked_count_{ 0 };
 std::atomic<void(*)(void)> FiberScheduler::local_unpark_hook_{ nullptr };
 std::atomic<void(*)(void)> FiberScheduler::local_detach_hook_{ nullptr };
@@ -64,8 +65,16 @@ void FiberScheduler::detachCurrentThreadDispatcher(void)
  */
 void FiberScheduler::registerWaker(void* key, WakeFn wake)
 {
+    /// @details 阻塞标志按**线程**分配而不是按调度器实例：同一线程可能先后装两次
+    /// 调度器（boost.fiber 二次安装时新旧实例会短暂并存），两份登记必须共用同一个
+    /// 标志，否则 enterBlocked() 置的是一份、wakeAllBlocked() 查的是另一份。
+    /// 用 shared_ptr 是因为登记表里的条目可能比线程活得久（线程退出时若还没来得及
+    /// unregisterWaker），裸指针会悬垂。
+    if(!t_blocked_flag_){
+        t_blocked_flag_ = std::make_shared<std::atomic_bool>(false);
+    }
     std::lock_guard<std::mutex> guard(waker_mtx_);
-    wakers_[key] = std::move(wake);
+    wakers_[key] = WakerEntry{ std::move(wake), t_blocked_flag_ };
 }
 
 /**
@@ -78,7 +87,7 @@ void FiberScheduler::unregisterWaker(void* key)
 }
 
 /**
- * @brief 叫醒所有阻塞中的线程（无人阻塞时直接返回，避免惊群）
+ * @brief 叫醒所有阻塞中的线程（无人阻塞时直接返回；只戳真正阻塞着的那几个）
  */
 void FiberScheduler::wakeAllBlocked(void)
 {
@@ -87,24 +96,40 @@ void FiberScheduler::wakeAllBlocked(void)
     }
     std::lock_guard<std::mutex> guard(waker_mtx_);
     for(auto& entry : wakers_){
-        entry.second();
+        /// @details 只戳确实阻塞着的线程。忙着跑协程的线程戳了也白戳：它压根不在
+        /// poll() 里，这一下只是把粘性唤醒标志置上，让它下一次 poll() 空转一轮。
+        const WakerEntry& e = entry.second;
+        if(e.blocked && e.blocked->load(std::memory_order_acquire)){
+            e.fn();
+        }
     }
 }
 
 /**
- * @brief 进入阻塞前计数 +1
+ * @brief 进入阻塞前：置本线程阻塞标志，计数 +1
  */
 void FiberScheduler::enterBlocked(void)
 {
+    /// @details 先置标志、后加计数。反过来会漏唤醒：并发的 wakeAllBlocked() 可能
+    /// 看到计数已 >0 而标志还是 false，于是跳过本线程。多置一会儿标志只会白挨一次
+    /// 戳（计数为 0 时对方早在第一道闸就返回了），没有副作用。
+    if(t_blocked_flag_){
+        t_blocked_flag_->store(true, std::memory_order_release);
+    }
     s_blocked_count_.fetch_add(1, std::memory_order_release);
 }
 
 /**
- * @brief 离开阻塞后计数 -1
+ * @brief 离开阻塞后：计数 -1，清本线程阻塞标志
  */
 void FiberScheduler::leaveBlocked(void)
 {
+    /// @details 与 enterBlocked() 对称：先减计数、后清标志，保证「计数 >0 且标志为
+    /// 真」的区间始终覆盖真正阻塞的那一段。
     s_blocked_count_.fetch_sub(1, std::memory_order_release);
+    if(t_blocked_flag_){
+        t_blocked_flag_->store(false, std::memory_order_release);
+    }
 }
 
 /**

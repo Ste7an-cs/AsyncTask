@@ -160,6 +160,8 @@ public:
      * @endcode
      * @param key 登记键（用调度器实例地址），注销时用同一个键
      * @param wake 可跨线程调用的唤醒回调
+     * @details 登记的同时把**调用线程**的阻塞标志一并记下，wakeAllBlocked() 据此
+     *          只戳真正阻塞着的线程。因此必须在要被唤醒的那个线程上调用。
      * @warning wakeAllBlocked() 在持有 waker_mtx_（非递归 std::mutex）期间调用
      *          登记的回调。回调绝不能在同一线程上再入 registerWaker /
      *          unregisterWaker / wakeAllBlocked，否则会自锁死锁。
@@ -172,13 +174,22 @@ public:
     static void unregisterWaker(void* key);
     /**
      * @brief 叫醒所有阻塞中的线程
-     * @details 仅在确有线程阻塞时才遍历登记表。无条件广播会造成惊群 ——
-     *          每次协程就绪都叫醒全部工作线程，正是本次要消除的 CPU 浪费。
+     * @details 两道闸：① 全局计数为 0 时直接返回，连登记表都不遍历；② 遍历时
+     *          只戳「此刻确实阻塞着」的那几个线程，忙着跑协程的线程一个都不戳。
+     * @details 第二道闸不是优化而是必需。只有第一道闸时，实测 testProfile：
+     *          ~1.9 万次广播/秒 × 17 个登记线程 = **32.4 万次 wakeUp() 系统调用/秒**，
+     *          而任一时刻真正阻塞的只有 0~4 个线程 —— 16 个白叫，进程 CPU 从
+     *          266s 涨到 1805s（issue #6 那个忙转的另一种形态）。第一道闸在事件泵
+     *          改为按需阻塞之前一直是「计数恒为 0」，所以这条惊群路径此前从未点亮。
      */
     static void wakeAllBlocked(void);
-    /** @brief 进入阻塞前调用（阻塞线程计数 +1） */
+    /**
+     * @brief 进入阻塞前调用（置本线程阻塞标志，阻塞线程计数 +1）
+     * @warning 必须在真正要阻塞的那个线程上调用，且与 leaveBlocked() 严格配对：
+     *          漏一次减计数，计数就永久 >0，wakeAllBlocked() 的第一道闸从此失效。
+     */
     static void enterBlocked(void);
-    /** @brief 离开阻塞后调用（阻塞线程计数 -1） */
+    /** @brief 离开阻塞后调用（阻塞线程计数 -1，清本线程阻塞标志） */
     static void leaveBlocked(void);
     /** @brief 当前阻塞中的线程数（供测试断言） */
     static int  blockedCount(void);
@@ -195,8 +206,14 @@ protected:
     static std::atomic_bool s_exit_;         ///< 全局退出标志
     static thread_local std::atomic_bool t_stop_;///< 当前线程退出标志
 
+    /// @brief 登记表条目：唤醒回调 + 该线程「此刻是否真的阻塞着」的标志
+    struct WakerEntry {
+        WakeFn                            fn;      ///< 唤醒回调
+        std::shared_ptr<std::atomic_bool> blocked; ///< 归属线程的阻塞标志
+    };
     static std::mutex                        waker_mtx_;   ///< 保护登记表
-    static std::unordered_map<void*, WakeFn> wakers_;      ///< 各线程的唤醒回调
+    static std::unordered_map<void*, WakerEntry> wakers_;  ///< 各线程的唤醒回调
+    static thread_local std::shared_ptr<std::atomic_bool> t_blocked_flag_;///< 本线程阻塞标志
     static std::atomic_int                   s_blocked_count_;///< 阻塞中的线程数
 
     /**
