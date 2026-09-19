@@ -501,15 +501,25 @@ void TestScheduler::test_case_qtfiber_scheduler()
 ///     醒不来，detach 而非 join 是为了不让 std::thread 在 joinable 状态下被
 ///     析构从而 std::terminate）。调用方应在返回 false 时直接 return，跳过
 ///     后续的 th.join()。
+/// \details 超时未必意味着永久挂死，也可能只是变慢的回归——detach 之后线程
+///     仍可能在某个更晚的时刻跑到终点，把结果写回 state。若 state 是本测试
+///     函数的栈上局部变量，函数已经因为上面的 return 而返回，那次迟到的写入
+///     就会写穿已释放的栈帧（UB：轻则污染后续测试的局部变量，重则是只在
+///     ASan/延迟场景下才现形的 stack-use-after-return）。要求调用方把完成
+///     标志和计时结果放进一个 shared_ptr 持有的结构体，并在线程体与内部协程
+///     里按值捕获这个 shared_ptr：这样即便真的 detach-and-leak，触达的也只是
+///     堆上多活了一会儿的对象，而不是悬垂引用。
+/// \tparam T 完成状态结构体类型，要求含有 std::atomic_bool done 成员
 /// \return 标志在超时前置位返回 true；调用方仍需自行 th.join()
 ///
-static bool waitDoneOrFail(std::thread& th, std::atomic_bool& done, const char* what)
+template <typename T>
+static bool waitDoneOrFail(std::thread& th, const std::shared_ptr<T>& state, const char* what)
 {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while(!done.load() && std::chrono::steady_clock::now() < deadline){
+    while(!state->done.load() && std::chrono::steady_clock::now() < deadline){
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    if(!done.load()){
+    if(!state->done.load()){
         th.detach();
         QTest::qFail(what, __FILE__, __LINE__);
         return false;
@@ -525,11 +535,19 @@ static bool waitDoneOrFail(std::thread& th, std::atomic_bool& done, const char* 
 ///
 void TestScheduler::test_case_park_until_idle_deadline()
 {
-    std::atomic_bool resumed{ false };
-    std::atomic<qint64> handoff_ms{ 0 };
-    std::atomic_bool done{ false };
+    /// 完成标志与计时结果放进 shared_ptr 持有的结构体：waitDoneOrFail 超时后
+    /// 会 detach 线程并让本函数直接返回，若这些是本函数的栈上局部变量，一次
+    /// "变慢而非永久卡死"的回归仍可能在函数返回之后写穿已释放的栈帧。线程体
+    /// 与内部协程都按值捕获这个 shared_ptr，detach-and-leak 也只是堆对象多活
+    /// 一会儿，而不是悬垂引用。
+    struct Result {
+        std::atomic_bool resumed{ false };
+        std::atomic<qint64> handoff_ms{ 0 };
+        std::atomic_bool done{ false };
+    };
+    auto result = std::make_shared<Result>();
 
-    std::thread th([&resumed, &handoff_ms, &done](){
+    std::thread th([result](){
         boost::fibers::use_scheduling_algorithm<Coro::QtFiberScheduler>();
         auto self = std::this_thread::get_id();
 
@@ -542,11 +560,11 @@ void TestScheduler::test_case_park_until_idle_deadline()
 
         /// 扮演 Qt 持有者：Task 4 里这就是泵协程要走的路
         boost::fibers::fiber holder(Coro::launch_properties(
-            [&resumed, &handoff_ms](){
+            [result](){
                 auto t0 = std::chrono::steady_clock::now();
                 auto tp = Coro::QtFiberScheduler::parkUntilIdle();
-                resumed.store(true);
-                handoff_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(tp - t0).count());
+                result->resumed.store(true);
+                result->handoff_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(tp - t0).count());
             },
             Coro::Priority::High, Coro::Affinity::fixed(self)));
 
@@ -557,19 +575,19 @@ void TestScheduler::test_case_park_until_idle_deadline()
         Coro::FiberScheduler::stopCurrentThreadPump();
         boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
         Coro::FiberScheduler::detachCurrentThreadDispatcher();
-        done.store(true);
+        result->done.store(true);
     });
-    if(!waitDoneOrFail(th, done, "超时：交棒（deadline）线程 5s 内未完成，parkUntilIdle 可能挂死")){
+    if(!waitDoneOrFail(th, result, "超时：交棒（deadline）线程 5s 内未完成，parkUntilIdle 可能挂死")){
         return;
     }
     th.join();
 
-    qDebug() << "parkUntilIdle 交回的截止时刻在" << handoff_ms.load() << "ms 之后（期望约 50）";
-    QVERIFY(resumed.load());                     // 走到这里说明 park 确实被唤醒了
+    qDebug() << "parkUntilIdle 交回的截止时刻在" << result->handoff_ms.load() << "ms 之后（期望约 50）";
+    QVERIFY(result->resumed.load());                     // 走到这里说明 park 确实被唤醒了
     /// 窗口给得很宽（20~200ms）：这里要证的是「交回来的是那个 50ms 的截止时刻」，
     /// 而不是 now() 也不是 time_point::max()，不是一个计时精度测试。
-    QVERIFY(handoff_ms.load() >= 20);
-    QVERIFY(handoff_ms.load() <= 200);
+    QVERIFY(result->handoff_ms.load() >= 20);
+    QVERIFY(result->handoff_ms.load() <= 200);
 }
 
 ///
@@ -580,27 +598,34 @@ void TestScheduler::test_case_park_until_idle_deadline()
 ///
 void TestScheduler::test_case_park_until_idle_unpark()
 {
-    std::atomic_bool resumed{ false };
-    std::atomic<qint64> parked_ms{ -1 };         // park 到被放出之间的耗时
-    std::atomic<qint64> remain_ms{ 1 };          // 返回时刻相对 now() 的余量
-    std::atomic_bool done{ false };
+    /// 理由同上一个测试：完成标志与计时结果放进 shared_ptr 持有的结构体，
+    /// 由线程体与内部协程按值捕获，避免 waitDoneOrFail 超时 detach 之后
+    /// 出现对本函数已释放栈帧的悬垂写入。parked 仍按引用捕获——它是线程体
+    /// 自己栈上的局部变量，生命周期与线程本身绑定，detach 之后依旧安全。
+    struct Result {
+        std::atomic_bool resumed{ false };
+        std::atomic<qint64> parked_ms{ -1 };         // park 到被放出之间的耗时
+        std::atomic<qint64> remain_ms{ 1 };          // 返回时刻相对 now() 的余量
+        std::atomic_bool done{ false };
+    };
+    auto result = std::make_shared<Result>();
 
-    std::thread th([&resumed, &parked_ms, &remain_ms, &done](){
+    std::thread th([result](){
         boost::fibers::use_scheduling_algorithm<Coro::QtFiberScheduler>();
         auto self = std::this_thread::get_id();
         std::atomic_bool parked{ false };
 
         boost::fibers::fiber holder(Coro::launch_properties(
-            [&resumed, &parked_ms, &remain_ms, &parked](){
+            [result, &parked](){
                 auto t0 = std::chrono::steady_clock::now();
                 /// 置位与 park 之间没有让出点，协程又是协作式调度：对方看见
                 /// parked 为真时，本协程必定已经挂起。
                 parked.store(true);
                 auto tp = Coro::QtFiberScheduler::parkUntilIdle();
                 auto now = std::chrono::steady_clock::now();
-                resumed.store(true);
-                parked_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count());
-                remain_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count());
+                result->resumed.store(true);
+                result->parked_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count());
+                result->remain_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count());
             },
             Coro::Priority::High, Coro::Affinity::fixed(self)));
 
@@ -615,22 +640,22 @@ void TestScheduler::test_case_park_until_idle_unpark()
         holder.join();
         boost::this_fiber::sleep_for(std::chrono::milliseconds(5));
         Coro::FiberScheduler::detachCurrentThreadDispatcher();
-        done.store(true);
+        result->done.store(true);
     });
-    if(!waitDoneOrFail(th, done, "超时：解挂（unpark）线程 5s 内未完成，unparkLocal 可能挂死")){
+    if(!waitDoneOrFail(th, result, "超时：解挂（unpark）线程 5s 内未完成，unparkLocal 可能挂死")){
         return;
     }
     th.join();
 
-    qDebug() << "unpark 后 park 耗时" << parked_ms.load() << "ms，返回时刻余量"
-             << remain_ms.load() << "ms（期望均约 0）";
-    QVERIFY(resumed.load());                     // 被 unpark 放出来了
+    qDebug() << "unpark 后 park 耗时" << result->parked_ms.load() << "ms，返回时刻余量"
+             << result->remain_ms.load() << "ms（期望均约 0）";
+    QVERIFY(result->resumed.load());                     // 被 unpark 放出来了
     /// 返回的是 now()：可阻塞时长不为正，调用方据此立刻返回而不是再睡一觉。
-    QVERIFY(remain_ms.load() <= 0);
+    QVERIFY(result->remain_ms.load() <= 0);
     /// 真正的判据是上面 remain_ms<=0（走的是 unpark 而非交棒，那条会给出一个未来
     /// 时刻）。parked_ms>=0 对单调时钟恒真，不构成断言，这里只保留上界，确认
     /// 确实是"几乎立刻回来"而不是拖了很久才被放出。
-    QVERIFY(parked_ms.load() <= 200);
+    QVERIFY(result->parked_ms.load() <= 200);
 }
 
 ///
