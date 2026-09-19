@@ -907,7 +907,8 @@ void Coro::QtFiberScheduler::pumpLoop(void)
 
         /// @details 交棒之后、本协程真正被调度之前，可能又有协程被远端投递进来。
         /// 此时不能再去睡，否则手上有活却阻塞在 poll() 里。
-        if(has_ready_fibers() || stopping()){
+        /// **不可用 has_ready_fibers()** —— 见下方警告。
+        if(hasReadyWork() || stopping()){
             FiberScheduler::leaveBlocked();
             continue;
         }
@@ -935,6 +936,56 @@ void Coro::QtFiberScheduler::pumpLoop(void)
 
 **每一条 `continue` 路径都必须配对 `leaveBlocked()`** —— 漏掉一条，计数就会单调上涨，
 `wakeAllBlocked()` 的限流闸从此永远打开，退化成无条件惊群广播。
+
+### 为什么不能用 `has_ready_fibers()`（实测）
+
+**⚠️ 此处曾是计划缺陷（Task 4 实施时由插桩实测捕获）**：原稿用的是
+`has_ready_fibers()`。它恒为真，泵因此**一次都不会阻塞**，直接退化成满速忙转。
+
+`FiberScheduler::awakened()` 把所有 pinned context 塞进 `main_queue_`
+（`fiberscheduler.cpp:49-54`），而 boost.fiber 的 **dispatcher context 正是 pinned 的**；
+`has_ready_fibers()` 又把 `main_queue_.size() > 0` 算作「有活」。于是队列里永远躺着那
+一个 dispatcher context。插桩实测（testexecutor，3 秒）：
+
+```
+[PUMP] iter=665421  readyCont=665420  blocked=0
+[PUMP] main=665420  mainSz==1:665420  frontIsDispatcher:665420
+```
+
+66 万次迭代，零次阻塞，每次 `main_queue_` 都恰好一个元素且就是 dispatcher。
+**而测试全部通过** —— 这个缺陷会以「修好了时延」的面目合并，实际交付的却是
+issue #6 里那个把进程 CPU 从 2.4s 推到 49.4s 的忙转。原泵不受影响，因为它从不调用
+`has_ready_fibers()`。
+
+正确做法是新增一个排除 dispatcher 的判断（`FiberScheduler` 的 protected 成员）：
+
+```cpp
+/**
+ * @brief 本线程是否有真正可跑的协程（排除常驻的 dispatcher context）
+ * @details has_ready_fibers() 不能用于「要不要去睡」的判断：main_queue_ 里永远
+ *          有一个 pinned 的 dispatcher context，使其恒为真。
+ * @return 有真实可跑协程返回 true
+ */
+bool FiberScheduler::hasReadyWork(void) const noexcept
+{
+    std::lock_guard<std::mutex> guard(global_mtx);
+    auto* q = FiberGlobalQueue::instance();
+    if(q->getQueueSize(Affinity::shared()) > 0
+       || q->getQueueSize(Affinity::fixed(std::this_thread::get_id())) > 0
+       || q->getQueueSize(Affinity::sticky()) > 0
+       || q->getQueueSize(Affinity{AffinityMode::Sticky, std::this_thread::get_id()}) > 0){
+        return true;
+    }
+    // main_queue_ 里的 dispatcher context 不算活；其余 pinned context（如被唤醒的
+    // 主纤程）要算。std::queue 不可遍历，但实测该队列稳定只含一个元素。
+    if(main_queue_.empty()) return false;
+    if(main_queue_.size() > 1) return true;
+    return !main_queue_.front()->is_context(boost::fibers::type::dispatcher_context);
+}
+```
+
+`QtLocalFiberScheduler` 覆写了 `has_ready_fibers()`（只认 Shared 与本线程 Fixed），
+若它也要用这条判断，需相应覆写 `hasReadyWork()`。
 
 **⚠️ 此处曾是计划缺陷（Task 2 评审提出，Task 4 派发前订正）**：原稿是先
 `has_ready_fibers()` 复查、后 `enterBlocked()`，存在上述丢唤醒窗口。
