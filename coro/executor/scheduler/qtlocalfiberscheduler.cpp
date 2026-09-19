@@ -1,5 +1,6 @@
 #include "qtlocalfiberscheduler.h"
 #include <QDebug>
+#include <boost/fiber/type.hpp>
 
 /**
  * @brief 构造
@@ -69,4 +70,22 @@ bool Coro::QtLocalFiberScheduler::has_ready_fibers() const noexcept
     }else{
         return false;
     }
+}
+
+/**
+ * @brief 本线程是否有真正可跑的协程（只认 Shared 与本线程 Fixed，排除 dispatcher）
+ * @return 有真实可跑协程返回 true
+ */
+bool Coro::QtLocalFiberScheduler::hasReadyWork(void) const noexcept
+{
+    std::lock_guard<std::mutex> guard(global_mtx);
+    auto* q = FiberGlobalQueue::instance();
+    if(q->getQueueSize(Affinity::shared()) > 0
+       || q->getQueueSize(Affinity::fixed(std::this_thread::get_id())) > 0){
+        return true;
+    }
+    /// @details 同基类：main_queue_ 里常驻的 dispatcher context 不算活。
+    if(main_queue_.empty()) return false;
+    if(main_queue_.size() > 1) return true;
+    return !main_queue_.front()->is_context(boost::fibers::type::dispatcher_context);
 }

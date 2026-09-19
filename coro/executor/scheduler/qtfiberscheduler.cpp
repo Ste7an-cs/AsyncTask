@@ -2,6 +2,8 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QThread>
+#include <algorithm>
+#include <chrono>
 #include <thread>
 #include "detail/asyncdefine.h"
 #include <boost/fiber/all.hpp>
@@ -197,13 +199,46 @@ void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time
 }
 
 /**
- * @brief 常驻事件泵协程主体
+ * @brief 常驻事件泵协程主体：排空 → 交出线程 → 按需阻塞在 poll()
+ * @details 不再有固定分发间隔。无就绪协程时阻塞在 Qt 的 poll() 里，fd 就绪即刻
+ *          返回；空闲时线程真正休眠而非轮询。阻塞上限由 Coro::maxEventBlockMs()
+ *          兜底 —— 本泵**不参与**跨线程唤醒广播，那把保险丝因此是远端就绪唯一的
+ *          兜底手段，原委见头文件里的长注释。
  */
 void Coro::QtFiberScheduler::pumpLoop(void)
 {
-    while (!FiberScheduler::s_exit_.load(std::memory_order_acquire)
-           && !FiberScheduler::t_stop_.load(std::memory_order_acquire)) {
-        eventloop.processEvents(QEventLoop::AllEvents);
-        Coro::msleep(1);
+    auto stopping = [this]{
+        return FiberScheduler::s_exit_.load(std::memory_order_acquire)
+            || FiberScheduler::t_stop_.load(std::memory_order_acquire);
+    };
+
+    while(!stopping()){
+        eventloop.processEvents(QEventLoop::AllEvents);   // 槽在本协程栈上跑
+        if(stopping()) break;
+
+        const auto tp = parkUntilIdle();                  // 交出线程，等交棒
+        if(stopping()) break;
+
+        /// @details 交棒之后、本协程真正被调度之前，可能又有协程被远端投递进来。
+        /// 此时不能再去睡，否则手上有活却阻塞在 poll() 里。
+        /// **不可用 has_ready_fibers()** —— main_queue_ 里常驻一个 pinned 的
+        /// dispatcher context 使其恒为真，泵会一次都不阻塞、退化成满速忙转。
+        if(hasReadyWork() || stopping()){
+            continue;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        long long ms = 0;
+        if(tp > now){
+            ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
+        }
+        ms = std::min<long long>(ms, Coro::maxEventBlockMs());
+        if(ms <= 0){
+            continue;
+        }
+
+        deadline_timer_.start(static_cast<int>(ms));
+        eventloop.processEvents(QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents);
+        deadline_timer_.stop();
     }
 }

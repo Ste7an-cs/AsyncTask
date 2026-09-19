@@ -179,14 +179,25 @@ public:
      * @details 第二道闸不是优化而是必需。只有第一道闸时，实测 testProfile：
      *          ~1.9 万次广播/秒 × 17 个登记线程 = **32.4 万次 wakeUp() 系统调用/秒**，
      *          而任一时刻真正阻塞的只有 0~4 个线程 —— 16 个白叫，进程 CPU 从
-     *          266s 涨到 1805s（issue #6 那个忙转的另一种形态）。第一道闸在事件泵
-     *          改为按需阻塞之前一直是「计数恒为 0」，所以这条惊群路径此前从未点亮。
+     *          266s 涨到 1805s（issue #6 那个忙转的另一种形态）。
+     *
+     * @warning **当下全框架没有 enterBlocked() 的生产调用者，本函数因此恒在第一
+     *          道闸返回，整张登记表是休眠的。** 这不是遗漏：Task 4 把 Qt 事件泵
+     *          改成按需阻塞之后曾让它参与广播，实测 CPU 反而从 136.5s 涨到
+     *          1371.7s —— 被戳醒的线程里只有 25.8% 找得到活干，74.2% 醒来空跑一轮
+     *          又睡回去，电平触发的广播把这份 churn 乘上了线程数。于是决定：先只
+     *          收下事件泵重写带来的 2 倍 CPU 改善，唤醒策略（边沿触发／wake-one／
+     *          限流）单独立项。本机制与下面两个计数函数、以及 test_case_waker_registry
+     *          里那条「不戳正忙线程」的断言一并保留，等那个任务接手 ——
+     *          **它们是正确的、有测试护着的半成品，不是死代码，请勿顺手删除。**
      */
     static void wakeAllBlocked(void);
     /**
      * @brief 进入阻塞前调用（置本线程阻塞标志，阻塞线程计数 +1）
      * @warning 必须在真正要阻塞的那个线程上调用，且与 leaveBlocked() 严格配对：
      *          漏一次减计数，计数就永久 >0，wakeAllBlocked() 的第一道闸从此失效。
+     *          另见 QtFiberScheduler::pumpLoop() 的注释：调用点必须排在「有没有活」
+     *          的复查之前，否则会开一个丢唤醒的窗口。当前无生产调用者，仅测试在用。
      */
     static void enterBlocked(void);
     /** @brief 离开阻塞后调用（阻塞线程计数 -1，清本线程阻塞标志） */
@@ -197,6 +208,22 @@ public:
 protected://全局
     static std::mutex                       global_mtx;///< 全局锁，串行化全局队列的跨线程访问
 protected:
+    /**
+     * @brief 本线程是否有真正可跑的协程（排除常驻的 dispatcher context）
+     * @code
+     * // 事件泵在「要不要去睡」之前复查：
+     * if(hasReadyWork()) continue;   // 手上有活，这一轮不睡
+     * @endcode
+     * @details has_ready_fibers() 不能用于这个判断：awakened() 把所有 pinned
+     *          context 都塞进 main_queue_，而 boost.fiber 的 dispatcher context
+     *          正是 pinned 的，于是队列里永远躺着它一个，has_ready_fibers() 恒为
+     *          真，泵一次都不会阻塞、直接退化成满速忙转。
+     * @return 有真实可跑协程返回 true
+     * @warning 派生类若覆写了 pick_next()（只取部分亲和的协程），必须同步覆写本
+     *          函数，否则会把自己永远取不到的协程算作「有活」而空转。
+     */
+    virtual bool hasReadyWork(void) const noexcept;
+
     std::queue<boost::fibers::context*>     main_queue_{};///< 调度器自身的就绪队列，包括 dispatch 任务和线程的主循环
     boost::mutex                            mtx_{};///< 保护 suspend_until 等待的互斥量
     boost::condition_variable               cnd_{};///< suspend_until 的条件变量

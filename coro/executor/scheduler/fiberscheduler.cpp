@@ -250,6 +250,28 @@ bool Coro::FiberScheduler::has_ready_fibers() const noexcept
 }
 
 /**
+ * @brief 本线程是否有真正可跑的协程（排除常驻的 dispatcher context）
+ * @return 有真实可跑协程返回 true
+ */
+bool Coro::FiberScheduler::hasReadyWork(void) const noexcept
+{
+    std::lock_guard<std::mutex> guard(global_mtx);
+    auto* q = FiberGlobalQueue::instance();
+    if(q->getQueueSize(Affinity::shared()) > 0
+       || q->getQueueSize(Affinity::fixed(std::this_thread::get_id())) > 0
+       || q->getQueueSize(Affinity::sticky()) > 0
+       || q->getQueueSize(Affinity{AffinityMode::Sticky, std::this_thread::get_id()}) > 0){
+        return true;
+    }
+    /// @details main_queue_ 里那个 dispatcher context 是常驻的，不算活；其余
+    /// pinned context（如被唤醒的线程主纤程）要算。std::queue 不可遍历，但实测
+    /// 该队列稳定只含一个元素，故只需判首元素。
+    if(main_queue_.empty()) return false;
+    if(main_queue_.size() > 1) return true;
+    return !main_queue_.front()->is_context(boost::fibers::type::dispatcher_context);
+}
+
+/**
  * @brief 无可运行协程时挂起线程至指定时刻或被 notify 唤醒
  * @param time_point 下一个唤醒的时刻
  */
