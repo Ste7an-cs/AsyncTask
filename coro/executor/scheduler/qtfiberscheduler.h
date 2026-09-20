@@ -107,7 +107,14 @@ protected:
      *          Shared 协程叫醒，它要睡满 maxEventBlockMs（默认 10ms）才自醒。**
      *          旧泵（processEvents + msleep(1)）对这种活的拾取延迟是 ~1ms，所以
      *          这是一次 ~1ms → ≤10ms 的跨线程拾取回归，换来 2 倍的 CPU 改善
-     *          （testProfile：CPU 266.5s→136.5s，墙钟 209.8s→125.5s）。
+     *          （testProfile：CPU 266.5s→119.8s，墙钟 209.8s→112.0s，
+     *          系统时间 63.9s→6.3s）。
+     *          **代价的另一半同样要说清楚：关机与「停某一个线程的泵」也一并被推迟
+     *          至多 maxEventBlockMs。** signalExit() / stopCurrentThreadPump() 里的
+     *          wakeAllBlocked() 现在是空操作，真正让泵醒来发现退出标志的是本函数
+     *          里的 deadline_timer_ 保险丝（详见 fiberscheduler.cpp 两处注释）。
+     *          注意这个上界没有封顶：setMaxEventBlockMs() 只夹低端（非正值夹到 1），
+     *          调大多少，关机就可能慢多少。
      *          急需更低跨线程延迟的场景可用 Coro::setMaxEventBlockMs() 调小；
      *          注意实测中墙钟反而比旧泵更快，那是因为压力下线程几乎不进 poll()，
      *          是本基准的性质，不是普遍保证。

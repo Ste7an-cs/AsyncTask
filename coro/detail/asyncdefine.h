@@ -39,9 +39,16 @@ void sleep(unsigned long secs);
 
 /**
  * @brief 设置事件阻塞的安全上限（毫秒）
- * @details 这**不是**事件分发间隔 —— 本线程自己的事件与协程都是按需唤醒的，
- *          fd 一就绪 poll() 立刻返回，没有间隔可言。默认 10ms，传入非正值夹到 1。
- * @warning 它是**跨线程拾取延迟的实际上界**，而不只是一道保险丝：事件泵有意
+ * @details 这**不是**事件分发间隔 —— 在跑 QtFiberScheduler 事件泵的工作线程上，
+ *          事件与协程都是按需唤醒的，fd 一就绪 poll() 立刻返回，没有间隔可言。
+ *          默认 10ms，传入非正值夹到 1。
+ *          **注意这只说工作线程。** 主线程进入 Coro::exec() 后泵是停掉的
+ *          （fiberapplication.cpp 中的 stopCurrentThreadPump()），分发改走
+ *          aboutToBlock 钩子里的 Coro::msleep(kFiberSliceMs)，那条路上确实有
+ *          ~1ms 的节奏，且本旋钮对它**完全无效**。
+ * @warning 它是**新投递的 Shared / Sticky 协程的跨线程拾取上界**，而不只是一道
+ *          保险丝（已归属本线程的协程走 boost 的 remote_ready_queue_ + notify()，
+ *          会被立即唤醒，不受本上限影响）：事件泵有意
  *          不参与跨线程唤醒广播（原委见 QtFiberScheduler::pumpLoop() 的注释，
  *          那条路实测会把 CPU 打到 10 倍），所以一个已经睡在 poll() 里的工作
  *          线程**不会**被远端投递的 Shared 协程叫醒，要睡满本上限才自醒。

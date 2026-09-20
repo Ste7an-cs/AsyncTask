@@ -898,20 +898,10 @@ void Coro::QtFiberScheduler::pumpLoop(void)
         const auto tp = parkUntilIdle();                  // 交出线程，等交棒
         if(stopping()) break;
 
-        /// @details 顺序不可颠倒：必须**先**计数、**后**复查就绪队列。若反过来，
-        /// 复查到入队之间有个窗口 —— 别的线程此刻投递协程并调 wakeAllBlocked()，
-        /// 采样到 s_blocked_count_ 为 0 便跳过广播，这次唤醒就丢了，只能靠
-        /// maxEventBlockMs 兜底（症状是偶尔慢 10ms，极难定位）。先计数则该窗口内
-        /// 的广播一定会打到我们身上：Qt 的 wakeUp() 是粘性的，随后的 poll() 立即返回。
-        FiberScheduler::enterBlocked();
-
         /// @details 交棒之后、本协程真正被调度之前，可能又有协程被远端投递进来。
         /// 此时不能再去睡，否则手上有活却阻塞在 poll() 里。
         /// **不可用 has_ready_fibers()** —— 见下方警告。
-        if(hasReadyWork() || stopping()){
-            FiberScheduler::leaveBlocked();
-            continue;
-        }
+        if(hasReadyWork() || stopping()) continue;
 
         const auto now = std::chrono::steady_clock::now();
         long long ms = 0;
@@ -919,14 +909,10 @@ void Coro::QtFiberScheduler::pumpLoop(void)
             ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
         }
         ms = std::min<long long>(ms, Coro::maxEventBlockMs());
-        if(ms <= 0){
-            FiberScheduler::leaveBlocked();
-            continue;
-        }
+        if(ms <= 0) continue;
 
         deadline_timer_.start(static_cast<int>(ms));
         eventloop.processEvents(QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents);
-        FiberScheduler::leaveBlocked();
         deadline_timer_.stop();
     }
 }
@@ -934,8 +920,41 @@ void Coro::QtFiberScheduler::pumpLoop(void)
 
 顶部若缺 `#include <algorithm>` 则补上。
 
-**每一条 `continue` 路径都必须配对 `leaveBlocked()`** —— 漏掉一条，计数就会单调上涨，
-`wakeAllBlocked()` 的限流闸从此永远打开，退化成无条件惊群广播。
+### 为什么泵不参与跨线程唤醒广播（实测，用户裁定）
+
+**⚠️ 本步骤原稿要求泵调用 `enterBlocked()` / `leaveBlocked()` 参与广播，实施时实测
+否决。** 泵一旦进入登记表，`wakeAllBlocked()` 就从惰性变为活跃，`testProfile` 实测：
+
+| 配置 | 墙钟 | CPU | 结果 |
+|---|---|---|---|
+| 基线（旧泵） | 209.8s | 266.5s | PASS |
+| 泵参与广播，广播给所有线程 | 323.2s | 1804.7s | FAIL（300s 超时） |
+| 泵参与广播 + 只戳真正阻塞的线程 | 324.9s | 1371.7s | FAIL |
+| **泵不参与广播（实际交付）** | **112.0s** | **119.8s** | **PASS** |
+
+根因是这条路**电平触发**：每有一个协程入队就广播一次，而被戳醒的线程里只有 25.8%
+真能找到活，其余 74.2% 醒来空跑一轮再睡回去。把 `maxEventBlockMs` 调到 1ms 当替代也
+不行（CPU 371.0s，比旧泵还差）。满载时保险丝在一百万次阻塞中只响 2 次 —— 广播承担了
+100% 的唤醒，所以这不是"保险丝调一调"能解决的。
+
+**代价**（已写进 `pumpLoop()` 的 Doxygen）：睡在 `poll()` 里的工作线程不会被远端投递的
+Shared 协程叫醒，要睡满 `maxEventBlockMs`；关机与"停某一线程的泵"同样被推迟至多这么久。
+`signalExit()` / `stopCurrentThreadPump()` 里的 `wakeAllBlocked()` 目前是空操作，真正
+让泵醒来的是 `deadline_timer_`。
+
+**正确解法（边沿触发 / wake-one / 限流闸）是另一个任务的题目**，证据已备齐于
+`.superpowers/sdd/task-4-report.md` 的「后续任务」一节。此处不留开关、不留注释掉的分支
+—— 死代码会烂。
+
+**但下面这条顺序约束必须留存**，它在计划里被搞错过一次，后续任务重新接入广播时仍然适用
+（同样写进了 `pumpLoop()` 的 Doxygen）：
+
+> `enterBlocked()` 必须排在 `hasReadyWork()` 复查**之前**，且每一条出口（复查命中、
+> `ms<=0`、poll 返回、`break`）都要配对 `leaveBlocked()`。
+>
+> 先复查后计数会开一个丢唤醒的窗口：复查与入队之间别的线程投递协程并广播，采样到计数
+> 为 0 便跳过，这次唤醒就丢了，只能等保险丝（症状是偶发慢 10ms，极难定位）。而漏掉一次
+> 减计数更糟 —— 计数永久 >0，限流闸从此形同虚设，每次广播都变成 N 个线程的惊群。
 
 ### 为什么不能用 `has_ready_fibers()`（实测）
 

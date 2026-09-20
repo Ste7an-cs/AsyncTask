@@ -37,7 +37,12 @@ FiberScheduler::~FiberScheduler()
 void FiberScheduler::signalExit(void)
 {
     s_exit_.store(true, std::memory_order_release);
-    wakeAllBlocked();   ///< 否则各线程会一直睡在 poll() 里，关机挂死
+    /// @details 泵有意不参与广播（见 QtFiberScheduler::pumpLoop() 的注释），
+    /// blockedCount() 恒为 0，这一行目前在本文件 :94 的第一道闸直接返回，是
+    /// 空操作。真正防止关机挂死的是 qtfiberscheduler.cpp:240 的 deadline_timer_
+    /// 保险丝——泵至多阻塞 maxEventBlockMs 就会自行醒来发现退出标志。等后续
+    /// 任务让泵重新参与广播后，这一行才会恢复其唤醒作用。
+    wakeAllBlocked();
 }
 
 /**
@@ -47,6 +52,12 @@ void FiberScheduler::stopCurrentThreadPump(void)
 {
     t_stop_.store(true, std::memory_order_release);
     void (*unpark)(void) = local_unpark_hook_.load(std::memory_order_acquire);
+    /// @details unpark() 只在泵挂在 parkUntilIdle() 上时才有用；一旦交棒完成，
+    /// parked_ 已被 qtfiberscheduler.cpp:180 的 suspend_until 清掉，此刻泵若正
+    /// 阻塞在 poll() 里，unpark() 就戳不到它。wakeAllBlocked() 同样是空操作，
+    /// 理由见 signalExit() 的注释。于是「停某一个线程的泵」目前没有立即生效的
+    /// 手段，只能等它自己在下一次 poll() 超时（至多 maxEventBlockMs）后发现
+    /// t_stop_ 已置位再退出。
     if(unpark != nullptr) unpark();                ///< 放出挂在 park 上的泵协程
     wakeAllBlocked();
 }
