@@ -141,6 +141,9 @@ std::chrono::steady_clock::time_point Coro::QtFiberScheduler::parkUntilIdle(void
     boost::fibers::context* ctx = boost::fibers::context::active();
     self->qt_waker_ = ctx->create_waker();
     self->next_deadline_ = std::chrono::steady_clock::now();
+    /// @details 记下挂起起点，供 releaseParkedIfOverdue() 判断持有者是否被扣留过久。
+    /// 必须在置 parked_ 之前写：置位之后本线程的 pick_next() 随时可能读它。
+    self->park_started_ = self->next_deadline_;
     self->parked_.store(true, std::memory_order_release);
     /// @details store 与 suspend 之间没有让出点（同线程、无抢占），而 suspend_until
     /// 只在本协程挂起之后才拿得到控制权，故不会丢唤醒。
@@ -160,6 +163,35 @@ void Coro::QtFiberScheduler::unparkLocal(void)
     if(self->parked_.exchange(false, std::memory_order_acq_rel)){
         self->next_deadline_ = std::chrono::steady_clock::now();
         self->qt_waker_.wake();
+    }
+}
+
+/**
+ * @brief 饥饿守卫：Qt 持有者被扣留超过 kMaxParkMs 就地放人
+ */
+void Coro::QtFiberScheduler::releaseParkedIfOverdue(void) noexcept
+{
+    /// @details 没有挂起中的持有者时到此为止，一次原子读的代价。持有者挂着时
+    /// 每次取协程多读一次单调钟（vDSO，约 20ns），相对 pick_next() 本身那把
+    /// 全局锁加四次队列探查是噪声量级。
+    if(!parked_.load(std::memory_order_acquire)){
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if(now - park_started_ < std::chrono::milliseconds(kMaxParkMs)){
+        return;
+    }
+    /// @details 与 unparkLocal() 同样的放人动作，但直接作用在 this 上：同一线程
+    /// 先后装两次调度器时 t_self_ 指向的是新实例，而扣留着持有者的是旧实例。
+    if(parked_.exchange(false, std::memory_order_acq_rel)){
+        next_deadline_ = now;           ///< 交回 now()：让持有者立刻回去分发，别再睡
+        /// @details wake() 只是把持有者协程排回就绪队列（同线程，走
+        /// context::active()->schedule() → awakened()），不切栈、不重入 pick_next()。
+        /// 因此**必须在 pick_next() 取全局锁之前调用**：awakened() 自己要拿
+        /// global_mtx，那是把非递归的 std::mutex。排好之后本轮 pick_next() 紧接着
+        /// 就会取到它 —— 持有者是 Fixed(本线程)，两份 pick_next() 都把它排在
+        /// Shared 之前，所以积压再深也插得进来。
+        qt_waker_.wake();
     }
 }
 

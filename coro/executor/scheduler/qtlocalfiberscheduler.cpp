@@ -24,6 +24,12 @@ Coro::QtLocalFiberScheduler::~QtLocalFiberScheduler()
  */
 boost::fibers::context *Coro::QtLocalFiberScheduler::pick_next() noexcept
 {
+    /// @details 饥饿守卫，必须排在取全局锁之前（它内部会走 awakened()，那里要拿
+    /// 同一把 global_mtx）。放在这里是因为**本函数是积压期间唯一还在跑的框架代码**：
+    /// 线程不空闲 → suspend_until() 不回调 → 挂起的 Qt 持有者无人唤醒。原委与
+    /// 「为什么不能写成一个睡 100ms 的守卫协程」见 QtFiberScheduler 头文件。
+    releaseParkedIfOverdue();
+
     boost::fibers::context *ctx{nullptr};
     // 先从当前调度器的fixed_queue_中，取出一个fixed模式且未分配的Fiber
     do{

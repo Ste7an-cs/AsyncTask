@@ -80,6 +80,12 @@ public:
     static void unparkLocal(void);
 
     /**
+     * @brief Qt 持有者被扣留的上限（毫秒）：饥饿守卫的周期
+     * @details 见 releaseParkedIfOverdue() 的长注释。
+     */
+    static constexpr int kMaxParkMs = 100;
+
+    /**
      * @brief 与本线程的事件分发器解绑（线程收尾时经基类钩子调用）
      * @details 注入 FiberScheduler::local_detach_hook_，由
      *          FiberThreadBlock::wait() 在停泵并让出之后调用。靠 thread_local
@@ -138,6 +144,51 @@ protected:
     void pumpLoop(void);
 
     /**
+     * @brief 饥饿守卫：Qt 持有者被扣留超过 kMaxParkMs 就地放人
+     *
+     * @details 由本线程调度器的 pick_next() 在每次取协程之前调用。
+     *          parkUntilIdle() 的交棒是**按需**的：只有调度器无就绪协程、
+     *          boost.fiber 回调 suspend_until() 时，挂起的 Qt 持有者才会被唤醒。
+     *          代价是这个唤醒条件依赖「线程变空闲」，而主线程的 pick_next() 会去
+     *          全局队列里偷 Shared 协程 —— 只要还有协程排队，主线程就永远不空闲，
+     *          Qt 一个事件都不分发。GUI 表现为窗口不重绘、点不动、关不掉，且时长
+     *          没有上界。本函数给这个「按需」加一条下限：**持有者最多被扣留
+     *          kMaxParkMs（100ms）**。
+     *
+     * @details 买到什么、付出什么，两边都要说清楚：<br>
+     *          - 买到：持续积压下 Qt 最坏 100ms 才轮到一次，肉眼可见的卡顿，
+     *            但输入、重绘、关窗都还活着，不是冻死。<br>
+     *          - 付出：**只是一道保险丝**。正常路径分毫未动 —— 线程一空闲
+     *            suspend_until() 仍然立刻交棒，fd 就绪仍然让 poll() 立刻返回，
+     *            Task 5 的时延收益（testlatency 每样本 p50 2112us→150us）不受影响。<br>
+     *          - 空闲唤醒频率不变：空闲时 pick_next() 取不到协程，boost.fiber 立刻
+     *            回调 suspend_until()，持有者在那里就被交棒放走了，本函数的 100ms
+     *            根本轮不到到期。空闲阻塞上限仍由 Coro::maxEventBlockMs() 管，
+     *            本函数一次都不会把它缩短。
+     *
+     * @warning 为什么**不能**写成「一个睡 100ms 的常驻守卫协程」——这是实测结论，
+     *          别再走回头路：`Coro::msleep()` 把协程挂进 boost 的 sleep_queue_，
+     *          而它只由 scheduler::dispatch() 里的 sleep2ready_() 搬回就绪态；
+     *          dispatch() 跑在 dispatcher context 上，那是个 pinned context，被
+     *          awakened() 放进 main_queue_，而两份 pick_next() 都把 main_queue_
+     *          排在全局队列**之后**。于是积压期间 dispatcher context 本身就被饿死，
+     *          没有任何睡着的协程会醒来。实测（testquit 的 starve 档）：主线程
+     *          Fixed 协程 msleep(200) 实际睡了 1497ms —— 正好是整个积压窗口。
+     *          同理，跨线程唤醒（remote_ready_queue_）也要 dispatcher 才搬得动，
+     *          所以守卫也不能靠别的线程把它叫醒。能不被饿死的只有两条：本线程
+     *          pick_next() 里同步做掉（即本函数），或由别的线程新建一个
+     *          Fixed(本线程) 协程投进全局队列。取前者：不多一条线程、不多一份
+     *          收尾逻辑，也就没有「守卫协程拖住 ~scheduler」的风险。
+     *
+     * @note 覆盖面：本函数由 QtLocalFiberScheduler::pick_next() 调用，覆盖主线程
+     *       与 QtFiberThread。线程池工作线程装的是 QtFiberScheduler，走基类
+     *       pick_next()，**不在覆盖范围内** —— 它们的事件泵同样会被积压饿死，
+     *       只是那里没有窗口可冻。要一并覆盖就得把钩子塞进基类的热路径，代价是
+     *       17 条线程每次取协程都多读一次表，故本次不做。
+     */
+    void releaseParkedIfOverdue(void) noexcept;
+
+    /**
      * @brief 戳醒本线程的 Qt 事件分发器（可跨线程调用）
      * @details 全程持 disp_mtx_：这把锁把「读 disp_ + 调 wakeUp()」和
      *          detachDispatcher() 里的「置空 disp_」串成互斥的两段，否则分发器
@@ -155,6 +206,7 @@ protected:
     boost::fibers::waker  qt_waker_{};            ///< 挂起中的 Qt 持有者协程
     std::atomic_bool      parked_{ false };       ///< Qt 持有者是否正挂起
     std::chrono::steady_clock::time_point next_deadline_{};///< 交棒过来的截止时刻
+    std::chrono::steady_clock::time_point park_started_{};///< 本次挂起的起点（饥饿守卫计时用）
     std::mutex            disp_mtx_{};            ///< 串行化 disp_ 的取用与失效
     QAbstractEventDispatcher* disp_{ nullptr };   ///< 本线程的事件分发器（disp_mtx_ 保护）
     QMetaObject::Connection disp_conn_{};         ///< disp_ 的 destroyed 连接（仅本线程用）
