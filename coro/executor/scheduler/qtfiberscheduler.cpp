@@ -144,6 +144,10 @@ std::chrono::steady_clock::time_point Coro::QtFiberScheduler::parkUntilIdle(void
     /// @details 记下挂起起点，供 releaseParkedIfOverdue() 判断持有者是否被扣留过久。
     /// 必须在置 parked_ 之前写：置位之后本线程的 pick_next() 随时可能读它。
     self->park_started_ = self->next_deadline_;
+    /// @details 记下即将挂起的 context 本身，供 releaseParkedIfOverdue() 识别
+    /// TOCTOU 窗口：boost::fibers::scheduler::suspend() 调 pick_next() 发生在
+    /// ctx->suspend() 内部、栈切换之前，此刻 context::active() 仍是 ctx。
+    self->parking_ctx_ = ctx;
     self->parked_.store(true, std::memory_order_release);
     /// @details store 与 suspend 之间没有让出点（同线程、无抢占），而 suspend_until
     /// 只在本协程挂起之后才拿得到控制权，故不会丢唤醒。
@@ -162,7 +166,13 @@ void Coro::QtFiberScheduler::unparkLocal(void)
     }
     if(self->parked_.exchange(false, std::memory_order_acq_rel)){
         self->next_deadline_ = std::chrono::steady_clock::now();
-        self->qt_waker_.wake();
+        /// @details epoch 只由 parked 的那个 context 自己的 create_waker() 作废，
+        /// 而它此刻挂在 suspend() 里跑不动，理论上不可能返回 false；万一断言假设
+        /// 被打破，wake() 悄悄丢了就是一次没有任何提示的永久挂死，所以自检一下。
+        if(!self->qt_waker_.wake()){
+            qWarning("QtFiberScheduler::unparkLocal: wake() 返回 false，"
+                     "持有者可能未被唤醒（epoch 已过期，不应发生）。");
+        }
     }
 }
 
@@ -181,17 +191,42 @@ void Coro::QtFiberScheduler::releaseParkedIfOverdue(void) noexcept
     if(now - park_started_ < std::chrono::milliseconds(kMaxParkMs)){
         return;
     }
+    /// @details TOCTOU 防护：boost::fibers::scheduler::suspend() 是这样实现的
+    /// ——`algo_->pick_next()->resume()`——pick_next() 在挂起协程自己的栈上、
+    /// **栈切换之前**执行，此刻 context::active() 还是那个即将挂起的协程本身
+    /// （parkUntilIdle() 里 ctx->suspend() 触发的正是这一次 pick_next()）。若这
+    /// 一刻恰好判定 overdue，wake() 会作用在一个还没真正让出、仍是 active 的
+    /// context 上：唤醒把它排回就绪队列后，本轮 pick_next() 剩余逻辑可能把它
+    /// 原样取出并对它调用 resume()——也就是对自身 resume()，undefined
+    /// behavior。parking_ctx_ 记录的正是这个 context：等于当前 active() 就说明
+    /// 挂起还没走完，本轮先不放人；下一次 pick_next()（那时早已切到别的栈）
+    /// 再次读到同一个 park_started_，立刻会重新判定 overdue 并成功放人，
+    /// 不会因为跳过这一次而多等一整个 kMaxParkMs。
+    if(parking_ctx_ == boost::fibers::context::active()){
+        return;
+    }
     /// @details 与 unparkLocal() 同样的放人动作，但直接作用在 this 上：同一线程
-    /// 先后装两次调度器时 t_self_ 指向的是新实例，而扣留着持有者的是旧实例。
+    /// 先后装两次调度器时 t_self_ 指向的是新实例，而扣留着持有者的是旧实例——
+    /// 不过这个场景实际不会发生：use_scheduling_algorithm 换算法之后，boost.fiber
+    /// 只回调新实例的 pick_next()，旧实例的这份守卫从此再也不会被调用。这里坚持
+    /// 用 this 而非 t_self_，单纯是因为本函数本就是 this 的成员，没有理由多绕
+    /// 一次 thread_local 查找。
     if(parked_.exchange(false, std::memory_order_acq_rel)){
         next_deadline_ = now;           ///< 交回 now()：让持有者立刻回去分发，别再睡
         /// @details wake() 只是把持有者协程排回就绪队列（同线程，走
         /// context::active()->schedule() → awakened()），不切栈、不重入 pick_next()。
         /// 因此**必须在 pick_next() 取全局锁之前调用**：awakened() 自己要拿
-        /// global_mtx，那是把非递归的 std::mutex。排好之后本轮 pick_next() 紧接着
-        /// 就会取到它 —— 持有者是 Fixed(本线程)，两份 pick_next() 都把它排在
-        /// Shared 之前，所以积压再深也插得进来。
-        qt_waker_.wake();
+        /// global_mtx，那是把非递归的 std::mutex。排好之后持有者只是回到了
+        /// Fixed(本线程) 这一桶里排队——它是 Priority::Normal，桶内按优先级
+        /// 降序排列（std::set<MetaContext, std::greater<MetaContext>>，见
+        /// fibertaskqueue.h），排在它前面的只有更高优先级的 Fixed(本线程) 协程；
+        /// 没有更高优先级的东西在排队时，才会紧接着这轮或下一轮 pick_next()
+        /// 就被取到——kMaxParkMs 这条上界管的是「被扣留多久」，不是「多久之后
+        /// 一定跑起来」。
+        if(!qt_waker_.wake()){
+            qWarning("QtFiberScheduler::releaseParkedIfOverdue: wake() 返回 false，"
+                     "饥饿守卫可能没能唤醒持有者（epoch 已过期，不应发生）。");
+        }
     }
 }
 
@@ -211,7 +246,12 @@ void Coro::QtFiberScheduler::suspend_until(const std::chrono::steady_clock::time
     /// 上 —— 那里执行 Qt 槽才是合法的；本回调跑在 dispatcher context，切栈会崩。
     if(parked_.exchange(false, std::memory_order_acq_rel)){
         next_deadline_ = time_point;
-        qt_waker_.wake();       // 只入队，不切栈
+        /// @details 同 releaseParkedIfOverdue()：wake() 返回 false 意味着 epoch
+        /// 已过期，parked_ 却已经被这里清掉——持有者会永久等不到唤醒，必须自检。
+        if(!qt_waker_.wake()){          // 只入队，不切栈
+            qWarning("QtFiberScheduler::suspend_until: wake() 返回 false，"
+                     "持有者可能没能被唤醒（epoch 已过期，不应发生）。");
+        }
         return;
     }
 

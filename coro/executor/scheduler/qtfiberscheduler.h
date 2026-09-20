@@ -156,8 +156,14 @@ protected:
      *          kMaxParkMs（100ms）**。
      *
      * @details 买到什么、付出什么，两边都要说清楚：<br>
-     *          - 买到：持续积压下 Qt 最坏 100ms 才轮到一次，肉眼可见的卡顿，
-     *            但输入、重绘、关窗都还活着，不是冻死。<br>
+     *          - 买到：**上界是 park 被扣留的时长**，不是端到端的分发间隔——
+     *            持有者最多被扣留 100ms 就会被本函数放回就绪队列，但它是
+     *            Priority::Normal 的 Fixed(本线程)，真正轮到它执行还要排在
+     *            同一优先级桶内更靠前的项之后、等 Priority::High 的
+     *            Fixed(本线程) 协程排空（fibertaskqueue.h 里的桶是按优先级降序
+     *            取的 std::set，不是 FIFO）。实测 104～106ms 只是因为
+     *            当时没有更高优先级的协程与它竞争这一桶，不能当成保证。持续积压下
+     *            肉眼可见的卡顿，但输入、重绘、关窗都还活着，不是冻死。<br>
      *          - 付出：**只是一道保险丝**。正常路径分毫未动 —— 线程一空闲
      *            suspend_until() 仍然立刻交棒，fd 就绪仍然让 poll() 立刻返回，
      *            Task 5 的时延收益（testlatency 每样本 p50 2112us→150us）不受影响。<br>
@@ -207,6 +213,15 @@ protected:
     std::atomic_bool      parked_{ false };       ///< Qt 持有者是否正挂起
     std::chrono::steady_clock::time_point next_deadline_{};///< 交棒过来的截止时刻
     std::chrono::steady_clock::time_point park_started_{};///< 本次挂起的起点（饥饿守卫计时用）
+    /**
+     * @brief 正在挂起中的持有者 context（饥饿守卫的 TOCTOU 防护用）
+     * @details boost::fibers::scheduler::suspend() 对 pick_next() 的调用发生在
+     *          挂起协程自己的栈上、**栈切换之前**——那一刻 context::active() 还是
+     *          这个即将挂起的协程本身。releaseParkedIfOverdue() 据此判断：若
+     *          parking_ctx_ 等于当前 active()，说明挂起尚未真正完成，本轮先不
+     *          放人，交给下一次 pick_next() 判断（届时已经切到别的栈）。
+     */
+    boost::fibers::context* parking_ctx_{ nullptr };
     std::mutex            disp_mtx_{};            ///< 串行化 disp_ 的取用与失效
     QAbstractEventDispatcher* disp_{ nullptr };   ///< 本线程的事件分发器（disp_mtx_ 保护）
     QMetaObject::Connection disp_conn_{};         ///< disp_ 的 destroyed 连接（仅本线程用）
