@@ -45,9 +45,14 @@ void sleep(unsigned long secs);
  *          主线程同理：进入 Coro::exec() 后泵是停掉的（fiberapplication.cpp
  *          中的 stopCurrentThreadPump()），阻塞上限改由 aboutToBlock 钩子按同
  *          一条规则算出，本旋钮对它**同样生效**。
- * @warning 它是**新投递的 Shared / Sticky 协程的跨线程拾取上界**，而不只是一道
- *          保险丝（已归属本线程的协程走 boost 的 remote_ready_queue_ + notify()，
- *          会被立即唤醒，不受本上限影响）：事件泵有意
+ * @warning 它是**跨线程新投递协程的拾取上界**，而不只是一道保险丝。适用范围是
+ *          新进全局队列的 Shared / Sticky **以及 Fixed(他线程)** —— 最后一种尤其
+ *          要留意：`makeTask(fn, ..., Affinity::fixed(gui线程id))` 正是本框架
+ *          文档规定的「在工作线程里碰控件」的唯一正确写法（见 example/gui_quit），
+ *          而 Fixed 协程只有那一个线程能跑，没有第二个线程可以替它捡起来。
+ *          于是这条 10ms 落在用户可见的 GUI 路径上，且不可被工作窃取摊薄。
+ *          （已归属本线程的协程走 boost 的 remote_ready_queue_ + notify()，
+ *          会被立即唤醒，不受本上限影响。）事件泵有意
  *          不参与跨线程唤醒广播（原委见 QtFiberScheduler::pumpLoop() 的注释，
  *          那条路实测会把 CPU 打到 10 倍），所以一个已经睡在 poll() 里的工作
  *          线程**不会**被远端投递的 Shared 协程叫醒，要睡满本上限才自醒。
