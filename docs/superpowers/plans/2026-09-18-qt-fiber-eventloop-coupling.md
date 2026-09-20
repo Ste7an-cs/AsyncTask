@@ -1120,23 +1120,30 @@ git commit -m "feat: 工作线程事件泵改为按需阻塞，去掉 1ms 固定
  * 多久就跑多久，跑完 Qt 才阻塞，且 fd 就绪即刻返回。
 ```
 
-- [ ] **Step 3: 阻塞计数**
+- [ ] **Step 3: ~~阻塞计数~~ —— 本步骤已取消，不要实现**
 
-`aboutToBlock` 返回后 Qt 才真正 poll，钩子内部没法包住阻塞区间。改用 `awake` 信号配对。在 `exec()` 里 `block_conn_` 之后再连一个：
+**⚠️ 原稿要求主线程用 `aboutToBlock` / `awake` 信号配对调用 `enterBlocked()` /
+`leaveBlocked()`，把主线程也纳入唤醒广播的限流统计。该步骤在 Task 4 实施后作废。**
 
-```cpp
-    // aboutToBlock 之后 Qt 才真正 poll，awake 则在 poll 返回后发出。
-    // 用这一对信号把「本线程睡在 poll 里」的区间标出来，供唤醒广播限流。
-    awake_conn_ = QObject::connect(disp, &QAbstractEventDispatcher::awake, this, []{
-        Coro::FiberScheduler::leaveBlocked();
-    });
-```
+Task 4 实测否决了「泵参与广播」这条路（电平触发，74.2% 的唤醒空跑，`testProfile`
+CPU 从 119.8s 飙到 1371.7s），用户裁定：**先发泵改写，唤醒策略整体推给后续任务。**
+工作线程的泵因此不调 `enterBlocked()`，`blockedCount()` 恒为 0，`wakeAllBlocked()`
+在第一道闸即返回，整张登记表处于休眠态。
 
-并在上一 Step 的 `aboutToBlock` lambda 末尾（设完定时器之后）加 `Coro::FiberScheduler::enterBlocked();`。
+若此处单独把主线程接进去，`blockedCount()` 就不再恒为 0，广播会部分复活 ——
+等于把已经整体推迟的策略又零敲碎打做一半，而且做的是唯一一个**不**受益于它的线程
+（主线程的 socket 就在本线程，其唤醒走 boost 的 `remote_ready_queue_` + `notify()`，
+根本不经广播）。
 
-`fiberapplication.h` 加成员 `QMetaObject::Connection awake_conn_;///< awake 钩子，收尾时断开`，`shutdown()` 里 `QObject::disconnect(block_conn_);` 之后加 `QObject::disconnect(awake_conn_);`。
+所以本步骤整体取消。主线程同样不参与广播，与工作线程保持一致。
 
-> 注意：Qt 的 `awake` 在 `processEvents` 开头也会发出（不止 poll 返回后），因此计数可能短暂为负。`wakeAllBlocked()` 用 `<= 0` 判断，负值只会让广播被跳过一次，不影响正确性 —— 有 `maxEventBlockMs` 兜底。若实现中发现计数漂移影响判断，改为在 `enterBlocked()` 前先检查是否已计数（用一个 `thread_local bool`）。
+顺带作废的还有原稿那条注脚 —— 它承认 Qt 的 `awake` 在 `processEvents` 开头也会发出、
+计数可能漂移为负，却辩称「负值只会让广播被跳过一次，不影响正确性」。该辩解本身也站
+不住：计数长期为负会让限流闸**永久关闭**，广播再不发出。既然整个步骤取消，这个坑一并
+消失，但记在这里以免后续任务重新捡起同一种配对方式。
+
+**后续任务接手时**：主线程要不要参与、用什么信号配对，连同边沿触发 / wake-one 一起
+设计，证据见 `.superpowers/sdd/task-4-report.md` 的「后续任务」一节。
 
 - [ ] **Step 4: 跑时延测试，确认断言通过**
 
