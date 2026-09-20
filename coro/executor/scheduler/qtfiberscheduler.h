@@ -15,10 +15,17 @@ namespace Coro {
 /**
  * @brief 支持 Qt 事件循环的调度器。
  *
- * suspend_until 委托基类阻塞（cv 等待，不空转）。首次 suspend_until 用
- * std::call_once 创建一个绑定当前线程的常驻“事件协程”持续分发 Qt 事件。
- * 退出流程：Coro::quit() 调 signalExit() 设全局退出标志，各线程的泵协程醒
- * 来后自行退出，从而 ~scheduler 无需等待无限协程即可干净析构。
+ * 首次 suspend_until 用 std::call_once 创建一个绑定当前线程的常驻“事件泵协程”。
+ * 泵协程排空 Qt 事件后调 parkUntilIdle() 交出线程；调度器无就绪协程时通过
+ * suspend_until 把最近的协程截止时刻交棒回来，泵据此阻塞在 Qt 的 poll() 上。
+ * 没有固定分发间隔：fd 就绪即刻返回，空闲时线程真正休眠。
+ *
+ * 本泵有意不参与跨线程唤醒广播（原委与代价见 pumpLoop() 的 @warning）：
+ * Coro::maxEventBlockMs()（默认 10ms）既是新协程投递到本线程的拾取延迟上界，
+ * 也是退出流程的兜底 —— Coro::quit() 只设全局退出标志，真正让睡着的泵醒来发现
+ * 该标志的是 pumpLoop() 里的 deadline_timer_ 这道保险丝，而不是唤醒广播。
+ *
+ * Qt 槽运行在泵协程的栈上，因此槽内可以 Coro::await()。
  * @code
  * // 工作线程上安装本调度器：既能调度协程，也能分发 Qt 事件
  * // （因此 QTimer / socket 等 Qt 对象在工作线程上也可正常工作）
