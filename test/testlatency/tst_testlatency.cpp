@@ -118,7 +118,8 @@ void test_latency::test_case_loopback_rtt()
     QCOMPARE(completed.load(), kSamples);
     const double minUs = minNs.load() / 1000.0;
     qInfo() << "loopback RTT min =" << minUs << "us over" << kSamples << "samples";
-    // 修复前约 3128us。阈值 1000us 宽松到不会被普通抖动触发，
+    // 修复前本机实测 2051-2080us（issue #6 记录的 3128us 来自跨进程口径，
+    // 本用例是单进程双端，不可直接比）。阈值 1000us 宽松到不会被普通抖动触发，
     // 又足以在「固定分发间隔」回归时立刻报警。
     QVERIFY2(minUs < 1000.0,
              qPrintable(QString("往返 min = %1 us，超过 1000 us 的地板阈值")
