@@ -41,10 +41,14 @@ public:
     int exec();
     /**
      * @brief 安全退出：广播 aboutToQuit → 排空在途协程与事件 → 停线程池 → 退出
+     *
+     * 可在任意线程调用：非主线程调用时自动投递回主线程执行，收尾语义一致。
      * @code
-     * // 等价于自由函数 Coro::quit()；可在任意协程或槽中调用
+     * // 等价于自由函数 Coro::quit()；可在任意协程、槽或线程中调用
      * Coro::FiberApplication::instance()->quit();
      * @endcode
+     * @warning 不可在 POSIX 信号处理函数中调用（非 async-signal-safe，会在
+     *          调度器上下文中切栈而崩溃）；见 example/signal_quit。
      */
     void quit();
 protected:
@@ -71,6 +75,8 @@ void installFiberApplication();
 int exec();
 /**
  * @brief 触发安全退出（等价于 FiberApplication::quit）
+ *
+ * 线程安全：在工作线程或任意非主线程调用时会自动投递回主线程执行。
  * @code
  * Coro::makeTask([job]{
  *     job.get();          // 先等其它任务完成（让出式）
@@ -78,6 +84,7 @@ int exec();
  *     return 0;
  * });
  * @endcode
+ * @warning 不可在 POSIX 信号处理函数中调用；正确做法见 example/signal_quit。
  */
 void quit();
 

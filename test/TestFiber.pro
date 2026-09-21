@@ -5,4 +5,5 @@ SUBDIRS += \
     test_scheduler/testscheduler.pro \
     testexecutor \
     testfiberawait \
-    testfibertask
+    testfibertask \
+    testquit
