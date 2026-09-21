@@ -17,7 +17,18 @@ namespace Coro {
  * @endcode
  *
  * 在主线程安装本地调度器并启动工作线程池；exec() 让主线程留在协程调度器中，
- * quit() 走安全退出流程。
+ * 同时把 Qt 主循环跑在一个绑定主线程的协程上，quit() 走安全退出流程。
+ *
+ * GUI 程序同样适用：窗口关闭、qApp->quit() 与 Coro::quit() 汇合到同一条退出
+ * 路径，无需特殊处理。
+ * @code
+ * int main(int argc, char* argv[]) {
+ *     QApplication app(argc, argv);
+ *     Coro::installFiberApplication();
+ *     MainWindow w; w.show();
+ *     return Coro::exec();                 // 关闭窗口即正常退出
+ * }
+ * @endcode
  */
 class FiberApplication : QObject{
     Q_OBJECT
@@ -31,18 +42,21 @@ public:
      */
     static FiberApplication* instance();
     /**
-     * @brief 主循环：主线程挂起于协程调度器（协程与 Qt 事件都能推进）
+     * @brief 主循环：主线程挂起于协程调度器，Qt 主循环跑在绑定主线程的协程上
      * @code
-     * // 等价于自由函数 Coro::exec()；与 QCoreApplication::exec() 互斥
+     * // 等价于自由函数 Coro::exec()；内部会进入 QCoreApplication::exec()，
+     * // 因此不要再自行调用 app.exec()
      * return Coro::FiberApplication::instance()->exec();
      * @endcode
-     * @return 退出码
+     * @return 退出码（QCoreApplication::exec() 的返回值）
      */
     int exec();
     /**
-     * @brief 安全退出：广播 aboutToQuit → 排空在途协程与事件 → 停线程池 → 退出
+     * @brief 安全退出：退出 Qt 主循环，收尾由 exec() 返回后的 shutdown() 承担
      *
      * 可在任意线程调用：非主线程调用时自动投递回主线程执行，收尾语义一致。
+     * 未调用过 Coro::exec() 时（如 QTest 驱动）退化为就地收尾并代发
+     * aboutToQuit。重复调用是幂等的。
      * @code
      * // 等价于自由函数 Coro::quit()；可在任意协程、槽或线程中调用
      * Coro::FiberApplication::instance()->quit();
@@ -54,7 +68,24 @@ public:
 protected:
     /** @brief 构造：主线程安装本地调度器并启动线程池 */
     FiberApplication();
+    /**
+     * @brief 收尾：停各线程泵 → 排空在途协程与事件 → 停线程池 → 解除主线程阻塞
+     *
+     * 运行在 qt-loop 协程上，由 QCoreApplication::exec() 返回后调用；此时 Qt
+     * 已自行 emit aboutToQuit 并冲刷过 DeferredDelete。
+     */
+    void shutdown();
+
     Coro::FiberThreadBlock block;///< 阻止主线程退出的阻塞基元
+    QMetaObject::Connection block_conn_;///< aboutToBlock 钩子，收尾时断开
+    int  exit_code_{0};///< QCoreApplication::exec() 的返回码
+    bool in_exec_{false};///< 已进入 Coro::exec()，退出走 Qt 原生路径
+    bool quit_requested_{false};///< 已请求或已完成退出（quit() 的幂等闸门）
+
+    /// 单次 aboutToBlock 内最多排空的事件轮数（Qt 与协程的线程时间分配旋钮）
+    static constexpr int kEventDrainBudget = 64;
+    /// 每轮让给 boost.fiber 的时间片（ms），等同原泵协程的 msleep(1)
+    static constexpr int kFiberSliceMs = 1;
 };
 
 /**
