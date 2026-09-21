@@ -1,4 +1,6 @@
 #include "asyncdefine.h"
+#include <atomic>
+#include <algorithm>
 
 /**
  * @brief 当前协程休眠指定毫秒数
@@ -14,4 +16,22 @@ void Coro::msleep(unsigned long mescs){
  */
 void Coro::sleep(unsigned long secs){
     boost::this_fiber::sleep_for(std::chrono::seconds(secs));
+}
+
+namespace {
+std::atomic_int g_max_event_block_ms{ 10 };
+}
+
+/**
+ * @brief 设置事件阻塞的安全上限
+ */
+void Coro::setMaxEventBlockMs(int ms){
+    g_max_event_block_ms.store(std::max(1, ms), std::memory_order_release);
+}
+
+/**
+ * @brief 读取事件阻塞的安全上限
+ */
+int Coro::maxEventBlockMs(void){
+    return g_max_event_block_ms.load(std::memory_order_acquire);
 }

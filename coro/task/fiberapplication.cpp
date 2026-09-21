@@ -8,6 +8,9 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QThread>
+#include <QTimer>
+#include <algorithm>
+#include <chrono>
 #include <thread>
 #include <boost/fiber/operations.hpp>
 
@@ -53,10 +56,9 @@ Coro::FiberApplication *Coro::FiberApplication::instance()
  * exit() 只遍历 eventLoops，栈为空时是空操作。GUI 程序因此关窗后退不出去。
  *
  * 代价是 exec() 会把线程闷在 poll() 里。aboutToBlock 钩子负责在 Qt 每次准备
- * 阻塞前把线程还给 boost.fiber：先按预算排空已到达的事件（排空过程中穿插
- * yield，避免事件风暴饿死协程），再让出一个时间片，最后 wakeUp() 使随后的
- * poll() 立即返回。这段等价于原泵协程的 processEvents(AllEvents)+msleep(1)，
- * 只是搬到了 Qt 的阻塞点上。
+ * 阻塞前把线程还给 boost.fiber：挂起 qt-loop 协程，等调度器把最近的协程截止
+ * 时刻交棒回来，据此给随后的 poll() 设一个上限。没有固定时间片 —— 协程要跑
+ * 多久就跑多久，跑完 Qt 才阻塞，且 fd 就绪即刻返回。
  * @return 退出码（QCoreApplication::exec() 的返回值）
  */
 int Coro::FiberApplication::exec()
@@ -71,16 +73,24 @@ int Coro::FiberApplication::exec()
     }
 
     QAbstractEventDispatcher* disp = QAbstractEventDispatcher::instance();
+    deadline_timer_.setSingleShot(true);
     block_conn_ = QObject::connect(disp, &QAbstractEventDispatcher::aboutToBlock,
-                                   this, [disp]{
-        // 排空已到达的事件。不带 WaitForMoreEvents，canWait 为 false，
-        // 因此不会递归触发 aboutToBlock。
-        int budget = 0;
-        while(++budget < kEventDrainBudget && disp->processEvents(QEventLoop::AllEvents)){
-            boost::this_fiber::yield();
+                                   this, [this, disp]{
+        /// @details 这里跑在 qt-loop 协程栈上。挂起自己，把线程交给 boost.fiber；
+        /// 调度器无事可做时会通过 suspend_until 把最近的协程截止时刻交棒回来。
+        const auto tp = Coro::QtFiberScheduler::parkUntilIdle();
+
+        const auto now = std::chrono::steady_clock::now();
+        long long ms = 0;
+        if(tp > now){
+            ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
         }
-        Coro::msleep(kFiberSliceMs);   // 这一片时间归 boost.fiber
-        disp->wakeUp();                // 令随后的 poll() 立即返回
+        ms = std::min<long long>(ms, Coro::maxEventBlockMs());
+        if(ms > 0){
+            deadline_timer_.start(static_cast<int>(ms));  // 让随后的 poll() 至多睡 ms
+        }else{
+            disp->wakeUp();                               // 立刻回来继续跑协程
+        }
     });
 
     // 停掉 QtFiberScheduler 的 processEvents 泵：事件改由 exec() 分发，
@@ -163,6 +173,7 @@ void Coro::FiberApplication::shutdown()
     quit_requested_ = true;             // 此后再调 quit() 一律无视
 
     QObject::disconnect(block_conn_);   // 收尾期间不再让出/唤醒
+    deadline_timer_.stop();             // 断连后没人再收它，留着只会白戳一次 poll()
     QtFiberScheduler::signalExit();     // 各工作线程的泵协程自行退出
     drainUntilIdle();                   // 排空被 aboutToQuit 唤醒的协程及其 deleteLater
     Coro::FibersPool::instance().close();

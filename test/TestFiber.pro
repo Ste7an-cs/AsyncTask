@@ -6,4 +6,5 @@ SUBDIRS += \
     testexecutor \
     testfiberawait \
     testfibertask \
+    testlatency \
     testquit

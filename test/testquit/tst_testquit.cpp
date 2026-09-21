@@ -19,6 +19,12 @@
 /// 且退出码要如实传回。另有 noexec 一档：不调用 Coro::exec() 的用法（QTest 驱动
 /// 就是这样）下，quit() 仍须就地完成全部收尾。
 ///
+/// 还有一档 starve：它测的不是退出，而是**主线程 Qt 事件循环不得被协程积压饿死**。
+/// 之所以也放在本文件，是因为这条路径只存在于 Coro::exec() 里（aboutToBlock →
+/// parkUntilIdle 的交棒），而 exec() 一个进程只进得去一次、返回即收尾，没法和
+/// test_scheduler 里的其它用例共处一个进程；本文件的「自举子进程 + 15s 硬超时」
+/// 正好是这种一次性主循环场景的现成夹具，回归时报失败而不是把整条测试队列拖死。
+///
 #include <QtTest>
 #include <QApplication>
 #include <QProcess>
@@ -26,6 +32,8 @@
 #include <QThread>
 #include <QWidget>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <cstdio>
@@ -33,6 +41,7 @@
 #include "task/fiberapplication.h"
 #include "task/fibertask.h"
 #include "await/coro.hpp"
+#include "detail/asyncdefine.h"
 
 using namespace Coro;
 
@@ -154,6 +163,107 @@ int runHelper(const QString& mode, int argc, char* argv[])
     return exec();
 }
 
+// ------------------------------------------------- starve 档：主线程饥饿守卫
+
+/// starve 档的观测量，全部是原子量：写在主线程的 Qt 槽里，读在退出前
+struct StarveStat
+{
+    std::atomic_int      ticks{ 0 };          ///< QTimer 总触发次数
+    std::atomic_int      ticks_in_backlog{ 0 };///< 积压窗口内的触发次数
+    std::atomic_llong    max_gap_ms{ 0 };     ///< 积压窗口内两次分发的最大间隔
+    std::atomic_llong    sleep_ms{ -1 };      ///< 主线程协程 msleep(200) 的实测耗时
+};
+
+/**
+ * @brief starve 档被测程序：主线程背着协程积压，Qt 事件循环必须照常分发
+ *
+ * 场景就是 GUI 程序的「卡死」现场：kBacklogFibers 个 Shared 协程持续忙转
+ * kBacklogMs 毫秒。主线程的 pick_next() 会去全局队列里偷 Shared 协程，于是
+ * 本线程**永远不会进入空闲态**，suspend_until() 一次都不会被回调 —— 而
+ * parkUntilIdle() 挂起的 qt-loop 协程正是靠它交棒才醒得过来。没有饥饿守卫
+ * 时，这段时间里主线程一个 Qt 事件都不分发：窗口不重绘、点不动、关不掉。
+ *
+ * 断言用的可观测量是一个 50ms 的主线程 QTimer：积压期间它触发了几次、两次
+ * 触发之间最长隔了多久。另外记一个诊断量 sleep_ms —— 主线程 Fixed 协程
+ * msleep(200) 的实测耗时，用来区分「Qt 被饿死」和「整个主线程协程时基被饿死」。
+ * @return 退出码
+ */
+int runStarveHelper(int argc, char* argv[])
+{
+    QCoreApplication app(argc, argv);
+    installFiberApplication();
+
+    constexpr int kBacklogFibers = 256;   ///< 足够深，保证全局队列一刻不空
+    constexpr int kBacklogMs     = 1500;  ///< 积压持续时长
+    constexpr int kSpinUs        = 100;   ///< 每个协程两次让出之间的忙转时长
+    constexpr int kTimerMs       = 50;    ///< 主线程 QTimer 周期
+    constexpr int kQuitMs        = 2600;  ///< 积压结束后再留出余量才退出
+
+    auto stat = std::make_shared<StarveStat>();
+
+    /// 主线程的 Qt 定时器：它能不能响，就是「Qt 有没有被饿死」的判据
+    auto* timer = new QTimer(&app);
+    // 计时起点在 exec() 之前一刻设定，见下面 last_tick 的赋值
+    auto last_tick = std::make_shared<std::chrono::steady_clock::time_point>();
+    auto backlog_end = std::make_shared<std::chrono::steady_clock::time_point>();
+    QObject::connect(timer, &QTimer::timeout, &app, [stat, last_tick, backlog_end]{
+        const auto now = std::chrono::steady_clock::now();
+        const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - *last_tick).count();
+        stat->ticks.fetch_add(1);
+        /// 只统计「起点落在积压窗口内」的那些间隔：积压结束之后 Qt 自然恢复，
+        /// 那段的间隔说明不了问题。
+        if(*last_tick < *backlog_end){
+            if(gap > stat->max_gap_ms.load()){
+                stat->max_gap_ms.store(gap);
+            }
+            if(now <= *backlog_end){
+                stat->ticks_in_backlog.fetch_add(1);
+            }
+        }
+        *last_tick = now;
+    });
+
+    /// 诊断协程：主线程 Fixed，睡 200ms 看实际睡了多久
+    makeTask([stat]{
+        const auto t0 = std::chrono::steady_clock::now();
+        Coro::msleep(200);
+        stat->sleep_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t0).count());
+        return 0;
+    });
+
+    /// 退出闸：积压结束后 Qt 必定恢复，这个单次定时器到点收尾
+    QTimer::singleShot(kQuitMs, &app, [stat]{
+        std::printf("STARVE_TICKS=%d\n",          stat->ticks.load());
+        std::printf("STARVE_TICKS_BACKLOG=%d\n",  stat->ticks_in_backlog.load());
+        std::printf("STARVE_MAXGAP_MS=%lld\n",    stat->max_gap_ms.load());
+        std::printf("STARVE_SLEEP_MS=%lld\n",     stat->sleep_ms.load());
+        std::fflush(stdout);
+        quit();
+    });
+
+    const auto t0 = std::chrono::steady_clock::now();
+    *last_tick   = t0;
+    *backlog_end = t0 + std::chrono::milliseconds(kBacklogMs);
+
+    /// 积压本体：Shared 协程忙转 + 让出，让全局共享队列一刻不空。
+    /// 它们到点自行收敛，所以即便守卫失效本进程也能正常退出（报数字而不是挂死）。
+    const auto deadline = *backlog_end;
+    for(int i = 0; i < kBacklogFibers; ++i){
+        Coro::launch_properties([deadline, spin_us = kSpinUs]{
+            while(std::chrono::steady_clock::now() < deadline){
+                const auto spin_end = std::chrono::steady_clock::now()
+                                    + std::chrono::microseconds(spin_us);
+                while(std::chrono::steady_clock::now() < spin_end){}
+                boost::this_fiber::yield();
+            }
+        }, Priority::Normal, Affinity::shared(), "backlog").detach();
+    }
+
+    timer->start(kTimerMs);
+    return exec();
+}
+
 } // namespace
 
 // ------------------------------------------------------------------ 测试侧
@@ -165,6 +275,7 @@ class TestQuit : public QObject
 private slots:
     void quit_completes_shutdown_data();
     void quit_completes_shutdown();
+    void qt_loop_survives_coroutine_backlog();
 
 private:
     void runMode(const QString& mode, QByteArray* out, int* exitCode);
@@ -253,11 +364,77 @@ void TestQuit::quit_completes_shutdown()
              qPrintable(QStringLiteral("mode=%1 aboutToQuit 槽未在主线程触发\n%2").arg(mode, QString::fromUtf8(out))));
 }
 
+/**
+ * @brief 从 helper 输出里抓一个 KEY=数字 标记
+ * @param out helper 的合并输出
+ * @param key 标记名
+ * @return 取到的数值；没抓到返回 -1
+ */
+static long long markValue(const QByteArray& out, const char* key)
+{
+    const QRegularExpression re(QStringLiteral("%1=(-?\\d+)").arg(QLatin1String(key)));
+    const auto m = re.match(QString::fromUtf8(out));
+    return m.hasMatch() ? m.captured(1).toLongLong() : -1;
+}
+
+/**
+ * @brief 主线程背着协程积压时，Qt 事件循环仍须被分发（饥饿守卫回归）
+ *
+ * qt-loop 协程挂在 parkUntilIdle() 上，只有「本线程调度器空闲 → suspend_until()
+ * 回调」时才会被交棒唤醒。而主线程的 pick_next() 会去偷全局队列里的 Shared 协程，
+ * 只要还有协程排队，主线程就永远不空闲 —— Qt 于是一个事件都不分发，GUI 表现为
+ * 无限期冻结。守卫的职责是把最坏分发间隔压回 ~100ms：卡顿可见，但窗口还能点、
+ * 还能关。
+ *
+ * @note 这**不是** Task 5 引入的回归。把本用例原样编进 Task 5 之前的提交
+ *       （6532132，钩子里还是 `Coro::msleep(1)` 固定时间片）实测：同样
+ *       0 次分发、最大间隔 1501ms，与修复前完全一致。原因是 `msleep()` 的唤醒
+ *       也要靠 dispatcher context，而它在积压下同样被饿死（见下面的 sleep 诊断量）。
+ *       固定时间片提供的「至少每 1ms 分发一次」从来就不成立。
+ *
+ * 判据取两条：积压窗口内 50ms 定时器至少响了若干次，且两次分发的最大间隔有上界。
+ * 二者缺一都抓不住回归——只看次数，一次长冻结加一串密集触发也能蒙混过关；
+ * 只看间隔，一次都不响时反而没有间隔可测。
+ */
+void TestQuit::qt_loop_survives_coroutine_backlog()
+{
+    QByteArray out;
+    int exitCode = 0;
+    runMode(QStringLiteral("starve"), &out, &exitCode);
+
+    QVERIFY2(exitCode != -1, qPrintable(QStringLiteral("starve 档挂死未退出\n%1")
+                                        .arg(QString::fromUtf8(out))));
+    QVERIFY2(exitCode == 0, qPrintable(QStringLiteral("starve 档退出码=%1（期望 0）\n%2")
+                                       .arg(exitCode).arg(QString::fromUtf8(out))));
+
+    const long long ticks   = markValue(out, "STARVE_TICKS_BACKLOG");
+    const long long maxGap  = markValue(out, "STARVE_MAXGAP_MS");
+    const long long sleepMs = markValue(out, "STARVE_SLEEP_MS");
+    qInfo() << "积压窗口内 Qt 分发次数" << ticks
+            << "最大分发间隔(ms)" << maxGap
+            << "（诊断）主线程协程 msleep(200) 实测(ms)" << sleepMs;
+
+    /// 守卫周期 100ms，积压窗口 1500ms：理论上够响 15 次。下限取 5 是给忙机器
+    /// 留的余量——真出回归时这个数会是 0 或 1，离 5 远得很，不会擦边。
+    QVERIFY2(ticks >= 5, qPrintable(QStringLiteral("积压期间 Qt 只分发了 %1 次，主循环被饿死\n%2")
+                                    .arg(ticks).arg(QString::fromUtf8(out))));
+    /// 上限取 500ms：守卫是 100ms 一次，留 5 倍余量给 WSL2 + ASan 的调度抖动。
+    /// 冻结回归时这个数会是整个积压窗口的长度（~1500ms），同样不会擦边。
+    QVERIFY2(maxGap >= 0 && maxGap <= 500,
+             qPrintable(QStringLiteral("积压期间最大分发间隔 %1ms，超过 500ms 的可用性底线\n%2")
+                        .arg(maxGap).arg(QString::fromUtf8(out))));
+}
+
 int main(int argc, char* argv[])
 {
     const QLatin1String prefix("--helper=");
     if(argc > 1 && QLatin1String(argv[1]).startsWith(prefix)){
-        return runHelper(QString::fromLatin1(argv[1]).mid(prefix.size()), argc, argv);
+        const QString mode = QString::fromLatin1(argv[1]).mid(prefix.size());
+        // starve 档测的是主循环不被饿死而不是退出语义，另起一套被测程序
+        if(mode == QLatin1String("starve")){
+            return runStarveHelper(argc, argv);
+        }
+        return runHelper(mode, argc, argv);
     }
 
     QCoreApplication app(argc, argv);

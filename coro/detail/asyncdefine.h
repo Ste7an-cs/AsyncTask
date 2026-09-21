@@ -38,6 +38,39 @@ void msleep(unsigned long mescs);
 void sleep(unsigned long secs);
 
 /**
+ * @brief 设置事件阻塞的安全上限（毫秒）
+ * @details 这**不是**事件分发间隔 —— 在跑 QtFiberScheduler 事件泵的工作线程上，
+ *          事件与协程都是按需唤醒的，fd 一就绪 poll() 立刻返回，没有间隔可言。
+ *          默认 10ms，传入非正值夹到 1。
+ *          主线程同理：进入 Coro::exec() 后泵是停掉的（fiberapplication.cpp
+ *          中的 stopCurrentThreadPump()），阻塞上限改由 aboutToBlock 钩子按同
+ *          一条规则算出，本旋钮对它**同样生效**。
+ * @warning 它是**跨线程新投递协程的拾取上界**，而不只是一道保险丝。适用范围是
+ *          新进全局队列的 Shared / Sticky **以及 Fixed(他线程)** —— 最后一种尤其
+ *          要留意：`makeTask(fn, ..., Affinity::fixed(gui线程id))` 正是本框架
+ *          文档规定的「在工作线程里碰控件」的唯一正确写法（见 example/gui_quit），
+ *          而 Fixed 协程只有那一个线程能跑，没有第二个线程可以替它捡起来。
+ *          于是这条 10ms 落在用户可见的 GUI 路径上，且不可被工作窃取摊薄。
+ *          （已归属本线程的协程走 boost 的 remote_ready_queue_ + notify()，
+ *          会被立即唤醒，不受本上限影响。）事件泵有意
+ *          不参与跨线程唤醒广播（原委见 QtFiberScheduler::pumpLoop() 的注释，
+ *          那条路实测会把 CPU 打到 10 倍），所以一个已经睡在 poll() 里的工作
+ *          线程**不会**被远端投递的 Shared 协程叫醒，要睡满本上限才自醒。
+ *          对跨线程投递延迟敏感的程序应调小它（代价是空闲时更费电）。
+ * @code
+ * Coro::setMaxEventBlockMs(50);   // 更省电，但跨线程拾取最坏要等 50ms
+ * Coro::setMaxEventBlockMs(2);    // 跨线程更跟手，空闲唤醒更频繁
+ * @endcode
+ * @param ms 上限毫秒数
+ */
+void setMaxEventBlockMs(int ms);
+/**
+ * @brief 读取事件阻塞的安全上限（毫秒）
+ * @return 当前上限
+ */
+int maxEventBlockMs(void);
+
+/**
  * @brief 以指定调度属性启动一个协程（带调度属性启动协程的统一低层入口）。
  *
  * 以 MetaContext(pri, affine, name) 作为 fiber 属性创建 boost fiber 执行 func。

@@ -2,6 +2,7 @@
 #define FIBERAPPLICATION_H
 #include <QObject>
 #include <QCoreApplication>
+#include <QTimer>
 #include "executor/scheduler/fiberthreadblock.h"
 namespace Coro {
 
@@ -81,11 +82,7 @@ protected:
     int  exit_code_{0};///< QCoreApplication::exec() 的返回码
     bool in_exec_{false};///< 已进入 Coro::exec()，退出走 Qt 原生路径
     bool quit_requested_{false};///< 已请求或已完成退出（quit() 的幂等闸门）
-
-    /// 单次 aboutToBlock 内最多排空的事件轮数（Qt 与协程的线程时间分配旋钮）
-    static constexpr int kEventDrainBudget = 64;
-    /// 每轮让给 boost.fiber 的时间片（ms），等同原泵协程的 msleep(1)
-    static constexpr int kFiberSliceMs = 1;
+    QTimer deadline_timer_{};///< 单次定时器，给随后的 poll() 设上限
 };
 
 /**

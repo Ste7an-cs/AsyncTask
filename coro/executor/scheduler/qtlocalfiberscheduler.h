@@ -41,6 +41,16 @@ public:
      * @return 有则返回 true
      */
     bool has_ready_fibers(void) const noexcept override;
+
+protected:
+    /**
+     * @brief 本线程是否有真正可跑的协程（只认 Shared 与本线程 Fixed）
+     * @details 必须跟着 pick_next() 一起覆写：基类版本把未分配的 Sticky 协程也
+     *          算作「有活」，而本调度器的 pick_next() 从不取 Sticky —— 事件泵会
+     *          因此认定手上永远有活而一次都不去阻塞，退化成满速忙转。
+     * @return 有真实可跑协程返回 true
+     */
+    bool hasReadyWork(void) const noexcept override;
 };
 
 }
