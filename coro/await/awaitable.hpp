@@ -296,23 +296,47 @@ public:
      */
     template<typename Rep, typename Period>
     Result<T, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
-        if(!queue_){
-            return std::make_error_code(std::errc::timed_out);    // 移动后的空壳
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
         }
+        if(!queue_){
+            return std::make_error_code(std::errc::timed_out);
+        }
+        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
+        const bool tracked = cancel && cancel->add(&cancel_node);
+        if(cancel && !tracked){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         T value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek_for(value, timeout)
                             : queue_->pop_wait_for(value, timeout);
+        if(tracked){
+            cancel->remove(&cancel_node);
+        }
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                boost::this_fiber::yield();   // 理由同 await()，见 spec §3.5
+                boost::this_fiber::yield();
             }
             return value;
         }
         if(status == boost::fibers::channel_op_status::timeout){
+            if(cancel && cancel->isCancelled()){
+                if(queue_->is_closed() && hub_){
+                    hub_->notifyClosed(queue_->close_error());
+                }
+                return std::make_error_code(std::errc::interrupted);
+            }
             return std::make_error_code(std::errc::timed_out);
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
 
     /**
@@ -630,23 +654,47 @@ public:
      */
     template<typename Rep, typename Period>
     Result<void, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
+        }
         if(!queue_){
             return std::make_error_code(std::errc::timed_out);
         }
+        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
+        const bool tracked = cancel && cancel->add(&cancel_node);
+        if(cancel && !tracked){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         int value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek_for(value, timeout)
                             : queue_->pop_wait_for(value, timeout);
+        if(tracked){
+            cancel->remove(&cancel_node);
+        }
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                boost::this_fiber::yield();   // 理由同 Awaitable<T>::await()，见 spec §3.5
+                boost::this_fiber::yield();
             }
             return Result<void, std::error_code>();
         }
         if(status == boost::fibers::channel_op_status::timeout){
+            if(cancel && cancel->isCancelled()){
+                if(queue_->is_closed() && hub_){
+                    hub_->notifyClosed(queue_->close_error());
+                }
+                return std::make_error_code(std::errc::interrupted);
+            }
             return std::make_error_code(std::errc::timed_out);
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
 
     /**

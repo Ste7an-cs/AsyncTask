@@ -92,6 +92,7 @@ private slots:
     void test_case_cancel_aborts_void_await();
     void test_case_cancel_keeps_following_awaits_immediate();
     void test_case_cancel_closes_last_consumer_hub();
+    void test_case_cancel_await_for_returns_interrupted();
     void end();
 
 };
@@ -483,6 +484,49 @@ void test_fiber_task::test_case_cancel_closes_last_consumer_hub()
     QCOMPARE(state.load(), 2);
     QTRY_VERIFY_WITH_TIMEOUT(cleanups.load() == 1, 1000);
     QVERIFY(source.channel()->is_closed());
+}
+
+/**
+ * @brief cancel() 时任务阻塞在 await_for()，应返回 interrupted 而不是 timed_out。
+ */
+void test_fiber_task::test_case_cancel_await_for_returns_interrupted()
+{
+    Coro::Awaitable<int> source;
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0}; // 1 成功，2 interrupted，3 timed_out，4 其他
+    std::atomic_llong elapsedMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = source.await_for(std::chrono::seconds(5));
+        elapsedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count());
+        if(r){
+            state.store(1);
+        }else if(r.error() == interruptedError()){
+            state.store(2);
+        }else if(r.error() == std::make_error_code(std::errc::timed_out)){
+            state.store(3);
+        }else{
+            state.store(4);
+        }
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);
+    task.cancel();
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not leave await_for()");
+    QCOMPARE(state.load(), 2);
+    QVERIFY(elapsedMs.load() >= 0);
+    QVERIFY(elapsedMs.load() < 1000);
 }
 
 void test_fiber_task::end()
