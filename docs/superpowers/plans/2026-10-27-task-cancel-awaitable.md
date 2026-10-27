@@ -1138,19 +1138,24 @@ void test_fiber_task::test_case_cancel_before_await_is_immediate()
 }
 
 /**
- * @brief 已完成任务再 cancel 不应崩溃；FiberTask::get() 是单消费者，不能重复取。
+ * @brief 已完成任务再 cancel 不应崩溃，也不得重复触发结束回调。
  */
 void test_fiber_task::test_case_cancel_completed_task_is_noop()
 {
+    std::atomic_int finalizers{0};
     auto task = Coro::makeTask([]{ return 42; },
                                Coro::Priority::Normal,
-                               Coro::Affinity::sticky());
+                               Coro::Affinity::sticky())
+                    .on_finally([&]{ finalizers.fetch_add(1); });
     auto first = task.get();
     QVERIFY(first.has_value());
     QCOMPARE(first.value(), 42);
+    QCOMPARE(finalizers.load(), 1);
 
-    // 已完成：没有活动 await；cancel 只置位标志，不得崩溃。
+    // 已完成：没有活动 await；cancel 只置位标志，不得崩溃或重跑收尾。
     task.cancel();
+    QTest::qWait(20);
+    QCOMPARE(finalizers.load(), 1);
 }
 
 /**
