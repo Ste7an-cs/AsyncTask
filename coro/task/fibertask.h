@@ -56,7 +56,7 @@ struct SharedState{
      * @endcode
      */
     void done_nodes() noexcept {
-        if(pending_cnt.fetch_sub(1) == 0){
+        if(pending_cnt.fetch_sub(1) == 1){
             for(auto& func : finally_cbs){
                 func();
             }
@@ -407,6 +407,9 @@ public:
             // 空句柄：不启动协程，直接返回一个已失败的后继任务
             promise_ptr->set_value(Result<ReturnType>(no_task_state()));
             return FiberTask<ReturnType>(next_future_ptr, state_ptr_, pri, affine);
+        }
+        if(state_ptr_){// 调用链计数+1
+            state_ptr_->add_nodes();
         }
         boost::fibers::fiber fiber = launch_properties(
                     [f_ptr, s_ptr = state_ptr_,
