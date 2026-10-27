@@ -4,6 +4,8 @@
 #include <future>
 #include "detail/asyncdefine.h"
 #include "detail/result.hpp"
+#include "detail/taskcancel.hpp"
+#include <system_error>
 
 namespace Coro {
 
@@ -36,6 +38,7 @@ inline std::error_code no_task_state(){
 struct SharedState{
     std::atomic_int pending_cnt{0};///< 在途节点计数
     std::atomic_bool is_runnable{true};///< 取消标志，false 表示已取消
+    detail::TaskCancelSlot cancel_slot;///< 当前节点 await 的取消槽
     std::vector<std::function<void()>> finally_cbs;///< 结束回调列表
     /**
      * @brief 登记一个节点（在途计数加一）
@@ -58,6 +61,16 @@ struct SharedState{
                 func();
             }
         }
+    }
+
+    /**
+     * @brief 取消任务链并中止当前 await
+     * @details 置 is_runnable=false（后继短路），并通知当前等待的 Awaitable 句柄
+     *          以 interrupted 收敛。
+     */
+    void cancel() noexcept {
+        is_runnable.store(false, std::memory_order_release);
+        cancel_slot.cancel(std::make_error_code(std::errc::interrupted));
     }
 };
 
@@ -168,7 +181,7 @@ public:
      */
     void cancel(){
         if(state_ptr_){
-            this->state_ptr_->is_runnable.store(false);
+            this->state_ptr_->cancel();
         }
     }
 
@@ -228,6 +241,7 @@ public:
             try {
                 Result<T> val = f_ptr->get();
                 if(val.has_value() && true == s_ptr->is_runnable.load()){
+                    detail::TaskCancelScope cancel_scope(&s_ptr->cancel_slot);
                     if constexpr (std::is_void_v<ReturnType>){
                         func(val.value());
                         p_ptr->set_value(Result<ReturnType>());
@@ -345,7 +359,7 @@ public:
      */
     void cancel(){
         if(state_ptr_){
-            this->state_ptr_->is_runnable.store(false);
+            this->state_ptr_->cancel();
         }
     }
 
@@ -401,6 +415,7 @@ public:
             try {
                 Result<void> val = f_ptr->get();
                 if(val.has_value() && true == s_ptr->is_runnable.load()){
+                    detail::TaskCancelScope cancel_scope(&s_ptr->cancel_slot);
                     if constexpr (std::is_void_v<ReturnType>){
                         func();
                         p_ptr->set_value(Result<ReturnType>());
@@ -508,11 +523,12 @@ auto makeTask(Func&& func, Priority pri=Priority::Normal, Affinity affine=Affini
                 [func = std::forward<Func>(func),
                  p_ptr = promise_ptr, state_ptr]() mutable {
         try {
+            detail::TaskCancelScope cancel_scope(&state_ptr->cancel_slot);
             if constexpr (std::is_void_v<ReturnType>){
                 func();
                 p_ptr->set_value(Result<ReturnType>());
             }else{
-                ReturnType val = func();;
+                ReturnType val = func();
                 p_ptr->set_value(Result<ReturnType>(val));
             }
         } catch (...) {

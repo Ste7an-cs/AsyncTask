@@ -8,7 +8,9 @@
 #include "detail/fiberchannel.hpp"
 #include "detail/channelhub.hpp"
 #include "detail/result.hpp"
+#include "detail/taskcancel.hpp"
 #include <boost/fiber/operations.hpp>
+#include <system_error>
 
 namespace Coro {
 
@@ -245,25 +247,37 @@ public:
      * @endcode
      */
     Result<T, std::error_code> await(){
-        if(!queue_){
-            return std::make_error_code(std::errc::no_message);   // 移动后的空壳
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
         }
+        if(!queue_){
+            return std::make_error_code(std::errc::no_message);
+        }
+        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
+        const bool tracked = cancel && cancel->add(&cancel_node);
+        if(cancel && !tracked){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         T value{};
         const bool state = (hub_ && hub_->isState());
-        // 两种模式都等在**自己队列**的条件变量上；差别只在读取方式：
-        // 状态模式非破坏性 peek（值留在队列里可反复读），队列模式破坏性 pop。
         auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
+        if(tracked){
+            cancel->remove(&cancel_node);
+        }
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                // 命中值时 wait_peek 的谓词立即为真、无竞争的 fiber mutex 也不挂起，
-                // 整个 await 一次协程让出都不会发生。不在这里主动让出，
-                // while(await(a)) 这类循环会饿死同线程的一切——包括关闭者、
-                // 生产者与 Qt 泵协程，该线程的事件循环将彻底停摆（spec §3.5）。
                 boost::this_fiber::yield();
             }
             return value;
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
     /**
      * @brief 等待一条消息，最长等待 timeout 时长
@@ -348,6 +362,20 @@ public:
             hub_->close(error);          // 传播：关闭所有消费者队列
             hub_->notifyClosed(error);   // 关完之后表中已无未关闭的队列 -> 归零 -> 跑一次清理
         }
+    }
+private:
+    /**
+     * @brief 只关闭本句柄的消费者队列（任务取消路径）
+     * @param ec 关闭错误码
+     */
+    void closeConsumerQueue(std::error_code ec) noexcept {
+        if(queue_){
+            queue_->close(ec);
+        }
+    }
+    /** @brief 类型擦除 thunk，供 TaskCancelSlot 调用 */
+    static void closeConsumerQueueThunk(void* obj, std::error_code ec) noexcept {
+        static_cast<Awaitable*>(obj)->closeConsumerQueue(ec);
     }
 };
 
@@ -554,19 +582,37 @@ public:
      * @endcode
      */
     Result<void, std::error_code> await(){
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
+        }
         if(!queue_){
             return std::make_error_code(std::errc::no_message);
         }
+        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
+        const bool tracked = cancel && cancel->add(&cancel_node);
+        if(cancel && !tracked){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         int value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
+        if(tracked){
+            cancel->remove(&cancel_node);
+        }
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                boost::this_fiber::yield();   // 理由同 Awaitable<T>::await()，见 spec §3.5
+                boost::this_fiber::yield();
             }
             return Result<void, std::error_code>();
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
 
     /**
@@ -653,6 +699,20 @@ public:
             hub_->close(error);          // 传播：关闭所有消费者队列
             hub_->notifyClosed(error);   // 关完之后表中已无未关闭的队列 -> 归零 -> 跑一次清理
         }
+    }
+private:
+    /**
+     * @brief 只关闭本句柄的消费者队列（任务取消路径）
+     * @param ec 关闭错误码
+     */
+    void closeConsumerQueue(std::error_code ec) noexcept {
+        if(queue_){
+            queue_->close(ec);
+        }
+    }
+    /** @brief 类型擦除 thunk，供 TaskCancelSlot 调用 */
+    static void closeConsumerQueueThunk(void* obj, std::error_code ec) noexcept {
+        static_cast<Awaitable*>(obj)->closeConsumerQueue(ec);
     }
 };
 

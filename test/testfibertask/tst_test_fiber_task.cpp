@@ -25,6 +25,39 @@ do {\
         break;\
 } while (false)
 
+namespace {
+
+std::error_code interruptedError()
+{
+    return std::make_error_code(std::errc::interrupted);
+}
+
+/**
+ * @brief 有界等待 done；超时则执行 cleanup 再等，避免失败用例把任务永久挂起。
+ * @return done 最终是否为 true
+ */
+bool waitForDone(std::atomic_bool& done, int timeoutMs,
+                 const std::function<void()>& cleanup)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while(!done.load() && timer.elapsed() < timeoutMs){
+        QTest::qWait(1);
+    }
+    if(!done.load()){
+        if(cleanup){
+            cleanup();
+        }
+        timer.restart();
+        while(!done.load() && timer.elapsed() < 2000){
+            QTest::qWait(1);
+        }
+    }
+    return done.load();
+}
+
+} // namespace
+
 class SigObject : public QObject
 {
     Q_OBJECT
@@ -54,6 +87,9 @@ private slots:
     void test_case_chain_task();
     void test_case_chain_task_execpt();
     void test_case_default_construct_task();
+    void test_case_cancel_aborts_current_await();
+    void test_case_cancel_keeps_following_awaits_immediate();
+    void test_case_cancel_closes_last_consumer_hub();
     void end();
 
 };
@@ -266,6 +302,118 @@ void test_fiber_task::test_case_default_construct_task()
     QVERIFY(!arr[0].get());
     std::map<int, Coro::FiberTask<int>> m;
     QVERIFY(!m[7].get());
+}
+
+/**
+ * @brief cancel() 时任务正阻塞在 await()，当前等待应立即以 interrupted 收敛。
+ */
+void test_fiber_task::test_case_cancel_aborts_current_await()
+{
+    Coro::Awaitable<int> source;
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0}; // 1 成功，2 interrupted，3 其他错误
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        auto r = source.await();
+        if(r){
+            state.store(1);
+        }else if(r.error() == interruptedError()){
+            state.store(2);
+        }else{
+            state.store(3);
+        }
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);                    // 让协程真正进入 await
+    task.cancel();
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not leave await()");
+    QCOMPARE(state.load(), 2);
+}
+
+/**
+ * @brief 取消后，同一任务后续 await 必须立即中断，且不再关闭新句柄。
+ */
+void test_fiber_task::test_case_cancel_keeps_following_awaits_immediate()
+{
+    Coro::Awaitable<int> first;
+    Coro::Awaitable<int> second;
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  firstState{0};
+    std::atomic_int  secondState{0};
+    std::atomic_llong secondMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        auto r1 = first.await();
+        firstState.store(r1 ? 1 : (r1.error() == interruptedError() ? 2 : 3));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r2 = second.await();
+        secondMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0).count());
+        secondState.store(r2 ? 1 : (r2.error() == interruptedError() ? 2 : 3));
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        first.close(std::make_error_code(std::errc::operation_canceled));
+        second.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);
+    task.cancel();
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not finish");
+    QCOMPARE(firstState.load(), 2);
+    QCOMPARE(secondState.load(), 2);
+    QVERIFY(secondMs.load() >= 0);
+    QVERIFY(secondMs.load() < 1000);
+    QVERIFY(!second.isClosed());
+}
+
+/**
+ * @brief 当前句柄是唯一消费者时，取消引起的队列关闭应让 hub 归零并跑一次清理。
+ */
+void test_fiber_task::test_case_cancel_closes_last_consumer_hub()
+{
+    Coro::Awaitable<int> source;
+    std::atomic_int cleanups{0};
+    source.setOnClose([&]{ cleanups.fetch_add(1); });
+
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        auto r = source.await();
+        state.store(r ? 1 : (r.error() == interruptedError() ? 2 : 3));
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);
+    task.cancel();
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not finish");
+    QCOMPARE(state.load(), 2);
+    QTRY_VERIFY_WITH_TIMEOUT(cleanups.load() == 1, 1000);
+    QVERIFY(source.channel()->is_closed());
 }
 
 void test_fiber_task::end()
