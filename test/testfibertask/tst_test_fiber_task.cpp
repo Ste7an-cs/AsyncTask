@@ -93,6 +93,11 @@ private slots:
     void test_case_cancel_keeps_following_awaits_immediate();
     void test_case_cancel_closes_last_consumer_hub();
     void test_case_cancel_await_for_returns_interrupted();
+    void test_case_cancel_keeps_sibling_shared_handle();
+    void test_case_cancel_before_await_is_immediate();
+    void test_case_cancel_completed_task_is_noop();
+    void test_case_cancel_from_other_thread();
+    void test_case_cancel_await_for_void();
     void end();
 
 };
@@ -524,6 +529,203 @@ void test_fiber_task::test_case_cancel_await_for_returns_interrupted()
     QTest::qWait(100);
     task.cancel();
     QVERIFY2(waitForDone(done, 2000, cleanup), "task did not leave await_for()");
+    QCOMPARE(state.load(), 2);
+    QVERIFY(elapsedMs.load() >= 0);
+    QVERIFY(elapsedMs.load() < 1000);
+}
+
+/**
+ * @brief 取消一个 shared() 句柄不影响同 hub 的其它句柄。
+ */
+void test_fiber_task::test_case_cancel_keeps_sibling_shared_handle()
+{
+    Coro::Awaitable<int> source;
+    auto h1 = source.shared();
+    auto h2 = source.shared();
+
+    std::atomic_bool started1{false};
+    std::atomic_bool started2{false};
+    std::atomic_bool done1{false};
+    std::atomic_bool done2{false};
+    std::atomic_int  state1{0};
+    std::atomic_int  value2{-1};
+
+    auto t1 = Coro::makeTask([h1, &started1, &done1, &state1]{
+        started1.store(true);
+        auto r = h1->await();
+        state1.store(r ? 1 : (r.error() == interruptedError() ? 2 : 3));
+        done1.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    auto t2 = Coro::makeTask([h2, &started2, &done2, &value2]{
+        started2.store(true);
+        auto r = h2->await();
+        if(r){
+            value2.store(r.value());
+        }
+        done2.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started1.load() && started2.load(), 3000);
+    QTest::qWait(100);
+    t1.cancel();
+    const bool done1Ok = waitForDone(done1, 2000, cleanup);
+    if(!done1Ok || state1.load() != 2){
+        // 红阶段/失败路径：cleanup 已关闭 source，等 h2 也收尾，避免提前 return 后局部变量被使用
+        (void)waitForDone(done2, 2000, cleanup);
+    }
+    QVERIFY2(done1Ok, "h1 waiter did not finish");
+    QCOMPARE(state1.load(), 2);
+    QVERIFY(!done2.load());
+    QVERIFY(h1->isClosed());
+    QVERIFY(!h2->isClosed());
+
+    QVERIFY(source.resolve(7));
+    QVERIFY2(waitForDone(done2, 2000, cleanup), "h2 waiter did not finish");
+    QCOMPARE(value2.load(), 7);
+    QVERIFY(!h2->isClosed());
+}
+
+/**
+ * @brief 取消发生在任务进入 await 之前，下一次 await 应立即中断且不关闭句柄。
+ */
+void test_fiber_task::test_case_cancel_before_await_is_immediate()
+{
+    Coro::Awaitable<int> source;
+    std::atomic_bool entered{false};
+    std::atomic_bool gate{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0};
+    std::atomic_llong elapsedMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        entered.store(true);
+        while(!gate.load()){
+            Coro::msleep(1);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = source.await();
+        elapsedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count());
+        state.store(r ? 1 : (r.error() == interruptedError() ? 2 : 3));
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        gate.store(true);
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(entered.load(), 3000);
+    task.cancel();
+    gate.store(true);
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not finish");
+    QCOMPARE(state.load(), 2);
+    QVERIFY(elapsedMs.load() >= 0);
+    QVERIFY(elapsedMs.load() < 1000);
+    QVERIFY(!source.isClosed());
+}
+
+/**
+ * @brief 已完成任务再 cancel 不应崩溃，也不得重复触发结束回调。
+ */
+void test_fiber_task::test_case_cancel_completed_task_is_noop()
+{
+    std::atomic_int finalizers{0};
+    auto task = Coro::makeTask([]{ return 42; },
+                               Coro::Priority::Normal,
+                               Coro::Affinity::sticky())
+                    .on_finally([&]{ finalizers.fetch_add(1); });
+    auto first = task.get();
+    QVERIFY(first.has_value());
+    QCOMPARE(first.value(), 42);
+    // get() 在根节点 set_value() 时即返回，on_finally 由后续 done_nodes() 执行，
+    // 因此这里等收尾回调跑完再断言（与本文件 test_case_chain_task_execpt 的等待同理）。
+    QTRY_COMPARE_WITH_TIMEOUT(finalizers.load(), 1, 2000);
+
+    // 已完成：没有活动 await；cancel 只置位标志，不得崩溃或重跑收尾。
+    task.cancel();
+    QTest::qWait(20);
+    QCOMPARE(finalizers.load(), 1);
+}
+
+/**
+ * @brief 从没有 fiber 调度器的普通 std::thread 调用 cancel() 也要安全。
+ */
+void test_fiber_task::test_case_cancel_from_other_thread()
+{
+    Coro::Awaitable<int> source;
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        auto r = source.await();
+        state.store(r ? 1 : (r.error() == interruptedError() ? 2 : 3));
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);
+
+    std::thread canceller([task]() mutable { task.cancel(); });
+    canceller.join();
+
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not finish");
+    QCOMPARE(state.load(), 2);
+}
+
+/**
+ * @brief cancel() 时任务阻塞在 Awaitable<void>::await_for()，应返回 interrupted 而不是 timed_out。
+ */
+void test_fiber_task::test_case_cancel_await_for_void()
+{
+    Coro::Awaitable<void> source;
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0}; // 1 成功，2 interrupted，3 timed_out，4 其他
+    std::atomic_llong elapsedMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = source.await_for(std::chrono::seconds(5));
+        elapsedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count());
+        if(r){
+            state.store(1);
+        }else if(r.error() == interruptedError()){
+            state.store(2);
+        }else if(r.error() == std::make_error_code(std::errc::timed_out)){
+            state.store(3);
+        }else{
+            state.store(4);
+        }
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);
+    task.cancel();
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not leave Awaitable<void>::await_for()");
     QCOMPARE(state.load(), 2);
     QVERIFY(elapsedMs.load() >= 0);
     QVERIFY(elapsedMs.load() < 1000);
