@@ -1,5 +1,14 @@
 #include <QtTest>
 
+#include "await/awaitable.hpp"
+#include "detail/taskcancel.hpp"
+#include <QElapsedTimer>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <system_error>
+#include <thread>
+
 // add necessary includes here
 #include "executor/fiberpool.h"
 #include "detail/asyncdefine.h"
@@ -41,6 +50,7 @@ public:
 
 private slots:
     void begin();
+    void test_case_cancel_slot_aborts_active_node();
     void test_case_chain_task();
     void test_case_chain_task_execpt();
     void test_case_default_construct_task();
@@ -72,6 +82,39 @@ void test_fiber_task::begin()
     value = std::is_same_v<Coro::flatten_result_type_t<Coro::Result<Coro::Result<void>, std::string>>, Coro::Result<void, std::string>>;
     QVERIFY(value == true);
 
+}
+
+/**
+ * @brief TaskCancelSlot 的独立组件测试：登记、取消、注销与幂等。
+ */
+void test_fiber_task::test_case_cancel_slot_aborts_active_node()
+{
+    struct Probe {
+        int closed{0};
+        std::error_code seen{};
+        static void close(void* obj, std::error_code ec) noexcept
+        {
+            auto* self = static_cast<Probe*>(obj);
+            ++self->closed;
+            self->seen = ec;
+        }
+    } probe;
+
+    Coro::detail::TaskCancelSlot slot;
+    Coro::detail::AwaitableCancelNode node{&probe, &Probe::close};
+
+    QVERIFY(slot.add(&node));
+    QVERIFY(!slot.isCancelled());
+
+    slot.cancel(std::make_error_code(std::errc::interrupted));
+    QVERIFY(slot.isCancelled());
+    QCOMPARE(probe.closed, 1);
+    QVERIFY(probe.seen == std::make_error_code(std::errc::interrupted));
+
+    QVERIFY(!slot.add(&node));                  // 已取消后不再登记
+    slot.remove(&node);                         // active 已置空，安全空转
+    slot.cancel(std::make_error_code(std::errc::interrupted));
+    QCOMPARE(probe.closed, 1);                  // 幂等
 }
 ///
 /// \brief test_fiber_task::test_case_chain_task

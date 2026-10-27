@@ -9,6 +9,10 @@
 
 namespace Coro {
 
+namespace detail {
+class TaskCancelSlot;
+}
+
 /**
  * @brief 优先级标识
  * @code
@@ -232,6 +236,7 @@ struct MetaContext : boost::fibers::fiber_properties {
             this->priority_ = meta.priority_;
             this->affinity_ = meta.affinity_;
             this->name_ = meta.name_;
+            this->task_cancel_slot_ = meta.task_cancel_slot_;
         }
         return *this;
     }
@@ -243,7 +248,7 @@ struct MetaContext : boost::fibers::fiber_properties {
      * Coro::MetaContext copy(prop);    // 继承当前协程的优先级与亲和
      * @endcode
      */
-    MetaContext(const MetaContext& other): boost::fibers::fiber_properties(other.ctx_), priority_(other.priority_), affinity_(other.affinity_), name_(other.name_){
+    MetaContext(const MetaContext& other): boost::fibers::fiber_properties(other.ctx_), priority_(other.priority_), affinity_(other.affinity_), name_(other.name_), task_cancel_slot_(other.task_cancel_slot_){
     }
 
     /**
@@ -340,6 +345,20 @@ struct MetaContext : boost::fibers::fiber_properties {
         return name_;
     }
     /**
+     * @brief 读取当前 fiber 所属任务的取消槽
+     * @return 取消槽指针；无任务上下文时返回 nullptr
+     */
+    detail::TaskCancelSlot* taskCancelSlot() const noexcept {
+        return task_cancel_slot_;
+    }
+    /**
+     * @brief 设置当前 fiber 所属任务的取消槽
+     * @param slot 任务链的取消槽
+     */
+    void setTaskCancelSlot(detail::TaskCancelSlot* slot) noexcept {
+        task_cancel_slot_ = slot;
+    }
+    /**
      * @brief 读取关联的 boost fiber 上下文
      * @code
      * // 调度器据此把协程 attach 到本线程并恢复执行
@@ -397,6 +416,7 @@ private:
     Priority                       priority_{Priority::Normal};///< 优先级
     Affinity                       affinity_{};///< 线程模型
     std::string                    name_{""};///< 名称
+    detail::TaskCancelSlot*       task_cancel_slot_{nullptr};///< 当前任务的取消槽；非任务 fiber 为空
 };
 
 }

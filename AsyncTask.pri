@@ -54,6 +54,7 @@ HEADERS += \
     $$PWD/coro/await/awaitable.hpp \
     $$PWD/coro/await/generator.hpp \
     $$PWD/coro/detail/fiberchannel.hpp \
+    $$PWD/coro/detail/taskcancel.hpp \
     $$PWD/coro/detail/channelhub.hpp \
     $$PWD/coro/executor/fiberpool.h \
     $$PWD/coro/executor/scheduler/fiberproperty.h \
@@ -70,4 +71,5 @@ SOURCES += \
     $$PWD/coro/executor/scheduler/fibertaskqueue.cpp \
     $$PWD/coro/executor/scheduler/fiberthreadblock.cpp \
     $$PWD/coro/detail/asyncdefine.cpp \
+    $$PWD/coro/detail/taskcancel.cpp \
     $$PWD/coro/task/fibertask.cpp
