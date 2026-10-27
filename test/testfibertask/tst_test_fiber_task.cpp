@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <mutex>
 #include <system_error>
 #include <thread>
 
@@ -88,6 +89,7 @@ private slots:
     void test_case_chain_task_execpt();
     void test_case_default_construct_task();
     void test_case_cancel_aborts_current_await();
+    void test_case_cancel_aborts_void_await();
     void test_case_cancel_keeps_following_awaits_immediate();
     void test_case_cancel_closes_last_consumer_hub();
     void end();
@@ -201,37 +203,59 @@ void test_fiber_task::test_case_chain_task_execpt()
 {
 
     std::vector<std::thread::id> vec_id;
+    std::mutex cnt_mutex;
     std::vector<int> cnt{};
-    auto task = Coro::makeTask([&vec_id, &cnt](){
+    std::atomic_int finalizerCount{0};
+    auto task = Coro::makeTask([&vec_id, &cnt, &cnt_mutex](){
         vec_id.emplace_back(std::this_thread::get_id());
         Coro::sleep_for(std::chrono::milliseconds(100));
-        cnt.emplace_back(1);
+        {
+            std::lock_guard<std::mutex> lock(cnt_mutex);
+            cnt.emplace_back(1);
+        }
         qDebug() << "then 1";
         return 10;
     }, Coro::Priority::Normal, Coro::Affinity::sticky());
-    auto task1 = task.then([&vec_id, &cnt](int v1)->int{
+    auto task1 = task.then([&vec_id, &cnt, &cnt_mutex](int v1)->int{
         vec_id.emplace_back(std::this_thread::get_id());
         Coro::msleep(100);
         TQVERIFY(v1 == 10);
-        cnt.emplace_back(2);
+        {
+            std::lock_guard<std::mutex> lock(cnt_mutex);
+            cnt.emplace_back(2);
+        }
         qDebug() << "then 2";
         return 20;
-    }).on_finally([&cnt](){
-        cnt.emplace_back(5);
-    }).on_finally([&cnt](){
-        cnt.emplace_back(5);
-    }).then([&vec_id, &cnt, &task](int v2){
+    }).on_finally([&cnt, &cnt_mutex, &finalizerCount](){
+        {
+            std::lock_guard<std::mutex> lock(cnt_mutex);
+            cnt.emplace_back(5);
+            finalizerCount.fetch_add(1);
+        }
+    }).on_finally([&cnt, &cnt_mutex, &finalizerCount](){
+        {
+            std::lock_guard<std::mutex> lock(cnt_mutex);
+            cnt.emplace_back(5);
+            finalizerCount.fetch_add(1);
+        }
+    }).then([&vec_id, &cnt, &cnt_mutex, &task](int v2){
         vec_id.emplace_back(std::this_thread::get_id());
         Coro::msleep(100);
         TQVERIFY(v2 == 20);
         task.cancel();
         qDebug() << "then 3 cancel";
-        cnt.emplace_back(3);
+        {
+            std::lock_guard<std::mutex> lock(cnt_mutex);
+            cnt.emplace_back(3);
+        }
         return;
-    }).then([&vec_id, &cnt]()->QString{
+    }).then([&vec_id, &cnt, &cnt_mutex]()->QString{
         vec_id.emplace_back(std::this_thread::get_id());
         Coro::msleep(100);
-        cnt.emplace_back(4);
+        {
+            std::lock_guard<std::mutex> lock(cnt_mutex);
+            cnt.emplace_back(4);
+        }
         qDebug() << "then 4";
         return "done";
     });
@@ -243,12 +267,22 @@ void test_fiber_task::test_case_chain_task_execpt()
     for(auto id: vec_id){
         TQVERIFY(id == id0);
     }
-    TQVERIFY(cnt.size() == 5);
-    TQVERIFY(cnt[0] == 1);
-    TQVERIFY(cnt[1] == 2);
-    TQVERIFY(cnt[2] == 3);
-    TQVERIFY(cnt[3] == 5);
-    TQVERIFY(cnt[4] == 5);
+    // get() 在 then 节点 set_value() 时即返回，on_finally 由后续 done_nodes() 执行；
+    // 等两个收尾回调都追加完，再在锁内取快照断言。
+    QTRY_VERIFY_WITH_TIMEOUT(finalizerCount.load() == 2, 2000);
+    std::vector<int> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(cnt_mutex);
+        snapshot = cnt;
+    }
+    QVERIFY2(snapshot.size() == 5,
+             qPrintable(QStringLiteral("cnt.size()=%1, finalizers=%2")
+                            .arg(snapshot.size()).arg(finalizerCount.load())));
+    QCOMPARE(snapshot[0], 1);
+    QCOMPARE(snapshot[1], 2);
+    QCOMPARE(snapshot[2], 3);
+    QCOMPARE(snapshot[3], 5);
+    QCOMPARE(snapshot[4], 5);
 
 }
 
@@ -336,6 +370,41 @@ void test_fiber_task::test_case_cancel_aborts_current_await()
     QTest::qWait(100);                    // 让协程真正进入 await
     task.cancel();
     QVERIFY2(waitForDone(done, 2000, cleanup), "task did not leave await()");
+    QCOMPARE(state.load(), 2);
+}
+
+/**
+ * @brief cancel() 时任务正阻塞在 Awaitable<void>::await()，同样应以 interrupted 收敛。
+ */
+void test_fiber_task::test_case_cancel_aborts_void_await()
+{
+    Coro::Awaitable<void> source;
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0}; // 1 成功，2 interrupted，3 其他错误
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        auto r = source.await();
+        if(r){
+            state.store(1);
+        }else if(r.error() == interruptedError()){
+            state.store(2);
+        }else{
+            state.store(3);
+        }
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    const auto cleanup = [&]{
+        source.close(std::make_error_code(std::errc::operation_canceled));
+    };
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);                    // 让协程真正进入 await
+    task.cancel();
+    QVERIFY2(waitForDone(done, 2000, cleanup), "task did not leave Awaitable<void>::await()");
     QCOMPARE(state.load(), 2);
 }
 
