@@ -97,6 +97,9 @@ public:
 private slots:
     void begin();
     void test_case_cancel_slot_aborts_active_node();
+    void test_case_finally_one_shot_after_then();
+    void test_case_finally_late_registration_runs_immediately();
+    void test_case_finally_throwing_callback_does_not_terminate();
     void test_case_chain_task();
     void test_case_chain_task_execpt();
     void test_case_default_construct_task();
@@ -303,6 +306,70 @@ void test_fiber_task::test_case_chain_task_execpt()
     QCOMPARE(snapshot[3], 5);
     QCOMPARE(snapshot[4], 5);
 
+}
+
+/**
+ * @brief 整链结束后追加 then：已消费的 finalizer 不得随新的 1->0 再度执行。
+ */
+void test_fiber_task::test_case_finally_one_shot_after_then()
+{
+    std::atomic_int finalizers{0};
+    auto task = Coro::makeTask([]{ return 1; },
+                               Coro::Priority::Normal,
+                               Coro::Affinity::sticky())
+                    .on_finally([&]{ finalizers.fetch_add(1); });
+    // 不先用根句柄 get()：boost future 只能取一次，留给后继节点消费。
+    QTRY_COMPARE_WITH_TIMEOUT(finalizers.load(), 1, 2000);
+
+    // 完成后追加后继：pending_cnt 0->1->0；finalizer 已消费，不得重跑。
+    auto tail = task.then([](int v){ return v + 1; });
+    auto second = tail.get();
+    QVERIFY(second.has_value());
+    QCOMPARE(second.value(), 2);
+    QTest::qWait(50);
+    QCOMPARE(finalizers.load(), 1);
+}
+
+/**
+ * @brief 任务链结束后注册 on_finally：立即执行一次；回调抛出也不得终止进程。
+ */
+void test_fiber_task::test_case_finally_late_registration_runs_immediately()
+{
+    std::atomic_int early{0};
+    std::atomic_int late{0};
+    auto task = Coro::makeTask([]{ return 7; },
+                               Coro::Priority::Normal,
+                               Coro::Affinity::sticky())
+                    .on_finally([&]{ early.fetch_add(1); });
+    auto result = task.get();
+    QVERIFY(result.has_value());
+    QCOMPARE(result.value(), 7);
+    QTRY_COMPARE_WITH_TIMEOUT(early.load(), 1, 2000);
+
+    // 已结束：新注册的回调立即执行（不得保留到未来节点）。
+    task.on_finally([]{ throw 1; });
+    task.on_finally([&]{ late.fetch_add(1); });
+    QCOMPARE(late.load(), 1);
+    QTest::qWait(30);
+    QCOMPARE(late.load(), 1);
+    QCOMPARE(early.load(), 1);
+}
+
+/**
+ * @brief 收尾回调抛异常时只跳过该回调，后续回调仍执行，进程不终止。
+ */
+void test_fiber_task::test_case_finally_throwing_callback_does_not_terminate()
+{
+    std::atomic_int ran{0};
+    auto task = Coro::makeTask([]{ return 3; },
+                               Coro::Priority::Normal,
+                               Coro::Affinity::sticky())
+                    .on_finally([]{ throw 1; })
+                    .on_finally([&]{ ran.fetch_add(1); });
+    auto result = task.get();
+    QVERIFY(result.has_value());
+    QCOMPARE(result.value(), 3);
+    QTRY_COMPARE_WITH_TIMEOUT(ran.load(), 1, 2000);
 }
 
 /**
