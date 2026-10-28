@@ -137,7 +137,7 @@ class FiberTask;
  *                 .then([](int v){ return v + 1; })
  *                 .on_finally([]{ qDebug() << "chain done"; });
  * Coro::Result<int> r = task.get();     // 让出式等待，不阻塞线程
- * // task.cancel();                     // 取消：尚未开始的后继短路
+ * // task.cancel();                     // 取消：中止当前 await；后续等待/后继返回中断
  * @endcode
  */
 template<typename T>
@@ -173,10 +173,13 @@ public:
     FiberTask() = default;
 
     /**
-     * @brief 取消任务链（尚未开始的后继在启动前短路）
+     * @brief 取消任务链并中止当前 await
+     * @details 当前若阻塞在 Awaitable::await()/await_for()，该句柄的消费者队列
+     *          以 interrupted 关闭，当前等待立即返回；取消后后续 await 立即中断；
+     *          尚未开始的后继在启动前短路。取消是协作式的，不强制结束任务函数。
      * @code
      * auto task = Coro::makeTask(step1).then(step2);
-     * task.cancel();      // 协作式取消：不打断正在运行的节点
+     * task.cancel();      // 中止当前 await；后续等待/后继返回中断
      * @endcode
      */
     void cancel(){
@@ -351,10 +354,13 @@ public:
      */
     FiberTask() = default;
     /**
-     * @brief 取消任务链（尚未开始的后继在启动前短路）
+     * @brief 取消任务链并中止当前 await
+     * @details 当前若阻塞在 Awaitable::await()/await_for()，该句柄的消费者队列
+     *          以 interrupted 关闭，当前等待立即返回；取消后后续 await 立即中断；
+     *          尚未开始的后继在启动前短路。取消是协作式的，不强制结束任务函数。
      * @code
      * auto task = Coro::makeTask(step1).then(step2);
-     * task.cancel();      // 协作式取消：不打断正在运行的节点
+     * task.cancel();      // 中止当前 await；后续等待/后继返回中断
      * @endcode
      */
     void cancel(){

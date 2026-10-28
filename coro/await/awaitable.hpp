@@ -237,6 +237,8 @@ public:
      * @return 取到数据返回 Result 值；队列关闭后返回首次终止错误，默认关闭为 no_message
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * Coro::makeTask([&a]{
      *     while(auto v = a.await()){        // 关闭后循环自然结束
@@ -287,6 +289,8 @@ public:
      * @return 取到数据返回 Result 值；超时返回 timed_out，关闭返回首次终止错误
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * auto r = a.await_for(std::chrono::milliseconds(500));
      * if(!r && r.error() == std::make_error_code(std::errc::timed_out)){
@@ -598,6 +602,8 @@ public:
      * @return 事件到达返回成功 Result；队列关闭后返回首次终止错误，默认关闭为 no_message
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * Coro::makeTask([sock]{
      *     if(Coro::coro(sock).waitForConnected()->await()) startWork();
@@ -647,6 +653,8 @@ public:
      * @return 事件到达返回成功 Result；超时返回 timed_out，关闭返回首次终止错误
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * auto ok = Coro::coro(sock).waitForConnected()->await_for(std::chrono::seconds(2));
      * if(!ok) qWarning() << ok.error().message().c_str();

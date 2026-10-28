@@ -90,8 +90,15 @@ auto task = makeTask([]{ /* ... */ return 10; },
     .then([](int v){ return v + 1; })        // 链式后继，前驱结果为入参
     .on_finally([]{ /* 任务链结束回调 */ });
 Result<int> r = task.get();                  // 等待结果
-// task.cancel();                            // 需要时取消任务链
+// task.cancel();                            // 取消：中止当前 await，后继短路
 ```
+
+`cancel()` 是协作式取消：若任务当前阻塞在 `Awaitable::await()` / `await_for()`，
+该 Awaitable **句柄**的消费者队列会以 `std::errc::interrupted` 关闭，当前等待
+立即返回；取消后同一任务上的后续 await 也立即返回 `interrupted`。同一 hub 的
+其他 `shared()` 句柄不受影响；同一个 Awaitable 句柄上的多个等待者会一起被唤醒，
+需要按任务隔离时请使用独立的 `shared()` 句柄。框架不抛取消异常，也不强制结束
+任务函数。
 
 **优先级与线程亲和**
 ```cpp

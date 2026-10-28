@@ -71,7 +71,7 @@ int main(int argc, char* argv[]) {
 | 启动协程任务 | `auto t = makeTask(fn, pri=Priority::Normal, affine=Affinity::fixed(当前线程));` |
 | 链式后继 | `t.then([](Prev v){ return ...; })` |
 | 任务链结束回调 | `t.on_finally([]{ ... })` |
-| 取消任务链 | `t.cancel();`（只令尚未开始的节点短路） |
+| 取消任务链 | `t.cancel();`（中止当前 await，后续 await 立即中断，未开始后继短路） |
 | 取结果（让出式） | `Result<T> r = t.get();` |
 | 读取 Result | `if (r) use(r.value());` / `r.value_or(def)` / `r.has_value()` / `r.error()` |
 | 优先级 | `Priority::Low / Normal / High` |
