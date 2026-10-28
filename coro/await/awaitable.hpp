@@ -256,18 +256,16 @@ public:
         if(!queue_){
             return std::make_error_code(std::errc::no_message);
         }
-        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
-        const bool tracked = cancel && cancel->add(&cancel_node);
-        if(cancel && !tracked){
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
             return std::make_error_code(std::errc::interrupted);
         }
 
         T value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
-        if(tracked){
-            cancel->remove(&cancel_node);
-        }
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
                 boost::this_fiber::yield();
@@ -307,9 +305,9 @@ public:
         if(!queue_){
             return std::make_error_code(std::errc::timed_out);
         }
-        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
-        const bool tracked = cancel && cancel->add(&cancel_node);
-        if(cancel && !tracked){
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
             return std::make_error_code(std::errc::interrupted);
         }
 
@@ -317,9 +315,7 @@ public:
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek_for(value, timeout)
                             : queue_->pop_wait_for(value, timeout);
-        if(tracked){
-            cancel->remove(&cancel_node);
-        }
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
                 boost::this_fiber::yield();
@@ -393,17 +389,12 @@ public:
     }
 private:
     /**
-     * @brief 只关闭本句柄的消费者队列（任务取消路径）
+     * @brief 类型擦除 thunk：关闭取消目标队列
+     * @param obj 目标 FiberChannel 裸指针；close 期间由节点 alive 保持存活
      * @param ec 关闭错误码
      */
-    void closeConsumerQueue(std::error_code ec) noexcept {
-        if(queue_){
-            queue_->close(ec);
-        }
-    }
-    /** @brief 类型擦除 thunk，供 TaskCancelSlot 调用 */
-    static void closeConsumerQueueThunk(void* obj, std::error_code ec) noexcept {
-        static_cast<Awaitable*>(obj)->closeConsumerQueue(ec);
+    static void closeQueueThunk(void* obj, std::error_code ec) noexcept {
+        static_cast<FiberChannel<T>*>(obj)->close(ec);
     }
 };
 
@@ -619,18 +610,16 @@ public:
         if(!queue_){
             return std::make_error_code(std::errc::no_message);
         }
-        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
-        const bool tracked = cancel && cancel->add(&cancel_node);
-        if(cancel && !tracked){
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
             return std::make_error_code(std::errc::interrupted);
         }
 
         int value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
-        if(tracked){
-            cancel->remove(&cancel_node);
-        }
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
                 boost::this_fiber::yield();
@@ -669,9 +658,9 @@ public:
         if(!queue_){
             return std::make_error_code(std::errc::timed_out);
         }
-        detail::AwaitableCancelNode cancel_node{this, &Awaitable::closeConsumerQueueThunk};
-        const bool tracked = cancel && cancel->add(&cancel_node);
-        if(cancel && !tracked){
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
             return std::make_error_code(std::errc::interrupted);
         }
 
@@ -679,9 +668,7 @@ public:
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek_for(value, timeout)
                             : queue_->pop_wait_for(value, timeout);
-        if(tracked){
-            cancel->remove(&cancel_node);
-        }
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
                 boost::this_fiber::yield();
@@ -758,17 +745,12 @@ public:
     }
 private:
     /**
-     * @brief 只关闭本句柄的消费者队列（任务取消路径）
+     * @brief 类型擦除 thunk：关闭取消目标队列
+     * @param obj 目标 FiberChannel 裸指针；close 期间由节点 alive 保持存活
      * @param ec 关闭错误码
      */
-    void closeConsumerQueue(std::error_code ec) noexcept {
-        if(queue_){
-            queue_->close(ec);
-        }
-    }
-    /** @brief 类型擦除 thunk，供 TaskCancelSlot 调用 */
-    static void closeConsumerQueueThunk(void* obj, std::error_code ec) noexcept {
-        static_cast<Awaitable*>(obj)->closeConsumerQueue(ec);
+    static void closeQueueThunk(void* obj, std::error_code ec) noexcept {
+        static_cast<FiberChannel<int>*>(obj)->close(ec);
     }
 };
 

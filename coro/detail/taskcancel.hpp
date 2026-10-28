@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <memory>
 #include <mutex>
 #include <system_error>
 
@@ -17,8 +18,9 @@ struct AwaitableCancelNode {
     /** @brief 关闭回调类型；必须 noexcept，只做队列 close */
     using CloseFn = void (*)(void* obj, std::error_code ec) noexcept;
 
-    void*   obj{nullptr};   ///< 正在等待的 Awaitable 句柄
-    CloseFn close{nullptr}; ///< 调该句柄的私有 closeConsumerQueue
+    void*   obj{nullptr};   ///< 待关闭的 FiberChannel 裸指针
+    CloseFn close{nullptr}; ///< 关闭该队列的 thunk
+    std::shared_ptr<void> alive{};///< 关闭目标的保活引用；close 可能让出协程时目标不被销毁
 };
 
 /**
@@ -62,19 +64,26 @@ public:
     }
 
     /**
-     * @brief 置取消标志并关闭当前登记的消费者队列
+     * @brief 置取消标志并在锁外关闭当前登记的消费者队列
      * @param ec 关闭错误码
-     * @details 持锁调用 node->close；等待者返回后 remove() 会阻塞到本函数退出。
-     *          close 只做 noexcept 的 FiberChannel::close，不跑用户清理。
+     * @details 锁内只复制节点并清空 active_，随后解锁再调用 close。close 会经过
+     *          FiberChannel 的 fiber 互斥量，可能让出当前协程；若持 std::mutex
+     *          让出，同一调度线程上的唤醒者会卡在 remove() 上，形成死锁。
+     *          节点副本的 alive 保持目标存活，close 期间的栈展开不受影响。
      */
     void cancel(std::error_code ec) noexcept
     {
         cancelled_.store(true, std::memory_order_release);
-        std::lock_guard<std::mutex> lk(mtx_);
-        if(active_ != nullptr){
-            AwaitableCancelNode* node = active_;
-            active_ = nullptr;
-            node->close(node->obj, ec);
+        AwaitableCancelNode node{};
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if(active_ != nullptr){
+                node = *active_;
+                active_ = nullptr;
+            }
+        }
+        if(node.close != nullptr){
+            node.close(node.obj, ec);
         }
     }
 
@@ -88,6 +97,50 @@ private:
     std::mutex           mtx_;
     AwaitableCancelNode* active_{nullptr};
     std::atomic_bool     cancelled_{false};
+};
+
+/**
+ * @brief 一次 await 的取消登记 RAII 守卫。
+ * @details 构造时登记；析构时若仍登记则注销。await 在构造值、等待或取错误等任意
+ *          步骤抛出时，栈展开都会先注销，避免槽里留下指向已销毁栈节点的悬空指针。
+ */
+class TaskCancelRegistration {
+public:
+    /**
+     * @brief 登记节点
+     * @param slot 当前任务的取消槽；非任务上下文可为空
+     * @param node 调用方栈上的节点，生命周期必须覆盖本守卫
+     */
+    TaskCancelRegistration(TaskCancelSlot* slot, AwaitableCancelNode* node)
+        : slot_(slot), node_(node), registered_(slot != nullptr && slot->add(node)){}
+    /** @brief 未 release() 时注销登记 */
+    ~TaskCancelRegistration(){
+        if(registered_){
+            slot_->remove(node_);
+        }
+    }
+    TaskCancelRegistration(const TaskCancelRegistration&) = delete;
+    TaskCancelRegistration& operator=(const TaskCancelRegistration&) = delete;
+
+    /**
+     * @brief 是否登记成功
+     * @return 槽存在且未取消、登记成功返回 true
+     */
+    bool registered() const noexcept { return registered_; }
+    /**
+     * @brief 提前注销（幂等）
+     * @details 正常取到值或超时后调用，缩小取消与完成并发时的关闭窗口。
+     */
+    void release() noexcept {
+        if(registered_){
+            slot_->remove(node_);
+            registered_ = false;
+        }
+    }
+private:
+    TaskCancelSlot*      slot_{nullptr};
+    AwaitableCancelNode* node_{nullptr};
+    bool                 registered_{false};
 };
 
 TaskCancelSlot* currentTaskCancelSlot() noexcept;

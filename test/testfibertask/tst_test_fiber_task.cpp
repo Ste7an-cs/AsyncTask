@@ -57,6 +57,18 @@ bool waitForDone(std::atomic_bool& done, int timeoutMs,
     return done.load();
 }
 
+/**
+ * @brief 默认构造立即抛出的值类型：让 await 在登记取消节点之后、等待之前抛出。
+ */
+struct ThrowingValue {
+    struct Boom {};
+    ThrowingValue(){ throw Boom{}; }
+    ThrowingValue(const ThrowingValue&){ throw Boom{}; }
+    ThrowingValue(ThrowingValue&&){ throw Boom{}; }
+    ThrowingValue& operator=(const ThrowingValue&){ throw Boom{}; }
+    ThrowingValue& operator=(ThrowingValue&&){ throw Boom{}; }
+};
+
 } // namespace
 
 class SigObject : public QObject
@@ -98,6 +110,7 @@ private slots:
     void test_case_cancel_completed_task_is_noop();
     void test_case_cancel_from_other_thread();
     void test_case_cancel_await_for_void();
+    void test_case_cancel_after_throwing_value_is_safe();
     void end();
 
 };
@@ -729,6 +742,34 @@ void test_fiber_task::test_case_cancel_await_for_void()
     QCOMPARE(state.load(), 2);
     QVERIFY(elapsedMs.load() >= 0);
     QVERIFY(elapsedMs.load() < 1000);
+}
+
+/**
+ * @brief 值类型构造抛出时，await 的取消登记必须在异常路径上注销。
+ * @details 旧实现把栈上节点登记后不设防：T value{} 抛出会让节点随栈帧销毁，而槽内
+ *          仍指向它；任务结束后再 cancel 就会读已释放的节点（ASan UAF）。
+ *          新实现由 RAII 注销，cancel 不得再关闭这个仍存活的句柄。
+ */
+void test_fiber_task::test_case_cancel_after_throwing_value_is_safe()
+{
+    Coro::Awaitable<ThrowingValue> source;
+    std::atomic_bool started{false};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        (void)source.await();          // T value{} 抛 Boom
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    auto result = task.get();
+    QVERIFY(!result);
+    QCOMPARE(result.error(), interruptedError());
+
+    // 等 await 栈帧和任务 fiber 销毁；旧实现在这里 cancel 会踩已释放的栈节点。
+    QTest::qWait(50);
+    task.cancel();
+    QVERIFY(!source.isClosed());       // 节点已注销：cancel 不应关闭这个句柄
 }
 
 void test_fiber_task::end()
