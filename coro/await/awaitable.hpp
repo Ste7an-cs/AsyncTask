@@ -8,7 +8,9 @@
 #include "detail/fiberchannel.hpp"
 #include "detail/channelhub.hpp"
 #include "detail/result.hpp"
+#include "detail/taskcancel.hpp"
 #include <boost/fiber/operations.hpp>
+#include <system_error>
 
 namespace Coro {
 
@@ -235,6 +237,8 @@ public:
      * @return 取到数据返回 Result 值；队列关闭后返回首次终止错误，默认关闭为 no_message
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * Coro::makeTask([&a]{
      *     while(auto v = a.await()){        // 关闭后循环自然结束
@@ -245,25 +249,35 @@ public:
      * @endcode
      */
     Result<T, std::error_code> await(){
-        if(!queue_){
-            return std::make_error_code(std::errc::no_message);   // 移动后的空壳
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
         }
+        if(!queue_){
+            return std::make_error_code(std::errc::no_message);
+        }
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         T value{};
         const bool state = (hub_ && hub_->isState());
-        // 两种模式都等在**自己队列**的条件变量上；差别只在读取方式：
-        // 状态模式非破坏性 peek（值留在队列里可反复读），队列模式破坏性 pop。
         auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                // 命中值时 wait_peek 的谓词立即为真、无竞争的 fiber mutex 也不挂起，
-                // 整个 await 一次协程让出都不会发生。不在这里主动让出，
-                // while(await(a)) 这类循环会饿死同线程的一切——包括关闭者、
-                // 生产者与 Qt 泵协程，该线程的事件循环将彻底停摆（spec §3.5）。
                 boost::this_fiber::yield();
             }
             return value;
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
     /**
      * @brief 等待一条消息，最长等待 timeout 时长
@@ -273,6 +287,8 @@ public:
      * @return 取到数据返回 Result 值；超时返回 timed_out，关闭返回首次终止错误
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * auto r = a.await_for(std::chrono::milliseconds(500));
      * if(!r && r.error() == std::make_error_code(std::errc::timed_out)){
@@ -282,23 +298,45 @@ public:
      */
     template<typename Rep, typename Period>
     Result<T, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
-        if(!queue_){
-            return std::make_error_code(std::errc::timed_out);    // 移动后的空壳
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
         }
+        if(!queue_){
+            return std::make_error_code(std::errc::timed_out);
+        }
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         T value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek_for(value, timeout)
                             : queue_->pop_wait_for(value, timeout);
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                boost::this_fiber::yield();   // 理由同 await()，见 spec §3.5
+                boost::this_fiber::yield();
             }
             return value;
         }
         if(status == boost::fibers::channel_op_status::timeout){
+            if(cancel && cancel->isCancelled()){
+                if(queue_->is_closed() && hub_){
+                    hub_->notifyClosed(queue_->close_error());
+                }
+                return std::make_error_code(std::errc::interrupted);
+            }
             return std::make_error_code(std::errc::timed_out);
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
 
     /**
@@ -348,6 +386,15 @@ public:
             hub_->close(error);          // 传播：关闭所有消费者队列
             hub_->notifyClosed(error);   // 关完之后表中已无未关闭的队列 -> 归零 -> 跑一次清理
         }
+    }
+private:
+    /**
+     * @brief 类型擦除 thunk：关闭取消目标队列
+     * @param obj 目标 FiberChannel 裸指针；close 期间由节点 alive 保持存活
+     * @param ec 关闭错误码
+     */
+    static void closeQueueThunk(void* obj, std::error_code ec) noexcept {
+        static_cast<FiberChannel<T>*>(obj)->close(ec);
     }
 };
 
@@ -546,6 +593,8 @@ public:
      * @return 事件到达返回成功 Result；队列关闭后返回首次终止错误，默认关闭为 no_message
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * Coro::makeTask([sock]{
      *     if(Coro::coro(sock).waitForConnected()->await()) startWork();
@@ -554,19 +603,35 @@ public:
      * @endcode
      */
     Result<void, std::error_code> await(){
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
+        }
         if(!queue_){
             return std::make_error_code(std::errc::no_message);
         }
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         int value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek(value) : queue_->pop(value);
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                boost::this_fiber::yield();   // 理由同 Awaitable<T>::await()，见 spec §3.5
+                boost::this_fiber::yield();
             }
             return Result<void, std::error_code>();
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
 
     /**
@@ -577,6 +642,8 @@ public:
      * @return 事件到达返回成功 Result；超时返回 timed_out，关闭返回首次终止错误
      * @details 状态模式下本方法**不消费**：立即返回当前值，多次调用值不变；
      *          流关闭后返回终止错误（最后的值不再可读）。
+     * @note 任务 cancel() 中止当前等待时，本句柄的消费者队列以 interrupted 关闭；
+     *       同 hub 的其他 shared() 句柄不受影响。
      * @code
      * auto ok = Coro::coro(sock).waitForConnected()->await_for(std::chrono::seconds(2));
      * if(!ok) qWarning() << ok.error().message().c_str();
@@ -584,23 +651,45 @@ public:
      */
     template<typename Rep, typename Period>
     Result<void, std::error_code> await_for(const std::chrono::duration<Rep, Period>& timeout){
+        auto* cancel = detail::currentTaskCancelSlot();
+        if(cancel && cancel->isCancelled()){
+            return std::make_error_code(std::errc::interrupted);
+        }
         if(!queue_){
             return std::make_error_code(std::errc::timed_out);
         }
+        detail::AwaitableCancelNode cancel_node{queue_.get(), &Awaitable::closeQueueThunk, queue_};
+        detail::TaskCancelRegistration registration(cancel, &cancel_node);
+        if(cancel && !registration.registered()){
+            return std::make_error_code(std::errc::interrupted);
+        }
+
         int value{};
         const bool state = (hub_ && hub_->isState());
         auto status = state ? queue_->wait_peek_for(value, timeout)
                             : queue_->pop_wait_for(value, timeout);
+        registration.release();
         if(status == boost::fibers::channel_op_status::success){
             if(state){
-                boost::this_fiber::yield();   // 理由同 Awaitable<T>::await()，见 spec §3.5
+                boost::this_fiber::yield();
             }
             return Result<void, std::error_code>();
         }
         if(status == boost::fibers::channel_op_status::timeout){
+            if(cancel && cancel->isCancelled()){
+                if(queue_->is_closed() && hub_){
+                    hub_->notifyClosed(queue_->close_error());
+                }
+                return std::make_error_code(std::errc::interrupted);
+            }
             return std::make_error_code(std::errc::timed_out);
         }
-        return queue_->close_error();
+
+        const std::error_code error = queue_->close_error();
+        if(hub_){
+            hub_->notifyClosed(error);
+        }
+        return error;
     }
 
     /**
@@ -653,6 +742,15 @@ public:
             hub_->close(error);          // 传播：关闭所有消费者队列
             hub_->notifyClosed(error);   // 关完之后表中已无未关闭的队列 -> 归零 -> 跑一次清理
         }
+    }
+private:
+    /**
+     * @brief 类型擦除 thunk：关闭取消目标队列
+     * @param obj 目标 FiberChannel 裸指针；close 期间由节点 alive 保持存活
+     * @param ec 关闭错误码
+     */
+    static void closeQueueThunk(void* obj, std::error_code ec) noexcept {
+        static_cast<FiberChannel<int>*>(obj)->close(ec);
     }
 };
 

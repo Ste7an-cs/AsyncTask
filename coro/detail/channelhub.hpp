@@ -209,6 +209,8 @@ public:
      * @details 与 detach 不同，本方法不摘除槽位——已关闭的队列要留在表里，
      *          discard_pending() 之后仍需经由它清掉即将悬空的值。归零时 hub
      *          继承传入的终止原因，使生产者查 close_error() 能拿到真正的原因。
+     * @note 任务取消路径只关闭当前句柄的消费者队列；被唤醒的等待方在取消槽锁外
+     *       调用本方法，hub 才据此判定归零并执行清理。
      * @param error 消费者关闭时给出的终止原因
      * @code
      * hub->notifyClosed(error);    // 由 Awaitable::close(error) 调用
