@@ -2,6 +2,7 @@
 #define FIBERTASK_H
 #include <boost/fiber/all.hpp>
 #include <future>
+#include <mutex>
 #include "detail/asyncdefine.h"
 #include "detail/result.hpp"
 #include "detail/taskcancel.hpp"
@@ -30,7 +31,7 @@ inline std::error_code no_task_state(){
  *
  * 一条任务链上的所有 FiberTask 共享同一个 SharedState。
  * @code
- * // pending_cnt 记在途节点、is_runnable 为取消标志、finally_cbs 收集结束回调；
+ * // pending_cnt 记在途节点、is_runnable 为取消标志、结束回调只在首次归零时消费；
  * // 由 makeTask/then 自动维护，使用方通常不直接操作
  * auto t = Coro::makeTask([]{ return 1; }).then([](int v){ return v + 1; });
  * @endcode
@@ -39,7 +40,7 @@ struct SharedState{
     std::atomic_int pending_cnt{0};///< 在途节点计数
     std::atomic_bool is_runnable{true};///< 取消标志，false 表示已取消
     detail::TaskCancelSlot cancel_slot;///< 当前节点 await 的取消槽
-    std::vector<std::function<void()>> finally_cbs;///< 结束回调列表
+
     /**
      * @brief 登记一个节点（在途计数加一）
      * @code
@@ -50,16 +51,53 @@ struct SharedState{
         pending_cnt.fetch_add(1);
     }
     /**
-     * @brief 完成一个节点（在途计数减一），归零时触发全部结束回调
+     * @brief 完成一个节点（在途计数减一），首次归零时执行一次全部结束回调
+     * @details 1→0 时在锁内标记已收尾并取走回调列表，锁外逐个执行。之后再次归零
+     *          （例如整链结束后又追加 then）不再执行。单个回调抛出会被捕获并跳过，
+     *          其余回调照常执行，也不会穿过 noexcept 边界终止进程。
      * @code
-     * state->done_nodes();     // 节点结束时调用；计数归零即触发 on_finally
+     * state->done_nodes();     // 节点结束时调用；仅首次归零触发 on_finally
      * @endcode
      */
     void done_nodes() noexcept {
-        if(pending_cnt.fetch_sub(1) == 1){
-            for(auto& func : finally_cbs){
-                func();
+        if(pending_cnt.fetch_sub(1) != 1){
+            return;
+        }
+        std::vector<std::function<void()>> callbacks;
+        {
+            std::lock_guard<std::mutex> lock(finally_mtx_);
+            if(finalized_){
+                return;
             }
+            finalized_ = true;
+            callbacks.swap(finally_cbs_);
+        }
+        for(auto& func : callbacks){
+            run_finally(func);
+        }
+    }
+
+    /**
+     * @brief 注册结束回调；任务链已收尾时立即在调用线程执行一次
+     * @details 回调在锁外执行。已收尾后再注册不回填列表、不等待未来节点；
+     *          回调抛出会被捕获并忽略，不向调用方传播。
+     * @param func 结束回调
+     * @code
+     * state->add_finally([]{ cleanup(); });   // 由 on_finally() 调用
+     * @endcode
+     */
+    void add_finally(std::function<void()> func){
+        bool run_now = false;
+        {
+            std::lock_guard<std::mutex> lock(finally_mtx_);
+            if(finalized_){
+                run_now = true;
+            }else{
+                finally_cbs_.push_back(std::move(func));
+            }
+        }
+        if(run_now){
+            run_finally(func);
         }
     }
 
@@ -72,6 +110,22 @@ struct SharedState{
         is_runnable.store(false, std::memory_order_release);
         cancel_slot.cancel(std::make_error_code(std::errc::interrupted));
     }
+
+private:
+    /**
+     * @brief 执行单个结束回调；异常被吞掉，保证 noexcept 边界不终止进程
+     * @param func 待执行的回调
+     */
+    static void run_finally(std::function<void()>& func) noexcept {
+        try {
+            func();
+        } catch(...) {
+        }
+    }
+
+    std::vector<std::function<void()>> finally_cbs_;///< 待执行的结束回调，受 finally_mtx_ 保护
+    std::mutex finally_mtx_;///< 串行化结束回调的注册/取走与 finalized_ 状态
+    bool finalized_{false};///< 结束回调是否已被消费；保证一次性
 };
 
 /**
@@ -263,6 +317,9 @@ public:
     }
     /**
      * @brief 注册任务链全部结束后执行的回调
+     * @details 回调只在整链首次结束时执行一次；完成后追加的 then 不会让它重跑。
+     *          若注册时整链已结束，回调立即在调用线程执行（不再保留到未来节点）。
+     *          回调抛出的异常会被捕获并忽略，不影响其余回调，也不会终止进程。
      * @code
      * // 可登记多个；在整链最后一个节点结束时统一触发，适合集中释放资源
      * auto task = Coro::makeTask(work)
@@ -276,7 +333,7 @@ public:
     template<typename Func>
     auto on_finally(Func&& func){
         if(state_ptr_){
-            state_ptr_->finally_cbs.push_back(std::forward<Func>(func));
+            state_ptr_->add_finally(std::forward<Func>(func));
         }
         return FiberTask<T>(future_ptr_, state_ptr_, pri_, affine_);
     }
@@ -438,6 +495,9 @@ public:
     }
     /**
      * @brief 注册任务链全部结束后执行的回调
+     * @details 回调只在整链首次结束时执行一次；完成后追加的 then 不会让它重跑。
+     *          若注册时整链已结束，回调立即在调用线程执行（不再保留到未来节点）。
+     *          回调抛出的异常会被捕获并忽略，不影响其余回调，也不会终止进程。
      * @code
      * // 可登记多个；在整链最后一个节点结束时统一触发，适合集中释放资源
      * auto task = Coro::makeTask(work)
@@ -451,7 +511,7 @@ public:
     template<typename Func>
     auto on_finally(Func&& func){
         if(state_ptr_){
-            state_ptr_->finally_cbs.push_back(std::forward<Func>(func));
+            state_ptr_->add_finally(std::forward<Func>(func));
         }
         return FiberTask<void>(future_ptr_, state_ptr_, pri_, affine_);
     }
