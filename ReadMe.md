@@ -121,6 +121,17 @@ for (QTcpSocket* s : generate(coro(server).nextConnection())) { /* ... */ }
 auto v = await(coro(std::move(fut)));
 ```
 
+**可取消延时**
+
+```cpp
+using namespace std::chrono_literals;
+auto r = Coro::delay_for(100ms);
+```
+
+正常到期返回 `Result<void>` 成功；`FiberTask::cancel()` 会让它提前返回
+`std::errc::interrupted`。它内部使用 `Awaitable<void>::await_for`，不创建定时线程、
+不依赖 Qt；只响应 task.cancel，不响应 `Coro::quit()`/线程结束。
+
 **Awaitable 直接使用（生产者/消费者）**
 ```cpp
 Awaitable<int> a;

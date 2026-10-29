@@ -83,7 +83,7 @@ int main(int argc, char* argv[]) {
 | 接受连接 | `for (QTcpSocket* s : generate(coro(server).nextConnection())) {...}` |
 | 等待 future | `await(coro(std::move(fut)));` |
 | 把任意 Awaitable 当流 | `for (auto v : generate(coro(...))) {...}` |
-| 协程内让出 / 休眠 | `boost::this_fiber::yield();` `sleep(1);` `msleep(100);` |
+| 协程内让出 / 休眠 | `boost::this_fiber::yield();` `sleep(1);` `msleep(100);` `Coro::delay_for(100ms)`（可取消） |
 | 专用协程线程 | `auto* w = new QtFiberThread(); w->start(); ... w->quit();` |
 | 底层创建协程 | `auto fb = launch_properties(fn, pri, affine); fb.detach();` |
 
