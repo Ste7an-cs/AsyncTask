@@ -34,6 +34,7 @@
 
 #include "awaitable.hpp"   // 消费: await(a) / await_for(a, timeout)
 #include "generator.hpp"   // 消费: generate(a)
+#include "delay.hpp"       // 可取消延时: delay_for(duration)
 #include "corosignal.hpp"
 #include "corofuture.hpp"
 #include "coroiodevice.hpp"
