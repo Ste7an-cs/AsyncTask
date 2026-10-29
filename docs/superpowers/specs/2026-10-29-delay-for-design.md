@@ -117,10 +117,10 @@ Result<void> delay_for(const std::chrono::duration<Rep, Period>& duration)
    - sticky task 调用 `delay_for(50ms)`；
    - 结果成功；耗时不少于约 30ms、且小于 1s。
 2. **任务 cancel 提前中止**
-   - sticky task 调用 `delay_for(300ms)`，记录 started；
+   - sticky task 调用 `delay_for(1000ms)`，记录 started；
    - 主线程等待片刻后 `task.cancel()`；
-   - 结果错误为 `interrupted`，done 在 2s 内（实际应远小于 300ms）；
-   - 若取消未生效，任务最多在 300ms 后完成并以成功返回，测试失败但不会挂死。
+   - 结果错误为 `interrupted`，done 在 2s 内（实际应远小于 1000ms，测试断言 <800ms）；
+   - 若取消未生效，任务最多在 1000ms 后完成并以成功返回，测试失败但不会挂死。
 3. **零时长**
    - task 调用 `delay_for(0ms)`，立即成功，不挂起。
 
@@ -139,7 +139,7 @@ Result<void> delay_for(const std::chrono::duration<Rep, Period>& duration)
 ## 8. 验收标准
 
 - `delay_for(50ms)` 返回成功，确实等待约 50ms；
-- 任务 cancel 时 `delay_for(300ms)` 返回 `interrupted` 并提前完成；
+- 任务 cancel 时 `delay_for(1000ms)` 返回 `interrupted` 并提前完成；
 - `delay_for(0ms)` 立即成功；
 - 不新增定时线程，不引入 Qt 依赖，`FiberChannel`/`ChannelHub`/`await_for` 零修改；
 - 新测试在本地 WSL ASan wrapper 通过，现有 `testfibertask` 全量保持通过；
