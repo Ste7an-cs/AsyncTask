@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include "await/awaitable.hpp"
+#include "await/delay.hpp"
 #include "detail/taskcancel.hpp"
 #include <QElapsedTimer>
 #include <atomic>
@@ -114,6 +115,9 @@ private slots:
     void test_case_cancel_from_other_thread();
     void test_case_cancel_await_for_void();
     void test_case_cancel_after_throwing_value_is_safe();
+    void test_case_delay_for_normal_timeout();
+    void test_case_delay_for_cancelled();
+    void test_case_delay_for_zero();
     void end();
 
 };
@@ -837,6 +841,99 @@ void test_fiber_task::test_case_cancel_after_throwing_value_is_safe()
     QTest::qWait(50);
     task.cancel();
     QVERIFY(!source.isClosed());       // 节点已注销：cancel 不应关闭这个句柄
+}
+
+/**
+ * @brief 正常到期：delay_for 返回成功，且确实等待了约 50ms。
+ */
+void test_fiber_task::test_case_delay_for_normal_timeout()
+{
+    std::atomic_bool done{false};
+    std::atomic_int  state{0}; // 1 成功，2 interrupted，3 其它
+    std::atomic_llong elapsedMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        const auto start = std::chrono::steady_clock::now();
+        auto r = Coro::delay_for(std::chrono::milliseconds(50));
+        elapsedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start).count());
+        if(r){
+            state.store(1);
+        }else if(r.error() == interruptedError()){
+            state.store(2);
+        }else{
+            state.store(3);
+        }
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    QVERIFY2(waitForDone(done, 2000, {}), "delay_for did not finish");
+    QCOMPARE(state.load(), 1);
+    QVERIFY(elapsedMs.load() >= 30);
+    QVERIFY(elapsedMs.load() < 1000);
+}
+
+/**
+ * @brief 任务 cancel 时，delay_for 应提前返回 interrupted。
+ */
+void test_fiber_task::test_case_delay_for_cancelled()
+{
+    std::atomic_bool started{false};
+    std::atomic_bool done{false};
+    std::atomic_int  state{0};
+    std::atomic_llong elapsedMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        started.store(true);
+        const auto start = std::chrono::steady_clock::now();
+        auto r = Coro::delay_for(std::chrono::milliseconds(300));
+        elapsedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start).count());
+        if(r){
+            state.store(1);
+        }else if(r.error() == interruptedError()){
+            state.store(2);
+        }else{
+            state.store(3);
+        }
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    QTRY_VERIFY_WITH_TIMEOUT(started.load(), 3000);
+    QTest::qWait(100);
+    task.cancel();
+
+    QVERIFY2(waitForDone(done, 2000, {}), "delay_for did not finish after cancel");
+    QCOMPARE(state.load(), 2);
+    QVERIFY(elapsedMs.load() >= 0);
+    QVERIFY(elapsedMs.load() < 250);
+}
+
+/**
+ * @brief 零时长应立即成功，不挂起。
+ */
+void test_fiber_task::test_case_delay_for_zero()
+{
+    std::atomic_bool done{false};
+    std::atomic_int  state{0};
+    std::atomic_llong elapsedMs{-1};
+
+    auto task = Coro::makeTask([&]{
+        const auto start = std::chrono::steady_clock::now();
+        auto r = Coro::delay_for(std::chrono::milliseconds(0));
+        elapsedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start).count());
+        state.store(r ? 1 : (r.error() == interruptedError() ? 2 : 3));
+        done.store(true);
+        return 0;
+    }, Coro::Priority::Normal, Coro::Affinity::sticky());
+
+    QVERIFY2(waitForDone(done, 2000, {}), "zero delay_for did not finish");
+    QCOMPARE(state.load(), 1);
+    QVERIFY(elapsedMs.load() >= 0);
+    QVERIFY(elapsedMs.load() < 1000);
 }
 
 void test_fiber_task::end()

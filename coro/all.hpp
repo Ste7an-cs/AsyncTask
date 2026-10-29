@@ -45,6 +45,7 @@
 // —— 等待层（与 Qt 解耦部分）——
 #include "await/awaitable.hpp"      // Awaitable / await(a) / await_for(a, timeout)
 #include "await/generator.hpp"      // Generator / generate(a)
+#include "await/delay.hpp"          // delay_for / 可取消延时
 
 // —— Qt 相关能力（仅在启用 Qt 时引入）——
 #ifdef ASYNC_HAS_QTCORE

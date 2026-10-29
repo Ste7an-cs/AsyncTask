@@ -53,6 +53,7 @@ HEADERS += \
     $$PWD/coro/all.hpp \
     $$PWD/coro/await/awaitable.hpp \
     $$PWD/coro/await/generator.hpp \
+    $$PWD/coro/await/delay.hpp \
     $$PWD/coro/detail/fiberchannel.hpp \
     $$PWD/coro/detail/taskcancel.hpp \
     $$PWD/coro/detail/channelhub.hpp \
