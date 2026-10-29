@@ -1,8 +1,8 @@
 # Coro::delay_for 设计
 
 - 日期：2026-10-29
-- 状态：待评审
-- 范围：基于 `Awaitable<void>::await_for` 的可取消协程延时，替代 fiber 版 `sleep`/`msleep`
+- 状态：已评审
+- 范围：基于 `Awaitable<void>::await_for` 的可取消协程延时，补充并区别于 fiber 版 `sleep`/`msleep`
 - 相关：`coro/await/awaitable.hpp`、`coro/detail/asyncdefine.h`、`docs/superpowers/specs/2026-10-27-task-cancel-awaitable-design.md`
 
 ## 1. 背景与目标
@@ -106,6 +106,7 @@ Result<void> delay_for(const std::chrono::duration<Rep, Period>& duration)
 
 - 新增：`coro/await/delay.hpp`
 - 修改：`coro/all.hpp`（await 层引入）
+- 修改：`coro/await/coro.hpp`（Qt 伞头也暴露 delay_for）
 - 修改：`AsyncTask.pri`（HEADERS）
 - 测试：`test/testfibertask/tst_test_fiber_task.cpp`
 - 文档：`ReadMe.md`、`doc/使用说明.md`、`doc/架构设计.md`、`doc/软件设计说明.md`、`doc/需求文档.md`、`doc/需求规格说明.md`、`skill/using-asynctask/SKILL.md`

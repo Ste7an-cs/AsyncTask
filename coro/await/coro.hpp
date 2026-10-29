@@ -15,8 +15,10 @@
  *   - corolocalsocket.hpp —— coro(QLocalSocket*)
  *   - corolocalserver.hpp —— coro(QLocalServer*)
  *   - coroudpsocket.hpp   —— coro(QUdpSocket*)
+ *   - delay.hpp           —— delay_for(duration) 可取消延时
  *
- * 消费统一用自由函数 await(a)/await_for(a,timeout)（awaitable.hpp）与 generate(a)（generator.hpp）。
+ * 消费统一用自由函数 await(a)/await_for(a,timeout)（awaitable.hpp）、
+ * generate(a)（generator.hpp）与 delay_for(duration)（delay.hpp）。
  * 全部 Qt 依赖集中在这些 coro* 头文件中；Awaitable 本体与 Qt 解耦。
  *
  * @code

@@ -12,7 +12,7 @@ AsyncTask 是基于 boost.fiber 的**有栈协程**框架，面向 Qt/C++17。�
 三条核心规则（违反其一是绝大多数 bug 的根源）：
 
 1. **用 `Coro::exec()` 驱动主循环，不要用 `QCoreApplication::exec()`。** 协程调度器即主循环，Qt 事件由每个安装 `QtFiberScheduler` 的线程上的**常驻泵协程**（首次空闲时懒启动、在 worker 上下文持续 `processEvents`）分发；二者在同一线程互斥。
-2. **用 `Coro::quit()` 退出** —— 设置全局退出标志 → 各线程泵协程自行终止 → 唤醒挂起协程 → 排空在途任务 → 退出。**`block.wait()` 返回后会自动停止本线程的泵协程**，因此 `QtFiberThread` 等单独退出也安全。不调用 `quit()` 会导致退出时卡死或崩溃。
+2. **用 `Coro::quit()` 退出** —— 设置全局退出标志 → 各线程泵协程自行终止 → 关闭绑定应用生命周期的等待器并唤醒其挂起协程 → 排空在途任务 → 退出（`delay_for` 例外，只受 task.cancel 影响，长延时需先取消任务）。**`block.wait()` 返回后会自动停止本线程的泵协程**，因此 `QtFiberThread` 等单独退出也安全。不调用 `quit()` 会导致退出时卡死或崩溃。
 3. **所有 API 都在命名空间 `Coro` 下。** 先 `using namespace Coro;`。
 
 ## 何时使用
@@ -41,7 +41,7 @@ SOURCES += main.cpp
 #include "await/coro.hpp"            // 伞头：一次性引入所有来源的 coro()/await()/generate()
 // 或按来源单独引入：await/corosignal.hpp、corosocket.hpp、corotcpserver.hpp、
 //    corolocalsocket.hpp、corolocalserver.hpp、coroudpsocket.hpp、corosslsocket.hpp、
-//    coroiodevice.hpp、corofuture.hpp、await/generator.hpp
+//    coroiodevice.hpp、corofuture.hpp、await/generator.hpp、await/delay.hpp
 #include "detail/asyncdefine.h"      // sleep / msleep / launch_properties
 #include "executor/qtfiberthread.h"  // QtFiberThread（专用协程线程）
 using namespace Coro;
@@ -83,7 +83,7 @@ int main(int argc, char* argv[]) {
 | 接受连接 | `for (QTcpSocket* s : generate(coro(server).nextConnection())) {...}` |
 | 等待 future | `await(coro(std::move(fut)));` |
 | 把任意 Awaitable 当流 | `for (auto v : generate(coro(...))) {...}` |
-| 协程内让出 / 休眠 | `boost::this_fiber::yield();` `sleep(1);` `msleep(100);` `Coro::delay_for(100ms)`（可取消） |
+| 协程内让出 / 休眠 | `boost::this_fiber::yield();` `sleep(1);` `msleep(100);` `Coro::delay_for(100ms)`（只受 task.cancel 中断，quit 不会唤醒） |
 | 专用协程线程 | `auto* w = new QtFiberThread(); w->start(); ... w->quit();` |
 | 底层创建协程 | `auto fb = launch_properties(fn, pri, affine); fb.detach();` |
 
@@ -220,7 +220,7 @@ worker->quit(); delete worker;
 | 现象 | 原因与排除 |
 |---|---|
 | 主线程协程从不执行 | 用了 `QCoreApplication::exec()` 驱动主循环。改用 `Coro::exec()`（协程调度器即主循环并泵 Qt 事件；二者同线程互斥）。 |
-| 进程无法退出 / 退出崩溃 | 没调用 `Coro::quit()`。它会唤醒挂起协程、排空在途任务再退出。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
+| 进程无法退出 / 退出崩溃 | 没调用 `Coro::quit()`。它会关闭绑定应用生命周期的等待器、唤醒其挂起协程、排空在途任务再退出；`delay_for` 只受 task.cancel 影响，长延时需先取消任务。detached 协程勿在 `QCoreApplication` 析构后仍访问 Qt 对象。 |
 | 运行中 `deleteLater` 迟迟不生效 | 协程调度期间 Qt 不派发 `DeferredDelete`，通常到 `quit()` 才处理。需要即时释放请用普通 `delete`。 |
 | 运行中改 `Affinity` 但协程未迁移线程 | 不受支持。请在创建协程时用 `Affinity` 指定线程归属，勿运行中反复 `setAffinity` 迁移。 |
 | 找不到 `coro(socket)` / `coro(server)` | 缺 `QT += network`，或未引入对应头（`await/corosocket.hpp` 等）或伞头 `await/coro.hpp`。 |
